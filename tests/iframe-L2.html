@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Iframe L2 - Deepest Context</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 12px;
+      background: #050510;
+      color: #eee;
+    }
+
+    .context-layer {
+      border: 2px solid #e94560;
+      border-radius: 8px;
+      padding: 12px;
+      background: rgba(233, 69, 96, 0.05);
+    }
+
+    h2 {
+      margin: 0 0 8px 0;
+      color: #e94560;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    h2 .badge {
+      background: #e94560;
+      color: #fff;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: bold;
+    }
+
+    .form-section {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .form-group label {
+      font-size: 9px;
+      color: #888;
+      text-transform: uppercase;
+    }
+
+    .form-group input,
+    .form-group select,
+    .form-group textarea {
+      padding: 4px 6px;
+      border: 1px solid #333;
+      border-radius: 4px;
+      background: #0f0f1a;
+      color: #eee;
+      font-size: 11px;
+    }
+
+    .form-group input:focus,
+    .form-group select:focus,
+    .form-group textarea:focus {
+      outline: none;
+      border-color: #e94560;
+    }
+
+    .form-group textarea {
+      min-height: 35px;
+      resize: vertical;
+    }
+
+    .checkbox-group {
+      flex-direction: row;
+      align-items: center;
+    }
+
+    .checkbox-group input[type="checkbox"] {
+      width: 12px;
+      height: 12px;
+    }
+
+    .state-display {
+      margin-top: 8px;
+      padding: 5px;
+      background: #0a0a15;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 9px;
+    }
+
+    .state-display .label {
+      color: #888;
+      margin-bottom: 2px;
+    }
+
+    .state-display .value {
+      color: #e94560;
+      word-break: break-all;
+    }
+
+    button {
+      padding: 4px 8px;
+      background: #e94560;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 10px;
+      margin-right: 5px;
+      margin-top: 5px;
+    }
+
+    button:hover {
+      background: #d13a54;
+    }
+
+    button.secondary {
+      background: #4ec9b0;
+      color: #1a1a2e;
+    }
+
+    .shadow-host {
+      border: 2px dashed #9d4edd;
+      border-radius: 8px;
+      margin-top: 12px;
+    }
+
+    .depth-indicator {
+      background: linear-gradient(90deg, #4ec9b0, #9d4edd, #e94560);
+      color: #fff;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: bold;
+      margin-bottom: 10px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="depth-indicator">
+    🏆 DEEPEST LEVEL - Main → Shadow L1 → Iframe L1 → Shadow L2 → Iframe L2
+  </div>
+
+  <div class="context-layer" data-context="iframe-L2" data-layer="4">
+    <h2>
+      <span class="badge">L4</span>
+      Iframe Context (Level 2) - Inside Shadow L2
+    </h2>
+
+    <div class="form-section">
+      <div class="form-group">
+        <label>Text Input (L4)</label>
+        <input type="text" id="input-L4-text" data-testid="input-L4-text" placeholder="Enter text...">
+      </div>
+
+      <div class="form-group">
+        <label>Email (L4)</label>
+        <input type="email" id="input-L4-email" data-testid="input-L4-email" placeholder="email@example.com">
+      </div>
+
+      <div class="form-group">
+        <label>Number (L4)</label>
+        <input type="number" id="input-L4-number" data-testid="input-L4-number" placeholder="0" value="0">
+      </div>
+
+      <div class="form-group">
+        <label>Select (L4)</label>
+        <select id="input-L4-select" data-testid="input-L4-select">
+          <option value="">-- Select --</option>
+          <option value="option-a">Option A</option>
+          <option value="option-b">Option B</option>
+          <option value="option-c">Option C</option>
+        </select>
+      </div>
+
+      <div class="form-group checkbox-group">
+        <input type="checkbox" id="input-L4-checkbox" data-testid="input-L4-checkbox">
+        <label for="input-L4-checkbox">Checkbox (L4)</label>
+      </div>
+
+      <div class="form-group">
+        <label>Textarea (L4)</label>
+        <textarea id="input-L4-textarea" data-testid="input-L4-textarea" placeholder="Enter multi-line text..."></textarea>
+      </div>
+    </div>
+
+    <div class="state-display">
+      <div class="label">Current State:</div>
+      <div class="value" id="state-L4">-</div>
+    </div>
+
+    <button id="reset-L4">Reset L4 Form</button>
+    <button id="fill-L4" class="secondary">Fill Test Data</button>
+  </div>
+
+  <!-- Shadow DOM L3 - The deepest shadow DOM -->
+  <div id="shadow-host-L3" class="shadow-host"></div>
+
+  <script>
+    // =========================================================================
+    // Utility Functions
+    // =========================================================================
+
+    function getFormState(layer, root = document) {
+      const prefix = `input-L${layer}-`;
+      const state = {};
+
+      const text = root.querySelector(`[data-testid="${prefix}text"]`);
+      const email = root.querySelector(`[data-testid="${prefix}email"]`);
+      const number = root.querySelector(`[data-testid="${prefix}number"]`);
+      const select = root.querySelector(`[data-testid="${prefix}select"]`);
+      const checkbox = root.querySelector(`[data-testid="${prefix}checkbox"]`);
+      const textarea = root.querySelector(`[data-testid="${prefix}textarea"]`);
+
+      if (text) state.text = text.value;
+      if (email) state.email = email.value;
+      if (number) state.number = number.value;
+      if (select) state.select = select.value;
+      if (checkbox) state.checkbox = checkbox.checked;
+      if (textarea) state.textarea = textarea.value;
+
+      return state;
+    }
+
+    function updateStateDisplay(layer, root = document) {
+      const state = getFormState(layer, root);
+      const display = root.querySelector(`#state-L${layer}`);
+      if (display) {
+        display.textContent = JSON.stringify(state, null, 2);
+      }
+    }
+
+    function resetForm(layer, root = document) {
+      const prefix = `input-L${layer}-`;
+
+      const text = root.querySelector(`[data-testid="${prefix}text"]`);
+      const email = root.querySelector(`[data-testid="${prefix}email"]`);
+      const number = root.querySelector(`[data-testid="${prefix}number"]`);
+      const select = root.querySelector(`[data-testid="${prefix}select"]`);
+      const checkbox = root.querySelector(`[data-testid="${prefix}checkbox"]`);
+      const textarea = root.querySelector(`[data-testid="${prefix}textarea"]`);
+
+      if (text) text.value = '';
+      if (email) email.value = '';
+      if (number) number.value = '0';
+      if (select) select.value = '';
+      if (checkbox) checkbox.checked = false;
+      if (textarea) textarea.value = '';
+
+      updateStateDisplay(layer, root);
+    }
+
+    function fillWithTestData(layer, root = document) {
+      const prefix = `input-L${layer}-`;
+
+      const text = root.querySelector(`[data-testid="${prefix}text"]`);
+      const email = root.querySelector(`[data-testid="${prefix}email"]`);
+      const number = root.querySelector(`[data-testid="${prefix}number"]`);
+      const select = root.querySelector(`[data-testid="${prefix}select"]`);
+      const checkbox = root.querySelector(`[data-testid="${prefix}checkbox"]`);
+      const textarea = root.querySelector(`[data-testid="${prefix}textarea"]`);
+
+      if (text) text.value = `TestValue-L${layer}`;
+      if (email) email.value = `test-L${layer}@example.com`;
+      if (number) number.value = String(layer * 100 + 42);
+      if (select) select.value = ['option-a', 'option-b', 'option-c'][layer % 3];
+      if (checkbox) checkbox.checked = layer % 2 === 0;
+      if (textarea) textarea.value = `Multi-line text for Layer ${layer}\nLine 2\nLine 3`;
+
+      updateStateDisplay(layer, root);
+    }
+
+    // Expose globally
+    window.getFormState = getFormState;
+    window.updateStateDisplay = updateStateDisplay;
+    window.resetForm = resetForm;
+    window.fillWithTestData = fillWithTestData;
+
+    // =========================================================================
+    // Setup L4 (this iframe's main content)
+    // =========================================================================
+
+    document.querySelectorAll('[data-testid^="input-L4-"]').forEach(el => {
+      el.addEventListener('input', () => updateStateDisplay(4));
+      el.addEventListener('change', () => updateStateDisplay(4));
+    });
+
+    document.getElementById('reset-L4').addEventListener('click', () => resetForm(4));
+    document.getElementById('fill-L4').addEventListener('click', () => fillWithTestData(4));
+
+    updateStateDisplay(4);
+
+    // =========================================================================
+    // Create Shadow DOM L3 - The deepest level
+    // =========================================================================
+
+    const shadowHostL3 = document.getElementById('shadow-host-L3');
+    const shadowRootL3 = shadowHostL3.attachShadow({ mode: 'open' });
+
+    shadowRootL3.innerHTML = `
+      <style>
+        :host {
+          display: block;
+          padding: 10px;
+          background: rgba(157, 78, 221, 0.05);
+        }
+
+        .context-layer {
+          border: 2px solid #9d4edd;
+          border-radius: 8px;
+          padding: 10px;
+          background: rgba(157, 78, 221, 0.1);
+        }
+
+        .final-indicator {
+          background: linear-gradient(90deg, #9d4edd, #4ec9b0);
+          color: #fff;
+          padding: 3px 6px;
+          border-radius: 4px;
+          font-size: 9px;
+          font-weight: bold;
+          margin-bottom: 8px;
+          text-align: center;
+        }
+
+        h2 {
+          margin: 0 0 6px 0;
+          color: #9d4edd;
+          font-size: 12px;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+
+        h2 .badge {
+          background: #9d4edd;
+          color: #1a1a2e;
+          padding: 2px 5px;
+          border-radius: 4px;
+          font-size: 9px;
+          font-weight: bold;
+        }
+
+        .form-section {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+          gap: 6px;
+          margin-top: 6px;
+        }
+
+        .form-group {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+
+        .form-group label {
+          font-size: 8px;
+          color: #888;
+          text-transform: uppercase;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+          padding: 3px 5px;
+          border: 1px solid #333;
+          border-radius: 3px;
+          background: #050510;
+          color: #eee;
+          font-size: 10px;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+          outline: none;
+          border-color: #9d4edd;
+        }
+
+        .form-group textarea {
+          min-height: 30px;
+          resize: vertical;
+        }
+
+        .checkbox-group {
+          flex-direction: row;
+          align-items: center;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+          width: 10px;
+          height: 10px;
+        }
+
+        .state-display {
+          margin-top: 6px;
+          padding: 4px;
+          background: #050510;
+          border-radius: 3px;
+          font-family: monospace;
+          font-size: 8px;
+        }
+
+        .state-display .label {
+          color: #888;
+          margin-bottom: 2px;
+        }
+
+        .state-display .value {
+          color: #9d4edd;
+          word-break: break-all;
+        }
+
+        button {
+          padding: 3px 6px;
+          background: #9d4edd;
+          color: #fff;
+          border: none;
+          border-radius: 3px;
+          cursor: pointer;
+          font-weight: bold;
+          font-size: 9px;
+          margin-right: 4px;
+          margin-top: 4px;
+        }
+
+        button:hover {
+          background: #8b3dc9;
+        }
+
+        button.secondary {
+          background: #e94560;
+        }
+      </style>
+
+      <div class="final-indicator">
+        🎯 FINAL LAYER - Shadow DOM L3 (Layer 5)
+      </div>
+
+      <div class="context-layer" data-context="shadow-L3" data-layer="5">
+        <h2>
+          <span class="badge">L5</span>
+          Shadow DOM (Level 3) - Deepest
+        </h2>
+
+        <div class="form-section">
+          <div class="form-group">
+            <label>Text Input (L5)</label>
+            <input type="text" id="input-L5-text" data-testid="input-L5-text" placeholder="Text...">
+          </div>
+
+          <div class="form-group">
+            <label>Email (L5)</label>
+            <input type="email" id="input-L5-email" data-testid="input-L5-email" placeholder="email@example.com">
+          </div>
+
+          <div class="form-group">
+            <label>Number (L5)</label>
+            <input type="number" id="input-L5-number" data-testid="input-L5-number" placeholder="0" value="0">
+          </div>
+
+          <div class="form-group">
+            <label>Select (L5)</label>
+            <select id="input-L5-select" data-testid="input-L5-select">
+              <option value="">-- Select --</option>
+              <option value="option-a">Option A</option>
+              <option value="option-b">Option B</option>
+              <option value="option-c">Option C</option>
+            </select>
+          </div>
+
+          <div class="form-group checkbox-group">
+            <input type="checkbox" id="input-L5-checkbox" data-testid="input-L5-checkbox">
+            <label for="input-L5-checkbox">Checkbox (L5)</label>
+          </div>
+
+          <div class="form-group">
+            <label>Textarea (L5)</label>
+            <textarea id="input-L5-textarea" data-testid="input-L5-textarea" placeholder="Text..."></textarea>
+          </div>
+        </div>
+
+        <div class="state-display">
+          <div class="label">Current State:</div>
+          <div class="value" id="state-L5">-</div>
+        </div>
+
+        <button id="reset-L5">Reset L5 Form</button>
+        <button id="fill-L5" class="secondary">Fill Test Data</button>
+      </div>
+    `;
+
+    // Setup L5 event listeners
+    const l5Root = shadowRootL3;
+    l5Root.querySelectorAll('[data-testid^="input-L5-"]').forEach(el => {
+      el.addEventListener('input', () => {
+        const state = getFormState(5, l5Root);
+        l5Root.getElementById('state-L5').textContent = JSON.stringify(state, null, 2);
+      });
+      el.addEventListener('change', () => {
+        const state = getFormState(5, l5Root);
+        l5Root.getElementById('state-L5').textContent = JSON.stringify(state, null, 2);
+      });
+    });
+
+    l5Root.getElementById('reset-L5').addEventListener('click', () => {
+      resetForm(5, l5Root);
+    });
+
+    l5Root.getElementById('fill-L5').addEventListener('click', () => {
+      fillWithTestData(5, l5Root);
+    });
+
+    // Initial state
+    const initState5 = getFormState(5, l5Root);
+    l5Root.getElementById('state-L5').textContent = JSON.stringify(initState5, null, 2);
+
+    // Expose shadow root for testing
+    window.__shadowRootL3 = shadowRootL3;
+  </script>
+</body>
+</html>

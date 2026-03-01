@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Koi search_dom Stress Test</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #0d1117;
+      color: #c9d1d9;
+      line-height: 1.5;
+    }
+
+    h1 { color: #58a6ff; margin-bottom: 10px; }
+    h2 { color: #7ee787; margin: 20px 0 10px 0; font-size: 16px; }
+    h3 { color: #ffa657; margin: 15px 0 8px 0; font-size: 14px; }
+
+    .info-box {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-left: 4px solid #58a6ff;
+      padding: 15px;
+      margin-bottom: 20px;
+      border-radius: 6px;
+    }
+
+    .info-box code {
+      background: #21262d;
+      padding: 2px 6px;
+      border-radius: 3px;
+      color: #f97583;
+      font-size: 13px;
+    }
+
+    .test-section {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 15px;
+    }
+
+    .test-section.challenge {
+      border-color: #f85149;
+      background: #1c1117;
+    }
+
+    /* =========================================================================
+       SCENARIO 1: Duplicate Text Content
+       ========================================================================= */
+    .duplicate-section button {
+      background: #238636;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 5px;
+    }
+
+    .duplicate-section button:hover {
+      background: #2ea043;
+    }
+
+    /* =========================================================================
+       SCENARIO 2: Dynamic IDs and Classes
+       ========================================================================= */
+    .dynamic-ids [class*="btn-"] {
+      background: #1f6feb;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 5px;
+    }
+
+    /* =========================================================================
+       SCENARIO 3: Deeply Nested Elements
+       ========================================================================= */
+    .nested-container {
+      border: 1px dashed #30363d;
+      padding: 10px;
+      margin: 5px 0;
+    }
+
+    .nested-container .level-indicator {
+      font-size: 11px;
+      color: #8b949e;
+      margin-bottom: 5px;
+    }
+
+    /* =========================================================================
+       SCENARIO 4: Hidden/Invisible Elements
+       ========================================================================= */
+    .visibility-tests .hidden-display { display: none; }
+    .visibility-tests .hidden-visibility { visibility: hidden; }
+    .visibility-tests .hidden-opacity { opacity: 0; }
+    .visibility-tests .hidden-offscreen { position: absolute; left: -9999px; }
+    .visibility-tests .hidden-height { height: 0; overflow: hidden; }
+    .visibility-tests .visible-item { color: #7ee787; }
+
+    /* =========================================================================
+       SCENARIO 5: Similar Selectors
+       ========================================================================= */
+    .similar-selectors button {
+      padding: 8px 16px;
+      margin: 3px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+
+    .similar-selectors .btn-primary { background: #238636; color: white; }
+    .similar-selectors .btn-primary-outline { background: transparent; color: #238636; border: 2px solid #238636; }
+    .similar-selectors .btn-primary-lg { background: #238636; color: white; padding: 12px 24px; font-size: 16px; }
+    .similar-selectors .btn-primary-sm { background: #238636; color: white; padding: 4px 8px; font-size: 12px; }
+
+    /* =========================================================================
+       SCENARIO 6: Table with Repetitive Structure
+       ========================================================================= */
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0;
+    }
+
+    .data-table th, .data-table td {
+      border: 1px solid #30363d;
+      padding: 8px 12px;
+      text-align: left;
+    }
+
+    .data-table th {
+      background: #21262d;
+      color: #58a6ff;
+    }
+
+    .data-table tr:hover {
+      background: #21262d;
+    }
+
+    .data-table .action-btn {
+      background: #1f6feb;
+      color: white;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .data-table .delete-btn {
+      background: #f85149;
+    }
+
+    /* =========================================================================
+       SCENARIO 7: Form with Various Input Types
+       ========================================================================= */
+    .complex-form {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 15px;
+    }
+
+    .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .form-field label {
+      font-size: 12px;
+      color: #8b949e;
+      text-transform: uppercase;
+    }
+
+    .form-field input,
+    .form-field select,
+    .form-field textarea {
+      padding: 8px 12px;
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #c9d1d9;
+      font-size: 14px;
+    }
+
+    .form-field input:focus,
+    .form-field select:focus,
+    .form-field textarea:focus {
+      outline: none;
+      border-color: #58a6ff;
+    }
+
+    /* =========================================================================
+       SCENARIO 8: Custom Elements / Web Components
+       ========================================================================= */
+    custom-card {
+      display: block;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 10px 0;
+      background: #21262d;
+    }
+
+    /* =========================================================================
+       SCENARIO 9: SVG Elements
+       ========================================================================= */
+    .svg-container svg {
+      margin: 5px;
+    }
+
+    /* =========================================================================
+       SCENARIO 10: ARIA and Accessibility
+       ========================================================================= */
+    .aria-section [role="button"] {
+      background: #6e40c9;
+      color: white;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      display: inline-block;
+      margin: 5px;
+    }
+
+    .aria-section [role="alert"] {
+      background: #f85149;
+      color: white;
+      padding: 10px;
+      border-radius: 6px;
+      margin: 10px 0;
+    }
+
+    /* =========================================================================
+       Shadow DOM Host
+       ========================================================================= */
+    #shadow-host {
+      border: 2px dashed #a371f7;
+      border-radius: 8px;
+      min-height: 100px;
+      margin: 10px 0;
+    }
+
+    /* =========================================================================
+       Iframe Container
+       ========================================================================= */
+    .iframe-container iframe {
+      width: 100%;
+      height: 200px;
+      border: 2px dashed #f97583;
+      border-radius: 8px;
+      background: #0d1117;
+    }
+
+    /* =========================================================================
+       Legend
+       ========================================================================= */
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 15px;
+      margin: 15px 0;
+      padding: 10px;
+      background: #21262d;
+      border-radius: 6px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+
+    .legend-item .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+
+    .legend-item .dot.easy { background: #7ee787; }
+    .legend-item .dot.medium { background: #ffa657; }
+    .legend-item .dot.hard { background: #f85149; }
+
+    /* State display */
+    .state-output {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 10px;
+      font-family: 'Menlo', 'Monaco', monospace;
+      font-size: 12px;
+      max-height: 200px;
+      overflow: auto;
+      margin: 10px 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔍 Koi search_dom Stress Test</h1>
+
+  <div class="info-box">
+    <strong>Purpose:</strong> Test the agent's ability to discover, target, and act on DOM elements.<br><br>
+    <strong>Workflow Being Tested:</strong>
+    <code>list_structure</code> → <code>search_dom</code> → <code>inspect_element</code> → <code>click/fill</code><br><br>
+    <strong>Challenge Levels:</strong>
+    <div class="legend">
+      <div class="legend-item"><span class="dot easy"></span> Easy: Unique IDs, data-testid</div>
+      <div class="legend-item"><span class="dot medium"></span> Medium: Class combos, nth-child</div>
+      <div class="legend-item"><span class="dot hard"></span> Hard: Text search, dynamic, cross-context</div>
+    </div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 1: Duplicate Text - Multiple buttons with same text
+       ========================================================================= -->
+  <div class="test-section" id="scenario-duplicates">
+    <h2>📋 Scenario 1: Duplicate Text Content</h2>
+    <p>Multiple elements with identical text. Agent must disambiguate by context.</p>
+
+    <div class="duplicate-section">
+      <div id="cart-section">
+        <h3>Shopping Cart</h3>
+        <button data-action="add-cart">Add to Cart</button>
+        <button data-action="remove-cart">Remove</button>
+      </div>
+
+      <div id="wishlist-section">
+        <h3>Wishlist</h3>
+        <button data-action="add-wishlist">Add to Cart</button>
+        <button data-action="remove-wishlist">Remove</button>
+      </div>
+
+      <div id="compare-section">
+        <h3>Compare List</h3>
+        <button data-action="add-compare">Add to Cart</button>
+        <button data-action="remove-compare">Remove</button>
+      </div>
+    </div>
+
+    <div class="state-output" id="scenario1-log">Click any button to see action...</div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 2: Dynamic IDs and Randomly Generated Classes
+       ========================================================================= -->
+  <div class="test-section challenge" id="scenario-dynamic">
+    <h2>📋 Scenario 2: Dynamic/Random IDs (Hard)</h2>
+    <p>IDs and classes change on every page load. Agent must use stable attributes.</p>
+
+    <div class="dynamic-ids" id="dynamic-container">
+      <!-- Generated dynamically with random IDs -->
+    </div>
+
+    <div class="state-output" id="scenario2-log">Click any button to see action...</div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 3: Deeply Nested Elements
+       ========================================================================= -->
+  <div class="test-section" id="scenario-nested">
+    <h2>📋 Scenario 3: Deeply Nested Elements</h2>
+    <p>Target element is 10 levels deep. Selector must be efficient.</p>
+
+    <div id="nest-root" class="nested-container">
+      <!-- Generated dynamically with deep nesting -->
+    </div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 4: Visibility States
+       ========================================================================= -->
+  <div class="test-section" id="scenario-visibility">
+    <h2>📋 Scenario 4: Hidden vs Visible Elements</h2>
+    <p>Agent must identify which "Submit" button is actually visible.</p>
+
+    <div class="visibility-tests">
+      <button class="hidden-display" data-testid="submit-hidden-display">Submit</button>
+      <button class="hidden-visibility" data-testid="submit-hidden-visibility">Submit</button>
+      <button class="hidden-opacity" data-testid="submit-hidden-opacity">Submit</button>
+      <button class="hidden-offscreen" data-testid="submit-hidden-offscreen">Submit</button>
+      <button class="hidden-height" data-testid="submit-hidden-height">Submit</button>
+      <button class="visible-item" data-testid="submit-visible">Submit</button>
+    </div>
+
+    <p style="margin-top:10px;color:#8b949e;">Only one "Submit" button should be reported as visible.</p>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 5: Similar Selectors
+       ========================================================================= -->
+  <div class="test-section" id="scenario-similar">
+    <h2>📋 Scenario 5: Similar Class Names</h2>
+    <p>Multiple buttons with overlapping class names. Agent must select precisely.</p>
+
+    <div class="similar-selectors">
+      <button class="btn-primary" data-variant="default">Primary</button>
+      <button class="btn-primary-outline" data-variant="outline">Primary Outline</button>
+      <button class="btn-primary-lg" data-variant="large">Primary Large</button>
+      <button class="btn-primary-sm" data-variant="small">Primary Small</button>
+      <button class="btn-secondary" data-variant="secondary">Secondary</button>
+      <button class="btn-danger" data-variant="danger">Danger</button>
+    </div>
+
+    <div class="state-output" id="scenario5-log">Click a button...</div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 6: Table with Repetitive Structure
+       ========================================================================= -->
+  <div class="test-section" id="scenario-table">
+    <h2>📋 Scenario 6: Data Table Navigation</h2>
+    <p>Find and click "Edit" for user "alice@example.com" specifically.</p>
+
+    <table class="data-table" id="users-table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Name</th>
+          <th>Email</th>
+          <th>Role</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr data-user-id="1">
+          <td>1</td>
+          <td>John Doe</td>
+          <td>john@example.com</td>
+          <td>Admin</td>
+          <td>
+            <button class="action-btn edit-btn" data-action="edit" data-user="1">Edit</button>
+            <button class="action-btn delete-btn" data-action="delete" data-user="1">Delete</button>
+          </td>
+        </tr>
+        <tr data-user-id="2">
+          <td>2</td>
+          <td>Alice Smith</td>
+          <td>alice@example.com</td>
+          <td>Editor</td>
+          <td>
+            <button class="action-btn edit-btn" data-action="edit" data-user="2">Edit</button>
+            <button class="action-btn delete-btn" data-action="delete" data-user="2">Delete</button>
+          </td>
+        </tr>
+        <tr data-user-id="3">
+          <td>3</td>
+          <td>Bob Wilson</td>
+          <td>bob@example.com</td>
+          <td>Viewer</td>
+          <td>
+            <button class="action-btn edit-btn" data-action="edit" data-user="3">Edit</button>
+            <button class="action-btn delete-btn" data-action="delete" data-user="3">Delete</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="state-output" id="scenario6-log">Click an action button...</div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 7: Complex Form
+       ========================================================================= -->
+  <div class="test-section" id="scenario-form">
+    <h2>📋 Scenario 7: Complex Form Interaction</h2>
+    <p>Fill out this registration form programmatically.</p>
+
+    <form id="registration-form" class="complex-form">
+      <div class="form-field">
+        <label for="reg-firstname">First Name</label>
+        <input type="text" id="reg-firstname" name="firstname" data-testid="form-firstname" placeholder="John">
+      </div>
+
+      <div class="form-field">
+        <label for="reg-lastname">Last Name</label>
+        <input type="text" id="reg-lastname" name="lastname" data-testid="form-lastname" placeholder="Doe">
+      </div>
+
+      <div class="form-field">
+        <label for="reg-email">Email</label>
+        <input type="email" id="reg-email" name="email" data-testid="form-email" placeholder="john@example.com">
+      </div>
+
+      <div class="form-field">
+        <label for="reg-password">Password</label>
+        <input type="password" id="reg-password" name="password" data-testid="form-password" placeholder="••••••••">
+      </div>
+
+      <div class="form-field">
+        <label for="reg-country">Country</label>
+        <select id="reg-country" name="country" data-testid="form-country">
+          <option value="">Select Country</option>
+          <option value="us">United States</option>
+          <option value="uk">United Kingdom</option>
+          <option value="ca">Canada</option>
+          <option value="au">Australia</option>
+        </select>
+      </div>
+
+      <div class="form-field">
+        <label for="reg-bio">Bio</label>
+        <textarea id="reg-bio" name="bio" data-testid="form-bio" rows="3" placeholder="Tell us about yourself..."></textarea>
+      </div>
+
+      <div class="form-field" style="flex-direction:row;align-items:center;">
+        <input type="checkbox" id="reg-terms" name="terms" data-testid="form-terms">
+        <label for="reg-terms" style="text-transform:none;">I agree to the Terms of Service</label>
+      </div>
+
+      <div class="form-field" style="flex-direction:row;gap:10px;">
+        <input type="radio" id="reg-plan-free" name="plan" value="free" data-testid="form-plan-free">
+        <label for="reg-plan-free" style="text-transform:none;">Free Plan</label>
+        <input type="radio" id="reg-plan-pro" name="plan" value="pro" data-testid="form-plan-pro">
+        <label for="reg-plan-pro" style="text-transform:none;">Pro Plan</label>
+      </div>
+    </form>
+
+    <div class="state-output" id="scenario7-log">Form state will appear here...</div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 8: Custom Elements (Web Components)
+       ========================================================================= -->
+  <div class="test-section" id="scenario-webcomponents">
+    <h2>📋 Scenario 8: Custom Web Components</h2>
+    <p>Elements defined with custom tag names.</p>
+
+    <custom-card data-card-id="card-1">
+      <h3 slot="title">Card Title 1</h3>
+      <p>This is the first custom card component.</p>
+      <button data-testid="card1-action">Card 1 Action</button>
+    </custom-card>
+
+    <custom-card data-card-id="card-2">
+      <h3 slot="title">Card Title 2</h3>
+      <p>This is the second custom card component.</p>
+      <button data-testid="card2-action">Card 2 Action</button>
+    </custom-card>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 9: SVG Elements
+       ========================================================================= -->
+  <div class="test-section" id="scenario-svg">
+    <h2>📋 Scenario 9: SVG Interactive Elements</h2>
+    <p>Clickable SVG elements with different shapes.</p>
+
+    <div class="svg-container">
+      <svg width="200" height="100" viewBox="0 0 200 100">
+        <circle id="svg-circle" cx="50" cy="50" r="40" fill="#238636" data-shape="circle" style="cursor:pointer"/>
+        <rect id="svg-rect" x="110" y="10" width="80" height="80" fill="#1f6feb" data-shape="rectangle" style="cursor:pointer"/>
+      </svg>
+    </div>
+
+    <div class="state-output" id="scenario9-log">Click an SVG shape...</div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 10: ARIA and Accessibility Attributes
+       ========================================================================= -->
+  <div class="test-section" id="scenario-aria">
+    <h2>📋 Scenario 10: ARIA Roles and Labels</h2>
+    <p>Elements identified by accessibility attributes, not classes.</p>
+
+    <div class="aria-section">
+      <div role="button" aria-label="Open Settings" tabindex="0" data-testid="aria-settings">
+        ⚙️ Settings
+      </div>
+
+      <div role="button" aria-label="Open Profile" tabindex="0" data-testid="aria-profile">
+        👤 Profile
+      </div>
+
+      <div role="alert" aria-live="polite" id="aria-alert">
+        ⚠️ This is an alert message
+      </div>
+
+      <nav aria-label="Main Navigation">
+        <ul style="list-style:none;padding:0;display:flex;gap:10px;">
+          <li><a href="#" aria-current="page">Home</a></li>
+          <li><a href="#">Products</a></li>
+          <li><a href="#">About</a></li>
+          <li><a href="#">Contact</a></li>
+        </ul>
+      </nav>
+    </div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 11: Shadow DOM Boundary
+       ========================================================================= -->
+  <div class="test-section challenge" id="scenario-shadow">
+    <h2>📋 Scenario 11: Shadow DOM Boundary (Hard)</h2>
+    <p>Elements inside shadow DOM require context switch.</p>
+
+    <div id="shadow-host"></div>
+  </div>
+
+  <!-- =========================================================================
+       SCENARIO 12: Iframe Boundary
+       ========================================================================= -->
+  <div class="test-section challenge" id="scenario-iframe">
+    <h2>📋 Scenario 12: Cross-Iframe Search (Hard)</h2>
+    <p>Target element exists inside an iframe.</p>
+
+    <div class="iframe-container">
+      <iframe id="search-iframe" srcdoc="
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            body { background: #161b22; color: #c9d1d9; font-family: sans-serif; padding: 15px; margin: 0; }
+            button { background: #f85149; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
+            input { background: #21262d; border: 1px solid #30363d; color: white; padding: 8px; border-radius: 4px; }
+          </style>
+        </head>
+        <body>
+          <h3>Inside Iframe</h3>
+          <input type='text' id='iframe-input' data-testid='iframe-search' placeholder='Search inside iframe...'>
+          <button id='iframe-btn' data-testid='iframe-submit'>Submit</button>
+          <p id='iframe-status'>Status: Ready</p>
+          <script>
+            document.getElementById('iframe-btn').onclick = function() {
+              document.getElementById('iframe-status').textContent = 'Status: Clicked!';
+            };
+          </script>
+        </body>
+        </html>
+      "></iframe>
+    </div>
+  </div>
+
+  <!-- =========================================================================
+       Page Structure Summary (for list_structure tool)
+       ========================================================================= -->
+  <div class="test-section" id="page-summary">
+    <h2>📊 Page Structure Summary</h2>
+    <div class="state-output" id="structure-output">
+      Loading structure...
+    </div>
+  </div>
+
+  <script>
+    // =========================================================================
+    // Dynamic Content Generation
+    // =========================================================================
+
+    // Scenario 2: Generate random IDs
+    (function() {
+      const container = document.getElementById('dynamic-container');
+      const actions = ['Save', 'Cancel', 'Delete', 'Update', 'Refresh'];
+
+      actions.forEach((action, i) => {
+        const btn = document.createElement('button');
+        const randomId = 'btn-' + Math.random().toString(36).substring(2, 10);
+        const randomClass = 'cls-' + Math.random().toString(36).substring(2, 8);
+
+        btn.id = randomId;
+        btn.className = randomClass;
+        btn.textContent = action;
+        btn.setAttribute('data-action-type', action.toLowerCase());
+        btn.setAttribute('data-index', i);
+
+        btn.onclick = () => {
+          document.getElementById('scenario2-log').textContent =
+            `Clicked: ${action} (id=${randomId}, class=${randomClass})`;
+        };
+
+        container.appendChild(btn);
+      });
+    })();
+
+    // Scenario 3: Generate deep nesting
+    (function() {
+      const root = document.getElementById('nest-root');
+      let current = root;
+
+      for (let i = 1; i <= 10; i++) {
+        const div = document.createElement('div');
+        div.className = 'nested-container';
+        div.innerHTML = `<div class="level-indicator">Level ${i}</div>`;
+
+        if (i === 10) {
+          const target = document.createElement('button');
+          target.id = 'deep-target';
+          target.setAttribute('data-testid', 'deeply-nested-button');
+          target.textContent = '🎯 Target Button (Level 10)';
+          target.style.cssText = 'background:#f85149;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;';
+          target.onclick = () => alert('Deep target clicked!');
+          div.appendChild(target);
+        }
+
+        current.appendChild(div);
+        current = div;
+      }
+    })();
+
+    // Scenario 11: Create Shadow DOM
+    (function() {
+      const host = document.getElementById('shadow-host');
+      const shadow = host.attachShadow({ mode: 'open' });
+
+      shadow.innerHTML = `
+        <style>
+          :host { display: block; padding: 15px; background: #1c1428; }
+          h3 { color: #a371f7; margin: 0 0 10px 0; }
+          button { background: #a371f7; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; margin: 5px; }
+          input { background: #21262d; border: 1px solid #a371f7; color: white; padding: 8px; border-radius: 4px; margin: 5px; }
+          .shadow-status { color: #8b949e; margin-top: 10px; font-family: monospace; }
+        </style>
+        <h3>🔮 Shadow DOM Content</h3>
+        <input type="text" id="shadow-input" data-testid="shadow-search" placeholder="Type in shadow...">
+        <button id="shadow-btn" data-testid="shadow-submit">Shadow Submit</button>
+        <div class="shadow-status" id="shadow-status">Status: Ready</div>
+      `;
+
+      shadow.getElementById('shadow-btn').onclick = function() {
+        shadow.getElementById('shadow-status').textContent = 'Status: Shadow button clicked!';
+      };
+
+      // Expose for testing
+      window.__testShadowRoot = shadow;
+    })();
+
+    // =========================================================================
+    // Event Logging
+    // =========================================================================
+
+    // Scenario 1 logging
+    document.querySelectorAll('.duplicate-section button').forEach(btn => {
+      btn.onclick = function() {
+        const action = this.getAttribute('data-action');
+        const section = this.closest('[id$="-section"]').id;
+        document.getElementById('scenario1-log').textContent =
+          `Action: ${action} in ${section}`;
+      };
+    });
+
+    // Scenario 5 logging
+    document.querySelectorAll('.similar-selectors button').forEach(btn => {
+      btn.onclick = function() {
+        const variant = this.getAttribute('data-variant');
+        const classes = this.className;
+        document.getElementById('scenario5-log').textContent =
+          `Clicked variant="${variant}", class="${classes}"`;
+      };
+    });
+
+    // Scenario 6 logging
+    document.querySelectorAll('#users-table button').forEach(btn => {
+      btn.onclick = function() {
+        const action = this.getAttribute('data-action');
+        const userId = this.getAttribute('data-user');
+        const row = this.closest('tr');
+        const email = row.querySelector('td:nth-child(3)').textContent;
+        document.getElementById('scenario6-log').textContent =
+          `${action.toUpperCase()} user ${userId} (${email})`;
+      };
+    });
+
+    // Scenario 7 form state
+    document.getElementById('registration-form').addEventListener('input', function() {
+      const formData = new FormData(this);
+      const state = {};
+      for (let [key, value] of formData.entries()) {
+        state[key] = value;
+      }
+      document.getElementById('scenario7-log').textContent = JSON.stringify(state, null, 2);
+    });
+
+    // Scenario 9 SVG clicks
+    document.querySelectorAll('.svg-container svg *').forEach(el => {
+      el.onclick = function() {
+        const shape = this.getAttribute('data-shape');
+        const id = this.id;
+        document.getElementById('scenario9-log').textContent =
+          `Clicked SVG: ${shape} (id=${id})`;
+      };
+    });
+
+    // =========================================================================
+    // Page Structure Summary
+    // =========================================================================
+
+    function generateStructureSummary() {
+      const summary = {
+        scenarios: [],
+        shadowDOMs: [],
+        iframes: [],
+        interactiveElements: {
+          buttons: document.querySelectorAll('button').length,
+          inputs: document.querySelectorAll('input').length,
+          selects: document.querySelectorAll('select').length,
+          links: document.querySelectorAll('a').length
+        }
+      };
+
+      // List scenarios
+      document.querySelectorAll('.test-section').forEach(section => {
+        const id = section.id;
+        const h2 = section.querySelector('h2');
+        const isHard = section.classList.contains('challenge');
+        summary.scenarios.push({
+          id,
+          title: h2 ? h2.textContent.replace(/📋\s*/, '') : id,
+          difficulty: isHard ? 'hard' : 'normal'
+        });
+      });
+
+      // Shadow DOMs
+      summary.shadowDOMs.push({ host: '#shadow-host', hasContent: true });
+
+      // Iframes
+      document.querySelectorAll('iframe').forEach(iframe => {
+        summary.iframes.push({
+          id: iframe.id || '(anonymous)',
+          src: iframe.src || '(srcdoc)'
+        });
+      });
+
+      return summary;
+    }
+
+    document.getElementById('structure-output').textContent =
+      JSON.stringify(generateStructureSummary(), null, 2);
+
+    // Expose for testing
+    window.__pageStructure = generateStructureSummary;
+  </script>
+</body>
+</html>

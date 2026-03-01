@@ -1,0 +1,5 @@
+Name,Email,Department,Start Date,Active
+Alice,alice@example.com,Engineering,2024-01-15,TRUE
+Bob,bob@example.com,Marketing,2024-02-01,TRUE
+Charlie,charlie@example.com,Sales,2024-03-10,FALSE
+Diana,diana@example.com,Engineering,2024-04-20,TRUE

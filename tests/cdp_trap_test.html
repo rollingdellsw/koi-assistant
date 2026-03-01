@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Koi Bridge: CDP & Trap Test</title>
+    <style>
+        body { background: #111; color: #eee; font-family: system-ui, sans-serif; padding: 20px; }
+        .card { border: 1px solid #333; background: #222; padding: 20px; margin-bottom: 20px; border-radius: 8px; }
+        h2 { margin-top: 0; color: #4ec9b0; }
+        button { background: #3a3a3a; color: white; border: 1px solid #555; padding: 8px 16px; cursor: pointer; border-radius: 4px; }
+        button:hover { background: #555; }
+        input { background: #333; color: white; border: 1px solid #555; padding: 8px; width: 300px; }
+        #log { margin-top: 10px; color: #aaa; font-family: monospace; }
+        .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-right: 5px; }
+        .xhr { background: #c586c0; color: #000; }
+        .fetch { background: #ce9178; color: #000; }
+    </style>
+</head>
+<body>
+    <h1>Koi Bridge Validation</h1>
+
+    <div class="card">
+        <h2>1. CDP Input (press_key)</h2>
+        <p>Standard JS can't always trigger native 'Enter' behavior. CDP can.</p>
+        <input type="text" id="cdp-input" placeholder="Focus me and press Enter via CDP..." />
+        <div id="key-log">Waiting for input...</div>
+    </div>
+
+    <div class="card">
+        <h2>2. Network Traps (XHR & Fetch)</h2>
+        <p>Click these to generate failed requests with response bodies.</p>
+
+        <button id="btn-fetch-404" onclick="triggerFetch()">Trigger Fetch 404</button>
+        <button id="btn-xhr-404" onclick="triggerXHR()">Trigger XHR 404</button>
+    </div>
+
+    <div class="card">
+        <h2>3. Error Trap</h2>
+        <button id="btn-crash" onclick="triggerCrash()">Throw Error</button>
+    </div>
+
+    <script>
+        // Key Logger
+        const input = document.getElementById('cdp-input');
+        const keyLog = document.getElementById('key-log');
+        input.addEventListener('keydown', (e) => {
+            keyLog.innerText = `KeyDown: ${e.key} (Trusted: ${e.isTrusted})`;
+            if (e.key === 'Enter') keyLog.style.color = '#4ec9b0';
+        });
+
+        // Fetch Trigger
+        async function triggerFetch() {
+            try {
+                // Request a non-existent JSON file to get a 404
+                const res = await fetch('missing_resource.json');
+                console.log('Fetch status:', res.status);
+            } catch (e) { console.error(e); }
+        }
+
+        // XHR Trigger
+        function triggerXHR() {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', 'missing_xhr_resource.json');
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) console.log('XHR Status:', xhr.status);
+            };
+            xhr.send();
+        }
+
+        // Crash Trigger
+        function triggerCrash() {
+            // Throw a complex object to test serialization
+            throw new Error("CRITICAL_SYSTEM_FAILURE: Simulated crash for Koi trap testing");
+        }
+    </script>
+</body>
+</html>

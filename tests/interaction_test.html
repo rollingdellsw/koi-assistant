@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Koi Interaction & Trap Test</title>
+  <style>
+    body { background: #1a1a2e; color: #eee; font-family: sans-serif; padding: 20px; }
+    .box { border: 2px solid #4ec9b0; padding: 15px; margin: 10px 0; border-radius: 8px; }
+    button { cursor: pointer; padding: 8px 16px; background: #0e639c; color: white; border: none; border-radius: 4px; }
+    button:hover { background: #1177bb; }
+    .status { margin-left: 10px; font-family: monospace; color: #dcdcaa; }
+    #hover-target { width: 200px; padding: 10px; background: #333; transition: background 0.3s; }
+    #hover-target:hover { background: #e94560; }
+    #hover-status { display: none; }
+    #hover-target:hover #hover-status { display: inline; }
+  </style>
+</head>
+<body>
+  <h1>🧪 Interaction & Trap Test</h1>
+
+  <div class="box">
+    <h3>1. Main Context Interaction</h3>
+    <button id="btn-main" onclick="this.innerText='CLICKED'">Click Me</button>
+    <br><br>
+    <div id="hover-target"
+         onmouseenter="this.innerText='HOVERED_JS'"
+         onmouseleave="this.innerText='Hover Me'">
+      Hover Me
+    </div>
+  </div>
+
+  <div class="box" style="border-color: #e94560">
+    <h3>2. Trap Triggers (Error & Network)</h3>
+    <button id="btn-error" onclick="throw new Error('Test Trap Error')">Trigger JS Error</button>
+    <button id="btn-network" onclick="fetch('/non-existent-resource.json')">Trigger 404 Fetch</button>
+  </div>
+
+  <div id="shadow-host" class="box" style="border-color: #9d4edd"></div>
+
+  <script>
+    // Setup Shadow DOM
+    const host = document.getElementById('shadow-host');
+    const root = host.attachShadow({mode: 'open'});
+    root.innerHTML = `
+      <style>
+        div { padding: 10px; background: #2d2d30; color: #9d4edd; }
+        button { background: #9d4edd; color: #1a1a2e; border: none; padding: 5px 10px; font-weight: bold; }
+      </style>
+      <div>
+        <h3>3. Shadow DOM Interaction</h3>
+        <p>Clicks here must propagate correctly.</p>
+        <button id="btn-shadow" onclick="this.innerText='SHADOW CLICKED'">Click Shadow Button</button>
+      </div>
+    `;
+  </script>
+</body>
+</html>

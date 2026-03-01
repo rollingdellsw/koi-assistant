@@ -1,0 +1,48 @@
+[
+  {
+    "id": "session-auto-title",
+    "trigger": { "type": "context", "condition": { "type": "session_needs_title" } },
+    "content": "This conversation doesn't have a title yet. Try generate a meaningful title if you have enough context, include it in your response using: <set_title>Your Title Here</set_title>.",
+    "strategy": "persistent",
+    "priority": "low"
+  },
+  {
+    "id": "tool-output-truncated",
+    "trigger": { "type": "tool_result", "toolName": ".*", "outputPattern": "Output truncated" },
+    "content": "Tool output was truncated due to size limits. For read_file, use 'start_line' and 'line_count' to paginate. For browser tools, try more specific queries or filters.",
+    "strategy": "one_shot",
+    "priority": "high"
+  },
+  {
+    "id": "max-iteration-limit",
+    "trigger": { "type": "iteration", "every": 15 },
+    "content": "CRITICAL SYSTEM ALERT: You have reached 15 consecutive tool calls, try a different strategy, or ask user.",
+    "strategy": "one_shot",
+    "priority": "high"
+  },
+  {
+    "id": "approaching-max-iterations",
+    "trigger": { "type": "iteration", "remainingBelow": 3 },
+    "content": "CRITICAL WARNING: You have less than 3 turns remaining before the hard iteration limit. STOP exploring, verify your findings, and formulate your final answer immediately.",
+    "strategy": "sticky",
+    "priority": "high"
+  },
+  {
+    "id": "low-context-warning",
+    "trigger": { "type": "context", "condition": { "type": "low_context_window", "threshold": 10000 } },
+    "content": "CONTEXT WINDOW LOW: You are approaching the context limit!",
+    "strategy": "sticky",
+    "priority": "high"
+  },
+  {
+    "id": "subtask-approaching-max-iterations",
+    "description": "Force the subtask agent to finalize its summary before being killed by the loop limit",
+    "trigger": {
+      "type": "iteration",
+      "remainingBelow": 3
+    },
+    "content": "CRITICAL WARNING: You have less than 3 turns remaining before the hard iteration limit. STOP exploring and reading new pages. Immediately formulate your final comprehensive summary and complete the task so your work is not lost.",
+    "strategy": "sticky",
+    "priority": "high"
+  }
+]

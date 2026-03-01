@@ -1,0 +1,46 @@
+{
+  "llm": {
+    "provider": "gemini",
+    "apiKey": "${GEMINI_API_KEY}",
+    "model": "gemini-3-flash-preview",
+    "baseUrl": "https://generativelanguage.googleapis.com",
+    "temperature": 0.7,
+    "contextWindow": 1000000,
+    "maxTokens": 32768,
+    "thinking": {
+      "enabled": true,
+      "budgetLevel": "high",
+      "fallbackToPrompt": false
+    }
+  },
+  "executor": {
+    "model": "gemini-3-flash-preview",
+    "enabled": true,
+    "timeoutMs": 180000,
+    "maxIterations": 20
+  },
+  "tools": {
+    "whitelist": [
+      "run_subtask"
+    ]
+  },
+  "agent": {
+    "systemPrompt": "You are a web assistant with browser use tools.\n\n"
+  },
+  "storage": {
+    "maxSessionStorageMb": 1000,
+    "autoCleanupDays": 90
+  },
+  "skills": {
+    "preload": [
+    ],
+    "comment": "Preload skills make their tools available immediately without LLM calling read_skill"
+  },
+  "gateways": {
+    "default": {
+      "authMethod": "none",
+      "url": "ws://localhost:8080"
+    }
+  },
+  "defaultGateway": "default"
+}

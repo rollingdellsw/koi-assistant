@@ -1,0 +1,47 @@
+{
+  "llm": {
+    "provider": "vllm",
+    "apiKey": "None",
+    "model": "/models/gpt-oss-20b",
+    "contextWindow": 262144,
+    "baseUrl": "http://192.168.68.116:8000/v1",
+    "temperature": 1.0,
+    "topP": 0.95,
+    "maxTokens": 16384,
+    "thinking": {
+      "enabled": true,
+      "budgetLevel": "high",
+      "fallbackToPrompt": false
+    }
+  },
+  "executor": {
+    "enabled": true,
+    "model": "/models/gpt-oss-20b",
+    "timeoutMs": 180000,
+    "maxIterations": 20
+  },
+  "tools": {
+    "whitelist": [
+      "run_subtask"
+    ]
+  },
+  "agent": {
+    "systemPrompt": "You are a web assistant with browser use tools.\n\n"
+  },
+  "storage": {
+    "maxSessionStorageMb": 1000,
+    "autoCleanupDays": 90
+  },
+  "skills": {
+    "preload": [
+    ],
+    "comment": "Preload skills make their tools available immediately without LLM calling read_skill"
+  },
+  "gateways": {
+    "default": {
+      "authMethod": "none",
+      "url": "ws://localhost:8080"
+    }
+  },
+  "defaultGateway": "default"
+}

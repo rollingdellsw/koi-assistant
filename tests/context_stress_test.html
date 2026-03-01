@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Koi Browser Tools - Context Stress Test</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+      min-height: 100vh;
+    }
+
+    h1 {
+      color: #4ec9b0;
+      margin-bottom: 10px;
+    }
+
+    .info {
+      background: #16213e;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      border-left: 4px solid #4ec9b0;
+    }
+
+    .info code {
+      background: #0f3460;
+      padding: 2px 6px;
+      border-radius: 3px;
+      color: #e94560;
+    }
+
+    .context-layer {
+      border: 2px solid #4ec9b0;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 15px 0;
+      background: rgba(78, 201, 176, 0.05);
+    }
+
+    .context-layer h2 {
+      margin: 0 0 10px 0;
+      color: #4ec9b0;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .context-layer h2 .badge {
+      background: #4ec9b0;
+      color: #1a1a2e;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: bold;
+    }
+
+    .form-section {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 15px;
+      margin-top: 10px;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .form-group label {
+      font-size: 12px;
+      color: #888;
+      text-transform: uppercase;
+    }
+
+    .form-group input,
+    .form-group select,
+    .form-group textarea {
+      padding: 8px 12px;
+      border: 1px solid #333;
+      border-radius: 4px;
+      background: #16213e;
+      color: #eee;
+      font-size: 14px;
+    }
+
+    .form-group input:focus,
+    .form-group select:focus,
+    .form-group textarea:focus {
+      outline: none;
+      border-color: #4ec9b0;
+    }
+
+    .form-group textarea {
+      min-height: 60px;
+      resize: vertical;
+    }
+
+    .checkbox-group {
+      flex-direction: row;
+      align-items: center;
+    }
+
+    .checkbox-group input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+    }
+
+    iframe {
+      width: 100%;
+      border: 2px dashed #e94560;
+      border-radius: 8px;
+      background: #0f0f1a;
+      min-height: 300px;
+    }
+
+    .shadow-host {
+      border: 2px dashed #9d4edd;
+      border-radius: 8px;
+      padding: 0;
+      margin: 15px 0;
+      min-height: 100px;
+    }
+
+    .state-display {
+      margin-top: 15px;
+      padding: 10px;
+      background: #0f3460;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+
+    .state-display .label {
+      color: #888;
+      margin-bottom: 5px;
+    }
+
+    .state-display .value {
+      color: #4ec9b0;
+      word-break: break-all;
+    }
+
+    button {
+      padding: 8px 16px;
+      background: #4ec9b0;
+      color: #1a1a2e;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      margin-right: 10px;
+      margin-top: 10px;
+    }
+
+    button:hover {
+      background: #3db89a;
+    }
+
+    button.secondary {
+      background: #e94560;
+      color: #fff;
+    }
+
+    .legend {
+      display: flex;
+      gap: 20px;
+      margin-bottom: 15px;
+      flex-wrap: wrap;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+
+    .legend-item .color {
+      width: 20px;
+      height: 20px;
+      border-radius: 4px;
+    }
+
+    .legend-item .color.main { background: #4ec9b0; }
+    .legend-item .color.iframe { border: 2px dashed #e94560; }
+    .legend-item .color.shadow { border: 2px dashed #9d4edd; }
+  </style>
+</head>
+<body>
+  <h1>🧪 Koi Browser Tools - Context Stress Test</h1>
+
+  <div class="info">
+    <strong>Test Structure:</strong> This page contains nested contexts for testing browser tool context management.
+    <br><br>
+    <strong>Hierarchy:</strong>
+    <code>Main Page</code> → <code>Shadow DOM L1</code> → <code>Iframe L1</code> → <code>Shadow DOM L2</code> → <code>Iframe L2</code> → <code>Shadow DOM L3</code>
+    <br><br>
+    Each layer has unique form fields with predictable IDs for automated testing.
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="color main"></div> Main Context</div>
+    <div class="legend-item"><div class="color iframe"></div> Iframe Boundary</div>
+    <div class="legend-item"><div class="color shadow"></div> Shadow DOM Boundary</div>
+  </div>
+
+  <!-- LAYER 0: Main Document -->
+  <div class="context-layer" data-context="main" data-layer="0">
+    <h2>
+      <span class="badge">L0</span>
+      Main Document Context
+    </h2>
+
+    <div class="form-section">
+      <div class="form-group">
+        <label>Text Input (L0)</label>
+        <input type="text" id="input-L0-text" data-testid="input-L0-text" placeholder="Enter text...">
+      </div>
+
+      <div class="form-group">
+        <label>Email (L0)</label>
+        <input type="email" id="input-L0-email" data-testid="input-L0-email" placeholder="email@example.com">
+      </div>
+
+      <div class="form-group">
+        <label>Number (L0)</label>
+        <input type="number" id="input-L0-number" data-testid="input-L0-number" placeholder="0" value="0">
+      </div>
+
+      <div class="form-group">
+        <label>Select (L0)</label>
+        <select id="input-L0-select" data-testid="input-L0-select">
+          <option value="">-- Select --</option>
+          <option value="option-a">Option A</option>
+          <option value="option-b">Option B</option>
+          <option value="option-c">Option C</option>
+        </select>
+      </div>
+
+      <div class="form-group checkbox-group">
+        <input type="checkbox" id="input-L0-checkbox" data-testid="input-L0-checkbox">
+        <label for="input-L0-checkbox">Checkbox (L0)</label>
+      </div>
+
+      <div class="form-group">
+        <label>Textarea (L0)</label>
+        <textarea id="input-L0-textarea" data-testid="input-L0-textarea" placeholder="Enter multi-line text..."></textarea>
+      </div>
+    </div>
+
+    <div class="state-display">
+      <div class="label">Current State (auto-updated):</div>
+      <div class="value" id="state-L0">-</div>
+    </div>
+
+    <button onclick="resetForm(0)">Reset L0 Form</button>
+    <button onclick="fillWithTestData(0)" class="secondary">Fill Test Data</button>
+  </div>
+
+  <!-- SHADOW DOM HOST L1 -->
+  <div id="shadow-host-L1" class="shadow-host"></div>
+
+  <script>
+    // =========================================================================
+    // Utility Functions
+    // =========================================================================
+
+    function getFormState(layer, root = document) {
+      const prefix = `input-L${layer}-`;
+      const state = {};
+
+      const text = root.querySelector(`[data-testid="${prefix}text"]`);
+      const email = root.querySelector(`[data-testid="${prefix}email"]`);
+      const number = root.querySelector(`[data-testid="${prefix}number"]`);
+      const select = root.querySelector(`[data-testid="${prefix}select"]`);
+      const checkbox = root.querySelector(`[data-testid="${prefix}checkbox"]`);
+      const textarea = root.querySelector(`[data-testid="${prefix}textarea"]`);
+
+      if (text) state.text = text.value;
+      if (email) state.email = email.value;
+      if (number) state.number = number.value;
+      if (select) state.select = select.value;
+      if (checkbox) state.checkbox = checkbox.checked;
+      if (textarea) state.textarea = textarea.value;
+
+      return state;
+    }
+
+    function updateStateDisplay(layer, root = document) {
+      const state = getFormState(layer, root);
+      const display = root.querySelector(`#state-L${layer}`);
+      if (display) {
+        display.textContent = JSON.stringify(state, null, 2);
+      }
+    }
+
+    function resetForm(layer, root = document) {
+      const prefix = `input-L${layer}-`;
+
+      const text = root.querySelector(`[data-testid="${prefix}text"]`);
+      const email = root.querySelector(`[data-testid="${prefix}email"]`);
+      const number = root.querySelector(`[data-testid="${prefix}number"]`);
+      const select = root.querySelector(`[data-testid="${prefix}select"]`);
+      const checkbox = root.querySelector(`[data-testid="${prefix}checkbox"]`);
+      const textarea = root.querySelector(`[data-testid="${prefix}textarea"]`);
+
+      if (text) text.value = '';
+      if (email) email.value = '';
+      if (number) number.value = '0';
+      if (select) select.value = '';
+      if (checkbox) checkbox.checked = false;
+      if (textarea) textarea.value = '';
+
+      updateStateDisplay(layer, root);
+    }
+
+    function fillWithTestData(layer, root = document) {
+      const prefix = `input-L${layer}-`;
+
+      const text = root.querySelector(`[data-testid="${prefix}text"]`);
+      const email = root.querySelector(`[data-testid="${prefix}email"]`);
+      const number = root.querySelector(`[data-testid="${prefix}number"]`);
+      const select = root.querySelector(`[data-testid="${prefix}select"]`);
+      const checkbox = root.querySelector(`[data-testid="${prefix}checkbox"]`);
+      const textarea = root.querySelector(`[data-testid="${prefix}textarea"]`);
+
+      if (text) text.value = `TestValue-L${layer}`;
+      if (email) email.value = `test-L${layer}@example.com`;
+      if (number) number.value = String(layer * 100 + 42);
+      if (select) select.value = ['option-a', 'option-b', 'option-c'][layer % 3];
+      if (checkbox) checkbox.checked = layer % 2 === 0;
+      if (textarea) textarea.value = `Multi-line text for Layer ${layer}\nLine 2\nLine 3`;
+
+      updateStateDisplay(layer, root);
+    }
+
+    // Expose globally for iframe access
+    window.getFormState = getFormState;
+    window.updateStateDisplay = updateStateDisplay;
+    window.resetForm = resetForm;
+    window.fillWithTestData = fillWithTestData;
+
+    // =========================================================================
+    // Setup L0 State Tracking
+    // =========================================================================
+
+    document.querySelectorAll('[data-testid^="input-L0-"]').forEach(el => {
+      el.addEventListener('input', () => updateStateDisplay(0));
+      el.addEventListener('change', () => updateStateDisplay(0));
+    });
+    updateStateDisplay(0);
+
+    // =========================================================================
+    // Create Shadow DOM L1
+    // =========================================================================
+
+    const shadowHostL1 = document.getElementById('shadow-host-L1');
+    const shadowRootL1 = shadowHostL1.attachShadow({ mode: 'open' });
+
+    shadowRootL1.innerHTML = `
+      <style>
+        :host {
+          display: block;
+          padding: 15px;
+          background: rgba(157, 78, 221, 0.05);
+        }
+
+        .context-layer {
+          border: 2px solid #9d4edd;
+          border-radius: 8px;
+          padding: 15px;
+          background: rgba(157, 78, 221, 0.1);
+        }
+
+        h2 {
+          margin: 0 0 10px 0;
+          color: #9d4edd;
+          font-size: 16px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        h2 .badge {
+          background: #9d4edd;
+          color: #1a1a2e;
+          padding: 2px 8px;
+          border-radius: 4px;
+          font-size: 12px;
+          font-weight: bold;
+        }
+
+        .form-section {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 15px;
+          margin-top: 10px;
+        }
+
+        .form-group {
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+        }
+
+        .form-group label {
+          font-size: 12px;
+          color: #888;
+          text-transform: uppercase;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+          padding: 8px 12px;
+          border: 1px solid #333;
+          border-radius: 4px;
+          background: #16213e;
+          color: #eee;
+          font-size: 14px;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+          outline: none;
+          border-color: #9d4edd;
+        }
+
+        .form-group textarea {
+          min-height: 60px;
+          resize: vertical;
+        }
+
+        .checkbox-group {
+          flex-direction: row;
+          align-items: center;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+          width: 18px;
+          height: 18px;
+        }
+
+        .state-display {
+          margin-top: 15px;
+          padding: 10px;
+          background: #1a1a2e;
+          border-radius: 4px;
+          font-family: monospace;
+          font-size: 12px;
+        }
+
+        .state-display .label {
+          color: #888;
+          margin-bottom: 5px;
+        }
+
+        .state-display .value {
+          color: #9d4edd;
+          word-break: break-all;
+        }
+
+        button {
+          padding: 8px 16px;
+          background: #9d4edd;
+          color: #fff;
+          border: none;
+          border-radius: 4px;
+          cursor: pointer;
+          font-weight: bold;
+          margin-right: 10px;
+          margin-top: 10px;
+        }
+
+        button:hover {
+          background: #8b3dc9;
+        }
+
+        button.secondary {
+          background: #e94560;
+        }
+
+        iframe {
+          width: 100%;
+          border: 2px dashed #e94560;
+          border-radius: 8px;
+          background: #0f0f1a;
+          min-height: 400px;
+          margin-top: 15px;
+        }
+      </style>
+
+      <div class="context-layer" data-context="shadow-L1" data-layer="1">
+        <h2>
+          <span class="badge">L1</span>
+          Shadow DOM Context (Level 1)
+        </h2>
+
+        <div class="form-section">
+          <div class="form-group">
+            <label>Text Input (L1)</label>
+            <input type="text" id="input-L1-text" data-testid="input-L1-text" placeholder="Enter text...">
+          </div>
+
+          <div class="form-group">
+            <label>Email (L1)</label>
+            <input type="email" id="input-L1-email" data-testid="input-L1-email" placeholder="email@example.com">
+          </div>
+
+          <div class="form-group">
+            <label>Number (L1)</label>
+            <input type="number" id="input-L1-number" data-testid="input-L1-number" placeholder="0" value="0">
+          </div>
+
+          <div class="form-group">
+            <label>Select (L1)</label>
+            <select id="input-L1-select" data-testid="input-L1-select">
+              <option value="">-- Select --</option>
+              <option value="option-a">Option A</option>
+              <option value="option-b">Option B</option>
+              <option value="option-c">Option C</option>
+            </select>
+          </div>
+
+          <div class="form-group checkbox-group">
+            <input type="checkbox" id="input-L1-checkbox" data-testid="input-L1-checkbox">
+            <label for="input-L1-checkbox">Checkbox (L1)</label>
+          </div>
+
+          <div class="form-group">
+            <label>Textarea (L1)</label>
+            <textarea id="input-L1-textarea" data-testid="input-L1-textarea" placeholder="Enter multi-line text..."></textarea>
+          </div>
+        </div>
+
+        <div class="state-display">
+          <div class="label">Current State (auto-updated):</div>
+          <div class="value" id="state-L1">-</div>
+        </div>
+
+        <button id="reset-L1">Reset L1 Form</button>
+        <button id="fill-L1" class="secondary">Fill Test Data</button>
+
+        <!-- Iframe L1 inside Shadow DOM L1 -->
+        <iframe id="iframe-L1" src="iframe-L1.html"></iframe>
+      </div>
+    `;
+
+    // Setup L1 event listeners
+    const l1Root = shadowRootL1;
+    l1Root.querySelectorAll('[data-testid^="input-L1-"]').forEach(el => {
+      el.addEventListener('input', () => {
+        const state = window.getFormState(1, l1Root);
+        l1Root.getElementById('state-L1').textContent = JSON.stringify(state, null, 2);
+      });
+      el.addEventListener('change', () => {
+        const state = window.getFormState(1, l1Root);
+        l1Root.getElementById('state-L1').textContent = JSON.stringify(state, null, 2);
+      });
+    });
+
+    l1Root.getElementById('reset-L1').addEventListener('click', () => {
+      window.resetForm(1, l1Root);
+    });
+
+    l1Root.getElementById('fill-L1').addEventListener('click', () => {
+      window.fillWithTestData(1, l1Root);
+    });
+
+    // Initial state
+    const initState1 = window.getFormState(1, l1Root);
+    l1Root.getElementById('state-L1').textContent = JSON.stringify(initState1, null, 2);
+
+    // Expose shadow root for testing
+    window.__shadowRootL1 = shadowRootL1;
+  </script>
+</body>
+</html>

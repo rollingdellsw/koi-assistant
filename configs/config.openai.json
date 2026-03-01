@@ -1,0 +1,46 @@
+{
+  "llm": {
+    "provider": "openai",
+    "apiKey": "${OPENAI_API_KEY}",
+    "model": "gpt-5.2",
+    "contextWindow": 400000,
+    "baseUrl": "https://api.openai.com/v1",
+    "temperature": 1.0,
+    "maxTokens": 128000,
+    "thinking": {
+      "enabled": true,
+      "budgetLevel": "high",
+      "fallbackToPrompt": false
+    }
+  },
+  "executor": {
+    "enabled": true,
+    "model": "gpt-5.2",
+    "timeoutMs": 180000,
+    "maxIterations": 20
+  },
+  "tools": {
+    "whitelist": [
+      "run_subtask"
+    ]
+  },
+  "agent": {
+    "systemPrompt": "You are a web assistant with browser use tools.\n\n"
+  },
+  "storage": {
+    "maxSessionStorageMb": 1000,
+    "autoCleanupDays": 90
+  },
+  "skills": {
+    "preload": [
+    ],
+    "comment": "Preload skills make their tools available immediately without LLM calling read_skill"
+  },
+  "gateways": {
+    "default": {
+      "authMethod": "none",
+      "url": "ws://localhost:8080"
+    }
+  },
+  "defaultGateway": "default"
+}
