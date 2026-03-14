@@ -53,6 +53,27 @@ if (!pageTitle.includes("Interaction & Trap Test")) {
 console.log("✅ Page Verified. Starting Phase 1...");
 
 // ────────────────────────────────────────────────────────────────────────────
+// PHASE 0a: Snapshot Mode Tests
+// ────────────────────────────────────────────────────────────────────────────
+console.log("\n📋 PHASE 0a: Snapshot Mode Verification");
+
+// readable mode (default) - clean text
+const readableSnap = await tools.takeSnapshot({ selector: 'body' });
+const readable = (typeof readableSnap === 'string' ? JSON.parse(readableSnap) : readableSnap);
+console.log(`  Readable mode: ${readable.totalLength} chars, mode=${readable.mode || 'readable'}`);
+
+// dom mode - compact tree for selectors
+const domSnap = await tools.takeSnapshot({ selector: 'body', mode: 'dom', maxDepth: 5 });
+const domResult = (typeof domSnap === 'string' ? JSON.parse(domSnap) : domSnap);
+console.log(`  DOM mode: ${domResult.totalLength} chars, mode=${domResult.mode || 'dom'}`);
+console.log(`  DOM preview:\n${domResult.content?.substring(0, 300)}`);
+
+// full mode - raw legacy
+const fullSnap = await tools.takeSnapshot({ selector: 'body', mode: 'full' });
+const fullResult = (typeof fullSnap === 'string' ? JSON.parse(fullSnap) : fullSnap);
+console.log(`  Full mode: ${fullResult.totalLength} chars, mode=${fullResult.mode || 'full'}`);
+
+// ────────────────────────────────────────────────────────────────────────────
 // PHASE 0: Request Action (User-Assisted Highlight)
 // ────────────────────────────────────────────────────────────────────────────
 console.log("\n📋 PHASE 0: Request Action (Highlight + Tooltip)");

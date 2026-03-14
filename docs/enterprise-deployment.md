@@ -380,4 +380,7 @@ To revoke a specific instance, use the Polar API or dashboard to deactivate the 
 | Authentication (ADC) | `chrome.identity.getAuthToken` → Google IAM enforces roles |
 | License enforcement  | Polar.sh activation on startup; no activation = no agent   |
 | Config immutability  | Enterprise mode disables save/edit/add/delete in UI        |
+
+```
+
 ```

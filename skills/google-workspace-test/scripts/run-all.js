@@ -317,9 +317,9 @@ async function suiteDrive() {
 async function suiteGuardrailNegative() {
   // Guardrail deny: write to non-owned files
   const fakeIds = [
-    { tool: "sheets_write_range", args: { spreadsheetId: "FAKE_ID_AAA", range: "A1", values: [["x"]] }, label: "sheets_write" },
-    { tool: "docs_batch_update", args: { documentId: "FAKE_ID_BBB", requests: [{ insertText: { text: "x", location: { index: 1 } } }] }, label: "docs_update" },
-    { tool: "slides_batch_update", args: { presentationId: "FAKE_ID_CCC", requests: [{ createSlide: {} }] }, label: "slides_update" },
+    { tool: "sheets_write_range", args: { spreadsheetId: "1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", range: "A1", values: [["x"]] }, label: "sheets_write" },
+    { tool: "docs_batch_update", args: { documentId: "1BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", requests: [{ insertText: { text: "x", location: { index: 1 } } }] }, label: "docs_update" },
+    { tool: "slides_batch_update", args: { presentationId: "1CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", requests: [{ createSlide: {} }] }, label: "slides_update" },
   ];
 
   for (const { tool, args, label } of fakeIds) {
@@ -334,10 +334,10 @@ async function suiteGuardrailNegative() {
 
   // Error handling: bad IDs
   const badReads = [
-    { tool: "sheets_read_range", args: { spreadsheetId: "BAD_ID", range: "A1:B2" }, label: "bad sheet read" },
-    { tool: "docs_read_content", args: { documentId: "BAD_ID" }, label: "bad doc read" },
-    { tool: "slides_get_metadata", args: { presentationId: "BAD_ID" }, label: "bad slides read" },
-    { tool: "gmail_get_message", args: { messageId: "BAD_ID" }, label: "bad gmail read" },
+    { tool: "sheets_read_range", args: { spreadsheetId: "NONEXISTENT_ID_12345", range: "A1:B2" }, label: "bad sheet read" },
+    { tool: "docs_read_content", args: { documentId: "NONEXISTENT_DOC_12345" }, label: "bad doc read" },
+    { tool: "slides_get_metadata", args: { presentationId: "NONEXISTENT_SLIDES_12345" }, label: "bad slides read" },
+    { tool: "gmail_get_message", args: { messageId: "NONEXISTENT_MSG_12345" }, label: "bad gmail read" },
   ];
 
   for (const { tool, args, label } of badReads) {

@@ -24,6 +24,16 @@ reminders:
     content: "⚠️ Context running low. Stop creating new workspaces. Summarize findings."
     strategy: "sticky"
     priority: "high"
+  - id: "osd:saccadic-memory"
+    trigger:
+      type: "tool_result"
+      toolName: "create_workspace"
+    content: |
+      Focus Shifted: You have created a new active Visual Workspace.
+      Remember that your previous workspaces are now demoted to low-res thumbnails to save context window space.
+      Before you pan away or create your next workspace, ALWAYS use `<scratchpad_update>...</scratchpad_update>` to jot down your analysis of the current image ID so you have a persistent record of what you found.
+    strategy: "sticky"
+    priority: "high"
 guardrails: scripts/guardrail.js
 ---
 

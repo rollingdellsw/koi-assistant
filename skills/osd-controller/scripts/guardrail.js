@@ -8,13 +8,6 @@ module.exports = {
       };
     }
 
-    // Rule 2: Limit concurrent workspaces
-    if (ctx.tool.name === 'create_workspace') {
-      const wsCount = Object.keys(ctx.memory?.snapshot || {}).length;
-      if (wsCount >= 3) {
-        return { allowed: false, message: 'Max 3 workspaces. Delete old ones before creating more.' };
-      }
-    }
     return { allowed: true };
   }
 };

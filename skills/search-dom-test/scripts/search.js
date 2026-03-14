@@ -13,6 +13,8 @@
 //   cat (read content)     →    inspect_element (get details)
 //   vim (edit)             →    click / fill (interact)
 //
+// Snapshot Modes: readable (default, clean text), dom (selector tree), full (raw textContent)
+//
 // Run with: /run discovery-workflow
 // ============================================================================
 
@@ -144,6 +146,52 @@ if (emailSearch.count === 1) {
   console.log(`   Current value: "${details.value || ''}"` );
   console.log(`   Visible: ${details.visible}`);
 }
+
+// ============================================================================
+// STEP 4b: SNAPSHOT MODES - "Different views of the same page"
+// ============================================================================
+
+console.log("\n\n📸 STEP 4b: Snapshot Modes");
+console.log("═".repeat(50));
+console.log("(Like 'cat' vs 'tree' vs 'hexdump' - different views)\n");
+
+// Mode: readable (default) - clean text stripped of boilerplate
+console.log("Mode: 'readable' (default) — clean text, structure markers:");
+const readableSnap = await tools.takeSnapshot({ selector: '#registration-form' });
+const readableText = (typeof readableSnap === 'string' ? JSON.parse(readableSnap) : readableSnap);
+console.log(`   Length: ${readableText.totalLength} chars`);
+console.log(`   Preview: ${readableText.content?.substring(0, 200)}...`);
+
+// Mode: dom - compact DOM tree for finding selectors
+console.log("\nMode: 'dom' — compact DOM tree for selector targeting:");
+const domSnap = await tools.takeSnapshot({ selector: '#registration-form', mode: 'dom' });
+const domText = (typeof domSnap === 'string' ? JSON.parse(domSnap) : domSnap);
+console.log(`   Length: ${domText.totalLength} chars`);
+console.log(`   Preview:\n${domText.content?.substring(0, 400)}`);
+
+// Mode: dom with maxDepth limit
+console.log("\nMode: 'dom' with maxDepth=3 — shallow tree:");
+const shallowDom = await tools.takeSnapshot({ selector: '#registration-form', mode: 'dom', maxDepth: 3 });
+const shallowText = (typeof shallowDom === 'string' ? JSON.parse(shallowDom) : shallowDom);
+console.log(`   Length: ${shallowText.totalLength} chars`);
+console.log(`   Preview:\n${shallowText.content?.substring(0, 300)}`);
+
+// Mode: full - raw textContent (legacy, for grep operations)
+console.log("\nMode: 'full' — raw textContent (legacy):");
+const fullSnap = await tools.takeSnapshot({ selector: '#registration-form', mode: 'full' });
+const fullText = (typeof fullSnap === 'string' ? JSON.parse(fullSnap) : fullSnap);
+console.log(`   Length: ${fullText.totalLength} chars`);
+console.log(`   Preview: ${fullText.content?.substring(0, 200)}...`);
+
+// Screenshot with resolution control
+console.log("\n📷 Screenshot resolution tiers:");
+const lowShot = await tools.takeScreenshot({ resolution: 'low' });
+const lowData = (typeof lowShot === 'string' ? JSON.parse(lowShot) : lowShot);
+console.log(`   Low (768px): data length = ${lowData.data?.length ?? 0} chars`);
+
+const highShot = await tools.takeScreenshot({ resolution: 'high' });
+const highData = (typeof highShot === 'string' ? JSON.parse(highShot) : highShot);
+console.log(`   High (1980px): data length = ${highData.data?.length ?? 0} chars`);
 
 // ============================================================================
 // STEP 5: ACT ON ELEMENT - "Make the change"
@@ -294,6 +342,9 @@ This mirrors file system navigation:
 Key Principles:
   • Start broad, narrow down
   • Check visibility before acting
+  • Use take_snapshot mode='dom' to discover selectors efficiently
+  • Use take_snapshot mode='readable' (default) for text content
+  • Use take_screenshot resolution='low' (default) to save context tokens
   • Use data-testid when available
   • Switch contexts explicitly for shadow/iframe
   • Verify actions with follow-up queries

@@ -60,12 +60,52 @@ return {
   async getViewer() {
     if (this._handle) return this._handle;
 
-    // Use static finder instead of dynamic code
-    const res = await runtime.acquireHandle('openseadragon_viewer', {});
+    const OSD_FINDER_SCRIPT = `() => {
+      function isViewer(obj) {
+        return obj && typeof obj === 'object' && obj.viewport && obj.world && typeof obj.viewport.zoomTo === 'function';
+      }
+      function findViewer() {
+        if (isViewer(window.viewer)) return window.viewer;
+        if (isViewer(window.osd)) return window.osd;
+        const selectors = ['.openseadragon-canvas', '#osd', '[data-testid="image-viewer"]', '.openseadragon-container'];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const key = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternal'));
+          if (!key) continue;
+          let fiber = el[key];
+          let depth = 0;
+          while (fiber && depth < 15) {
+            const candidates = [
+              fiber.stateNode,
+              fiber.memoizedProps?.viewer,
+              fiber.stateNode?.viewer,
+              fiber.memoizedState?.memoizedState
+            ];
+            for (const item of candidates) {
+              if (isViewer(item)) return item;
+              if (item?.current && isViewer(item.current)) return item.current;
+            }
+            fiber = fiber.return;
+            depth++;
+          }
+        }
+        return null;
+      }
+      const viewer = findViewer();
+      if (!viewer) return { error: "Viewer not found. Ensure the page has fully loaded." };
+      if (!window.__deftHandles) return { error: "Extension handle registry not initialized" };
+      return { handleId: window.__deftHandles.store(viewer) };
+    }`;
+
+    const res = await runtime.evaluateScript(OSD_FINDER_SCRIPT, {}, "MAIN");
     if (res.error) {
-      throw new Error(`Viewer not found: ${res.error}. Diagnostics: ${res.diagnostics ? res.diagnostics.join(', ') : 'none'}`);
+      throw new Error(`Viewer not found: ${res.error}`);
     }
-    this._handle = res.handleId;
+    if (res.result && res.result.error) {
+      throw new Error(`Viewer not found: ${res.result.error}`);
+    }
+    this._handle = res.result.handleId;
     return this._handle;
   },
 

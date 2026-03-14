@@ -18,6 +18,7 @@ _Koi™ brings peace to your mind_
 
 - **Cross-Source Data Reporting:** Chain multiple data sources together, such as querying a PostgreSQL database via a remote gateway and automatically exporting the results into a formatted Google Sheet.
 - **Per-page Browser Automation with JS Code:** Write your own Skill's JavaScript code to control your web pages, automate your workflows with **deterministic** precision, low-cost, yet maximum security.
+- **Event Triggered Automation:** Program your skill to [watch for](./skills/wait-for-demo/) asynchronous events, then launch sub-agents in a [for loop](./skills/gmail-summarizer/scripts/analyze.js) to handle workflows automatically.
 
 ---
 
@@ -41,12 +42,22 @@ To realize the true ROI of AI in the enterprise, we must shift our perspective o
 
 ► [Air-Gapped Enterprise AI](https://www.youtube.com/watch?v=oyxBI8R7hWk) — Watch Koi orchestrate a 14-page document analysis using an on-premise LLM server, keeping 100% of the data behind the firewall.
 
+### Gentle, Non-Intrusive Guidance
+
+Koi™ is designed to be a Co-Pilot, not a runaway bot. When navigating complex web applications, Koi™ doesn't just hijack your mouse; it gently highlights elements on the page with clear, context-aware tooltips, ensuring you remain in control of the workflow.
+
+<div align="center">
+  <img src="./docs/visual-help-1.png" width="48%" alt="User asking for help in Model Studio">
+  <img src="./docs/visual-help-2.png" width="48%" alt="Koi Assistant gently highlighting the exact button to click">
+  <br>
+  <em>The agent analyzes the page and provides a non-intrusive visual overlay to guide your next action.</em>
+</div>
 
 ---
 
 ## Quick Start
 
-1. Install the Koi™ extension in Chrome
+1. Install the Koi™ extension from [Chrome Web Store](https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng)
 2. Click the Koi icon → open the side panel → enter your LLM API key (in enterprise setup, this is [managed](./docs/enterprise-deployment.md) by IT)
 3. Open any web page, press `CTRL + Mouse Select` to capture a region, ask your question
 
@@ -240,23 +251,6 @@ This support for managed deployment is the only feature difference between paid 
 **Web application testing** — Load the [Chrome Developer Tools](./skills/chrome-developer-tools) skill → Agent navigates forms, fills fields, clicks buttons → Traps catch console errors and network failures → Agent reports issues with screenshots.
 
 **Domain-specific visual review** — Load the [OpenSeadragon skill](./skills/osd-controller) → AI controls zoom/pan on a 100M-pixel image via MCP server → CTRL+Select a region → Both you and the AI annotate areas of interest → Navigate to specific coordinates for a full diagnostic session.
-
----
-
-## Installation
-
-### From Chrome Web Store
-
-Install from https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng
-
-### Configuration
-
-1. Click the Koi icon in the toolbar
-2. Open Settings in the side panel
-3. Select a provider (Anthropic, Google Gemini, OpenRouter, OpenAI) or connect to a local LLM (Llama.cpp, vLLM, MLX)
-4. Enter your LLM API key
-
-→ [Full Configuration Guide](./docs/configuration.md)
 
 ---
 
