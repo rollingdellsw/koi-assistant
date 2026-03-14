@@ -247,7 +247,7 @@ This support for managed deployment is the only feature difference between paid 
 
 ### From Chrome Web Store
 
-_(Coming soon)_
+Install from https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng
 
 ### Configuration
 

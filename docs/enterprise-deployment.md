@@ -30,22 +30,18 @@ Licenses are purchased and managed through [Polar.sh](https://polar.sh), which h
 2. After checkout, your License Key is displayed on the confirmation page and emailed to the purchasing address.
 3. Copy the **full license key string** (e.g., `ENTERPRISE EXTENSION LICENSE-1CDB88D8-1742-419D-B383-F7565C01045B`). The prefix is part of the key — do not use only the UUID portion.
 
-### 1.2 Retrieve Your Organization ID
-
-1. Log into your Polar.sh dashboard.
-2. Click your organization name in the sidebar, then select **Settings**.
-3. Copy the **Organization ID** (a UUID, e.g., `ed4fc9dc-51a6-4a40-88fa-2371bc696a75`).
-
-### 1.3 Verify the License (Optional)
+### 1.2 Verify the License (Optional)
 
 Confirm the license is valid before deploying to endpoints:
+
+Set organization_id to `fe1d02a0-6354-4cb9-bd05-52abfbafc707`, which is Rollingdell Software Service LLC's organization_id on Polar.sh.
 
 ```bash
 curl -X POST https://api.polar.sh/v1/customer-portal/license-keys/validate \
   -H "Content-Type: application/json" \
   -d '{
     "key": "ENTERPRISE EXTENSION LICENSE-1CDB88D8-...",
-    "organization_id": "ed4fc9dc-..."
+    "organization_id": "fe1d02a0-6354-4cb9-bd05-52abfbafc707"
   }'
 ```
 
@@ -145,7 +141,7 @@ If you see `accessToken=MISSING, projectId=MISSING`, ensure you are running exte
 
 ## Phase 3: Chrome Managed Policy Deployment
 
-Chrome reads managed extension policies from the host OS. The extension ID for the production build is `ckcmgcddobmmbcneegigkkdfljiademi`. For sideloaded builds, find the ID at `chrome://extensions`.
+Chrome reads managed extension policies from the host OS. The extension ID for the production build is `aedfofodkbfgnjknkjpockkgajemkbng`. For sideloaded builds, find the ID at `chrome://extensions`.
 
 ### 3.1 Policy Values
 
@@ -154,7 +150,7 @@ Create the following string values under the extension's policy path:
 | Name                       | Value                                                             | Notes                                  |
 | -------------------------- | ----------------------------------------------------------------- | -------------------------------------- |
 | `license_key`              | `ENTERPRISE EXTENSION LICENSE-...`                                | Full string from Polar.sh              |
-| `organization_id`          | `ed4fc9dc-...`                                                    | UUID from Polar.sh Settings            |
+| `organization_id`          | `fe1d02a0-6354-4cb9-bd05-52abfbafc707`                            | UUID from Polar.sh Settings            |
 | `skill_signing_public_key` | `-----BEGIN PUBLIC KEY-----\nMFkw...\n-----END PUBLIC KEY-----\n` | PEM with literal `\n`                  |
 | `allowed_skill_names`      | `["google-workspace", "pdf", ...]`                                | JSON array of approved skill names     |
 | `default_config`           | `corp-gemini`                                                     | Name of the config profile to activate |
@@ -162,7 +158,7 @@ Create the following string values under the extension's policy path:
 
 ### 3.2 Windows (Registry / GPO / Intune)
 
-Path: `HKEY_CURRENT_USER\SOFTWARE\Policies\Google\Chrome\3rdparty\extensions\<KOI_EXTENSION_ID>\policy`
+Path: `HKEY_CURRENT_USER\SOFTWARE\Policies\Google\Chrome\3rdparty\extensions\aedfofodkbfgnjknkjpockkgajemkbng\policy`
 
 Create each value above as a **String Value (REG_SZ)**. For GPO/Intune mass deployment, export as a `.reg` file or use ADMX templates.
 
@@ -178,7 +174,7 @@ Create a JSON file at `/etc/opt/chrome/policies/managed/koi-enterprise.json`:
     "extensions": {
       "<EXTENSION_ID>": {
         "license_key": "ENTERPRISE EXTENSION LICENSE-...",
-        "organization_id": "ed4fc9dc-...",
+        "organization_id": "fe1d02a0-6354-4cb9-bd05-52abfbafc707",
         "skill_signing_public_key": "-----BEGIN PUBLIC KEY-----\nMFkw...",
         "allowed_skill_names": ["google-workspace", "pdf"],
         "default_config": "corp-gemini",
