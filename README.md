@@ -20,6 +20,8 @@ _Koi™ brings peace to your mind_
 - **Per-page Browser Automation with JS Code:** Write your own Skill's JavaScript code to control your web pages, automate your workflows with **deterministic** precision, low-cost, yet maximum security.
 - **Event Triggered Automation:** Program your skill to [watch for](./skills/wait-for-demo/) asynchronous events, then launch sub-agents in a [for loop](./skills/gmail-summarizer/scripts/analyze.js) to handle workflows automatically.
 
+[![Summarize an Outlook email with PDF, Word, and PNG attachments](https://img.youtube.com/vi/WOCZ1AfRJ5E/0.jpg)](https://youtu.be/WOCZ1AfRJ5E)
+
 ---
 
 ## The Philosophy: The Browser as the Enterprise OS
