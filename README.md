@@ -90,7 +90,9 @@ The AI sees what you see, annotates directly on the page, and helps you understa
 
 The captured region is displayed as an overlay on the page at its original position. Both you and the LLM can annotate it with rectangles, arrows, and text. The overlay persists until you dismiss it, keeping the conversation grounded in what you're looking at. An image stack in the side panel preserves visual history across turns.
 
-[![Watch OpenSeadragon demo](https://img.youtube.com/vi/3vWLvAOzu5Q/0.jpg)](https://youtu.be/3vWLvAOzu5Q)
+#### Watch Koi™ Working on a 100M-pixel Pathology Image
+
+[![Watch OpenSeadragon demo](https://img.youtube.com/vi/UlqHjMf5eUc/0.jpg)](https://youtu.be/UlqHjMf5eUc)
 
 ### 2. Skills System — Extend What the Agent Can Do
 
