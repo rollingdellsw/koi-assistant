@@ -3,6 +3,7 @@
 // Tests: Click, Hover, Trap System (Error/Network)
 // ============================================================================
 
+await tools.readSkill({ name: "dom-interactor" });
 console.log("🧪 Starting Wait-for Test...");
 
 // Refresh the test page to start clean

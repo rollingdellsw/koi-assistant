@@ -7,6 +7,7 @@ return {
       {
         name: "click",
         description: "Directly click an element via JS.",
+        displayMessage: "👆 Clicking `{{selector}}`",
         inputSchema: {
           type: "object",
           properties: { selector: { type: "string" } },
@@ -16,6 +17,7 @@ return {
       {
         name: "fill",
         description: "Directly set value of an input.",
+        displayMessage: '✏️ Filling `{{selector}}` with "{{value}}"',
         inputSchema: {
           type: "object",
           properties: {
@@ -28,6 +30,7 @@ return {
       {
         name: "hover",
         description: "Simulate hover event.",
+        displayMessage: "🖱️ Hovering `{{selector}}`",
         inputSchema: {
           type: "object",
           properties: { selector: { type: "string" } },
@@ -37,6 +40,7 @@ return {
       {
         name: "press_key",
         description: "Press a key or key combination.",
+        displayMessage: "⌨️ Pressing {{key}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -51,6 +55,7 @@ return {
       {
         name: "set_trap",
         description: "Register a background listener for crashes or network failures.",
+        displayMessage: "🪤 Setting {{trigger}} trap: {{name}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -64,6 +69,7 @@ return {
       {
         name: "remove_trap",
         description: "Remove a previously set trap.",
+        displayMessage: "🪤 Removing trap: {{name}}",
         inputSchema: {
           type: "object",
           properties: { name: { type: "string" } },

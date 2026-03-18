@@ -91,27 +91,72 @@ The following tools also require the **chrome-developer-tools** skill:
 **Why use it?**
 If a process is strictly deterministic (e.g., clicking 5 specific buttons to export a report), forcing the LLM to do it step-by-step wastes tokens, takes minutes, and risks hallucination. By bundling a script, the LLM simply calls `run_browser_script({ script_path: "my-skill:scripts/export.js" })` to execute the macro instantly.
 
-### 2.1. Advanced Page Interaction: The Handle System (`acquireHandle`)
+### 2.1. Advanced Page Interaction: The Handle System
 
-When interacting with complex, memory-heavy JavaScript objects on a webpage (like an OpenSeadragon viewer or a massive React state tree), serializing the object across the sandbox boundary via `evaluateScript` will crash the browser.
+When interacting with complex, memory-heavy JavaScript objects on a webpage (like an OpenSeadragon viewer or a massive React state tree), serializing the entire object across the sandbox boundary will crash the browser.
 
-Koi provides a Handle API to manage object references entirely on the target page:
+Koi provides a **Handle System** to manage object references entirely on the target page. The workflow has two parts:
+
+1. **Find & register** the object using `runtime.evaluateScript()` — your finder script runs in the page's `MAIN` world, locates the object, and stores it in `window.__deftHandles`.
+2. **Operate on it by handle** using `runtime.invokeOnHandle()` and `runtime.getFromHandle()` — these call methods or read properties without ever serializing the object across the boundary.
+
+#### Object Discovery with `evaluateScript`
+
+Each MCP server is responsible for its own object discovery logic. The finder script runs as a self-contained IIFE in the page's MAIN world:
 
 ```javascript
-// 1. Acquire a handle to the object on the target page
-const res = await runtime.acquireHandle("openseadragon_viewer", {});
-const handleId = res.handleId; // e.g., "h_1"
+// Example: finding a DOM element or global object (from dom_interactor.js)
+async _getHandle(args) {
+  const selector = args.selector;
+  const global = args.global || "window";
 
-// 2. Invoke methods on that handle without transferring the object
+  const FINDER_SCRIPT = `(function() {
+    // Bootstrap the handle registry if it doesn't exist yet
+    if (!window.__deftHandles) {
+      var nextId = 1;
+      var registry = new Map();
+      window.__deftHandles = {
+        store: function(obj) { var id = "h_" + (nextId++); registry.set(id, obj); return id; },
+        get: function(id) { return registry.get(id); },
+        release: function(id) { return registry.delete(id); }
+      };
+    }
+
+    var selector = ${JSON.stringify(selector || "")};
+    if (selector) {
+      var el = document.querySelector(selector);
+      if (!el) return { error: "Element not found: " + selector };
+      return { handleId: window.__deftHandles.store(el) };
+    }
+
+    // ... resolve global path, store in registry, return handleId ...
+  })()`;
+
+  const res = await runtime.evaluateScript(FINDER_SCRIPT, {}, "MAIN");
+  const result = res.result !== undefined ? res.result : res;
+  if (result.error) throw new Error(result.error);
+  return result.handleId; // e.g., "h_1"
+}
+```
+
+#### Operating on Handles
+
+Once you have a `handleId`, use the handle API methods — these never transfer the object itself:
+
+```javascript
+// Invoke methods on the handle
 await runtime.invokeOnHandle(handleId, "viewport.zoomTo", [1.5]);
-await runtime.invokeOnHandle(handleId, "viewport.panBy", [{ x: 0.1, y: 0.1 }]);
 
-// 3. Extract specific primitive values
-const zoomLevel = await runtime.getFromHandle(handleId, "viewport.getZoom");
+// Read primitive properties
+const zoom = await runtime.getFromHandle(handleId, "viewport.getZoom");
 
-// 4. Release memory
+// Release when done
 await runtime.releaseHandle(handleId);
 ```
+
+> **Design principle — "Smart Skill, Dumb Pipe":** The extension core is a generic transport layer. All domain-specific logic (React Fiber traversal, OpenSeadragon detection, etc.) lives inside the skill's MCP script, not in the extension. This keeps the extension CWS-reviewable and makes skills independently evolvable.
+
+> **Security note:** `evaluateScript` is only available to signature-verified MCP server scripts running inside the MCP sandbox (`sandbox-mcp.html`). The LLM cannot call `evaluateScript` directly — it is deliberately omitted from the browser tool set exposed to the agent.
 
 ---
 
@@ -200,6 +245,72 @@ async callTool(name, args) {
 ```
 
 _Security Note:_ Tokens are strictly restricted via the `allowed_domains` array. An MCP script cannot successfully `runtime.fetch` to `malicious-domain.com` using the Microsoft token.
+
+---
+
+## 5.3 Tool Display Messages
+
+MCP servers can provide a `displayMessage` template on each tool definition. When present, the UI renders a human-friendly status message instead of the raw tool name and arguments.
+
+### Template Syntax
+
+The template engine uses a lightweight Mustache-like syntax:
+
+| Pattern                               | Description                                           |
+| ------------------------------------- | ----------------------------------------------------- |
+| `{{argName}}`                         | Insert arg value (truncated to 60 chars)              |
+| `{{argName\|default:fallback}}`       | Use fallback if arg is missing or empty               |
+| `{{#argName}}...{{/argName}}`         | Conditional block — rendered only if arg is truthy    |
+| `{{#argName=val}}...{{/argName=val}}` | Conditional block — rendered only if arg equals `val` |
+
+### Adding displayMessage to an MCP Tool
+
+Add the `displayMessage` field alongside `name`, `description`, and `inputSchema` in your `listTools()` return value:
+
+```javascript
+listTools() {
+  return [
+    {
+      name: "sheets_read_range",
+      description: "Read a range of cells from a Google Sheet.",
+      displayMessage: "📊 Reading cells {{range}} from spreadsheet",
+      inputSchema: {
+        type: "object",
+        properties: {
+          spreadsheetId: { type: "string" },
+          range: { type: "string" },
+        },
+        required: ["spreadsheetId", "range"],
+      },
+    },
+  ];
+}
+```
+
+### Examples
+
+```
+// Static message (no args needed)
+"📋 Listing open tabs"
+
+// Simple interpolation
+"📊 Reading cells {{range}} from spreadsheet"
+
+// Conditional block
+"📧 Searching Gmail: \"{{query}}\""
+"📅 Fetching events{{#query}} matching \"{{query}}\"{{/query}}"
+
+// Conditional equality
+"{{#action=click}}👆 Please click: {{description}}{{/action=click}}"
+"{{#action=fill}}✏️ Please type \"{{value}}\" into: {{description}}{{/action=fill}}"
+
+// Default fallback
+"👆 Please click: {{description|default:the element}}"
+```
+
+If `displayMessage` is omitted, the UI falls back to a generic `"Executing: Tool Name"` message derived from the tool name.
+
+The `displayMessage` field is automatically stripped before tool definitions are sent to the LLM provider, so it has no effect on token usage or API compatibility.
 
 ---
 
@@ -323,4 +434,4 @@ For corporate and enterprise usage, Koi enforces strict cryptographic and isolat
 
 1. **Signature Verification:** In managed environments, Skills (the entire folder contents) must be signed. The Extension verifies the SHA-256 content hashes against an IT-provisioned public key before loading the skill.
 2. **Execution Isolation:** All user-provided scripts (`scripts/*.js`) and local MCP servers (`mcp/*.js`) are executed in `sandbox.html` with a strict `sandbox="allow-scripts"` CSP. They have no access to the `chrome.*` extension APIs or the background DOM.
-3. **Privilege Separation:** The LLM cannot call `evaluate_script` directly. Only signed, deterministic Skill scripts can execute arbitrary JavaScript on target webpages, preventing prompt-injection XSS attacks.
+3. **Privilege Separation:** The LLM cannot call `evaluate_script` directly. Only signed MCP server scripts (running in `sandbox-mcp.html`) can call `runtime.evaluateScript()` to execute JavaScript on target webpages. This two-layer isolation — LLM → sandbox → page — prevents prompt-injection XSS attacks.

@@ -63,9 +63,13 @@ Koi™ is designed to be a Co-Pilot, not a runaway bot. When navigating complex 
 2. Click the Koi icon → open the side panel → enter your LLM API key (in enterprise setup, this is [managed](./docs/enterprise-deployment.md) by IT)
 3. Open any web page, press `CTRL + Mouse Select` to capture a region, ask your question
 
-The AI sees what you see, annotates directly on the page, and helps you understand, debug, or automate anything in the browser.
-
 **Supported LLM providers:** Google Gemini, Anthropic (Claude), OpenAI, OpenRouter (access to Claude, DeepSeek, Kimi, Grok, and more), or connect to a local model via Llama.cpp / vLLM / MLX.
+
+> **Getting Your API Key:**
+> Koi™ requires an LLM API key to function. If you choose to use Google Gemini, you will need to generate a key via Google Cloud.
+>
+> *Tip: If you are new to Google Cloud, Google currently offers a $300 free credit for new accounts to explore their APIs. You can check your eligibility and sign up from their website.*
+
 
 → [Full Configuration Guide](./docs/configuration.md)
 

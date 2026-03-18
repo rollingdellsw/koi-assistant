@@ -61,6 +61,17 @@ return {
     if (this._handle) return this._handle;
 
     const OSD_FINDER_SCRIPT = `() => {
+      // Bootstrap handle registry if not yet injected by tool-executor
+      if (!window.__deftHandles) {
+        let nextId = 1;
+        const registry = new Map();
+        window.__deftHandles = {
+          store: function(obj) { var id = "h_" + (nextId++); registry.set(id, obj); return id; },
+          get: function(id) { return registry.get(id); },
+          release: function(id) { return registry.delete(id); }
+        };
+      }
+
       function isViewer(obj) {
         return obj && typeof obj === 'object' && obj.viewport && obj.world && typeof obj.viewport.zoomTo === 'function';
       }
@@ -94,7 +105,6 @@ return {
       }
       const viewer = findViewer();
       if (!viewer) return { error: "Viewer not found. Ensure the page has fully loaded." };
-      if (!window.__deftHandles) return { error: "Extension handle registry not initialized" };
       return { handleId: window.__deftHandles.store(viewer) };
     }`;
 

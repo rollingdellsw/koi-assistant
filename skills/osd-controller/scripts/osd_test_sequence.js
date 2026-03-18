@@ -1,4 +1,8 @@
 // skills/osd-controller/scripts/osd_test_sequence.js
+// Navigate and wait for the OSD viewer to actually mount
+// await tools.navigatePage('https://portal.gdc.cancer.gov/files/2a8feeb0-e337-48aa-9863-965fecc933d5');
+// await tools.waitFor({ selector: ".openseadragon-canvas", timeout: 15000 });
+
 console.log("🧪 OSD Test Starting...");
 
 async function runTest() {

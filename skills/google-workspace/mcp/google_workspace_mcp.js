@@ -10,6 +10,7 @@ return {
       {
         name: "sheets_read_range",
         description: "Read a range of cells from a Google Sheet. Returns data as 2D array. Use offset/limit for pagination on large ranges.",
+        displayMessage: "📊 Reading cells {{range}} from spreadsheet",
         inputSchema: {
           type: "object",
           properties: {
@@ -36,6 +37,7 @@ return {
       {
         name: "sheets_write_range",
         description: "Write data to a range in a Google Sheet. Use for creating/updating cells.",
+        displayMessage: "📝 Writing to {{range}} in spreadsheet",
         inputSchema: {
           type: "object",
           properties: {
@@ -53,6 +55,7 @@ return {
       {
         name: "sheets_create",
         description: "Create a new Google Sheet, or copy an existing one. Returns spreadsheetId and URL. Use copyFromId to duplicate an existing spreadsheet (preserves all sheets, formulas, formatting, and data).",
+        displayMessage: "📊 Creating spreadsheet \"{{title}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -65,6 +68,7 @@ return {
       {
         name: "sheets_list",
         description: "List recent Google Sheets from Drive. Each result includes a direct URL.",
+        displayMessage: "📋 Listing recent spreadsheets",
         inputSchema: {
           type: "object",
           properties: {
@@ -75,6 +79,7 @@ return {
       {
         name: "sheets_get_metadata",
         description: "Get spreadsheet metadata: title, sheets/tabs list with IDs, row/column counts. Includes URL to each sheet tab.",
+        displayMessage: "📊 Reading spreadsheet metadata",
         inputSchema: {
           type: "object",
           properties: {
@@ -86,6 +91,7 @@ return {
       {
         name: "sheets_batch_update",
         description: "Apply batch updates to a spreadsheet (add/delete/rename sheets, merge cells, format ranges, etc). Uses the spreadsheets.batchUpdate API.",
+        displayMessage: "📊 Updating spreadsheet",
         inputSchema: {
           type: "object",
           properties: {
@@ -102,6 +108,7 @@ return {
       {
         name: "sheets_clear_range",
         description: "Clear values from a range in a Google Sheet (keeps formatting).",
+        displayMessage: "🧹 Clearing {{range}} in spreadsheet",
         inputSchema: {
           type: "object",
           properties: {
@@ -114,6 +121,7 @@ return {
       {
         name: "sheets_get_urls",
         description: "Extract all hyperlink URLs from a Google Sheet range. Returns URL, cell location, and link text.",
+        displayMessage: "🔗 Extracting URLs from spreadsheet",
         inputSchema: {
           type: "object",
           properties: {
@@ -126,6 +134,7 @@ return {
       {
         name: "sheets_read_as_csv",
         description: "Read a sheet range and return as CSV text. Useful for large data exports. Supports pagination via offset/limit.",
+        displayMessage: "📊 Reading {{range}} as CSV",
         inputSchema: {
           type: "object",
           properties: {
@@ -142,6 +151,7 @@ return {
       {
         name: "docs_create",
         description: "Create a new Google Doc, or copy an existing one. Returns documentId and URL. Use copyFromId to duplicate an existing document (preserves all content, formatting, and images).",
+        displayMessage: "📝 Creating document \"{{title}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -155,6 +165,7 @@ return {
       {
         name: "drive_list",
         description: "List files from Google Drive. Supports filtering by MIME type, folder, and query. Each result includes a webViewLink URL.",
+        displayMessage: "📁 Listing Drive files{{#query}} matching \"{{query}}\"{{/query}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -168,6 +179,7 @@ return {
       {
         name: "drive_search",
         description: "Full-text search across Google Drive files. Returns file name, ID, MIME type, URL, and last modified time.",
+        displayMessage: "🔍 Searching Drive for \"{{searchTerm}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -182,6 +194,7 @@ return {
       {
         name: "drive_get_file_metadata",
         description: "Get metadata for a Drive file: name, MIME type, size, owners, permissions, timestamps, URL.",
+        displayMessage: "📄 Reading file metadata for {{fileId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -195,6 +208,7 @@ return {
       {
         name: "docs_get_metadata",
         description: "Get Google Doc metadata: title, tabs list, revision info. Includes URL to the document.",
+        displayMessage: "📝 Reading document metadata",
         inputSchema: {
           type: "object",
           properties: {
@@ -206,6 +220,7 @@ return {
       {
         name: "docs_read_content",
         description: "Read the text content of a Google Doc tab. Extracts text from structural elements, preserving basic structure. Supports pagination via startIndex/endIndex character offsets.",
+        displayMessage: "📖 Reading document content",
         inputSchema: {
           type: "object",
           properties: {
@@ -220,6 +235,7 @@ return {
       {
         name: "docs_get_images",
         description: "Extract all inline images from a Google Doc. Returns image content URIs (which can be fetched with an OAuth token) and their positions.",
+        displayMessage: "🖼️ Extracting images from document",
         inputSchema: {
           type: "object",
           properties: {
@@ -232,6 +248,7 @@ return {
       {
         name: "docs_batch_update",
         description: "Apply batch updates to a Google Doc (insert text, delete content, update styles, insert tables/images, etc). Uses documents.batchUpdate API. Only works on docs created by this agent.",
+        displayMessage: "📝 Updating document",
         inputSchema: {
           type: "object",
           properties: {
@@ -248,6 +265,7 @@ return {
       {
         name: "docs_get_urls",
         description: "Extract all hyperlink URLs from a Google Doc. Returns the URL, anchor text, and position for each link.",
+        displayMessage: "🔗 Extracting URLs from document",
         inputSchema: {
           type: "object",
           properties: {
@@ -262,6 +280,7 @@ return {
       {
         name: "slides_create",
         description: "Create a new Google Slides presentation, or copy an existing one. Returns presentationId and URL. Use copyFromId to duplicate an existing presentation (preserves all slides, layouts, and media).",
+        displayMessage: "📽️ Creating presentation \"{{title}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -274,6 +293,7 @@ return {
       {
         name: "slides_batch_update",
         description: "Apply batch updates to a Google Slides presentation (create slides, insert text/images, update layouts, etc). Uses presentations.batchUpdate API. Only works on presentations created by this agent.",
+        displayMessage: "📽️ Updating presentation",
         inputSchema: {
           type: "object",
           properties: {
@@ -290,6 +310,7 @@ return {
       {
         name: "slides_get_metadata",
         description: "Get presentation metadata: title, slide count, slide IDs, dimensions. Includes URL.",
+        displayMessage: "📽️ Reading presentation metadata",
         inputSchema: {
           type: "object",
           properties: {
@@ -301,6 +322,7 @@ return {
       {
         name: "slides_read_content",
         description: "Read slide content including text and image inventory. Each slide returns its text and lists any embedded images with contentUrl for downloading via gsuite_download_image. Supports pagination by slide range.",
+        displayMessage: "📖 Reading slides {{startSlide|default:1}} to {{endSlide|default:end}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -314,6 +336,7 @@ return {
       {
         name: "slides_get_images",
         description: "Extract all inline images from a Google Slides presentation. Returns image content URIs (which can be fetched with an OAuth token) and their positions. Supports pagination by slide range.",
+        displayMessage: "🖼️ Extracting images from slides {{startSlide|default:1}} to {{endSlide|default:end}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -327,6 +350,7 @@ return {
       {
         name: "slides_get_urls",
         description: "Extract all hyperlink URLs from presentation slides. Returns URL, anchor text, and slide number.",
+        displayMessage: "🔗 Extracting URLs from slides",
         inputSchema: {
           type: "object",
           properties: {
@@ -338,6 +362,7 @@ return {
       {
         name: "gsuite_download_image",
         description: "Download an image from Google Docs or Slides using its contentUri from docs_get_images or slides_read_content. Returns base64 image for visual analysis. Valid ~30 mins.",
+        displayMessage: "🖼️ Downloading image",
         inputSchema: {
           type: "object",
           properties: {
@@ -358,6 +383,7 @@ return {
       {
         name: "gmail_search",
         description: "Search Gmail messages using Gmail search syntax. Returns message IDs, snippet, subject, from, date. Each includes a URL to the message.",
+        displayMessage: "📧 Searching Gmail: \"{{query}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -371,6 +397,7 @@ return {
       {
         name: "gmail_get_message",
         description: "Get full content of a Gmail message by API ID. Do NOT use the internal UI hash from the Gmail browser URL (e.g. Ktbx...). You MUST use gmail_search to find the correct 16-character hex messageId first.",
+        displayMessage: "📧 Reading message {{messageId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -383,6 +410,7 @@ return {
       {
         name: "gmail_list_labels",
         description: "List all Gmail labels for the authenticated user.",
+        displayMessage: "🏷️ Listing Gmail labels",
         inputSchema: {
           type: "object",
           properties: {},
@@ -391,6 +419,7 @@ return {
       {
         name: "gmail_get_thread",
         description: "Get all messages in a Gmail thread by API ID. Do NOT use the random hash from the Gmail browser URL. Use gmail_search first.",
+        displayMessage: "📧 Reading email thread {{threadId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -402,6 +431,7 @@ return {
       {
         name: "gmail_get_attachment",
         description: "Fetch the content of a Gmail attachment. By default, returns metadata to prevent context overflow. WARNING: If you are an LLM agent, NEVER set returnRawBase64 to true. It will crash your context window. This parameter is STRICTLY for internal JavaScript execution via run_browser_script (e.g., when piping to pdf_load).",
+        displayMessage: "📎 Fetching attachment {{attachmentId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -417,6 +447,7 @@ return {
       {
         name: "calendar_list",
         description: "List all calendars accessible to the authenticated user.",
+        displayMessage: "📅 Listing calendars",
         inputSchema: {
           type: "object",
           properties: {},
@@ -425,6 +456,7 @@ return {
       {
         name: "calendar_get_events",
         description: "Get events from a calendar within a time range. Each event includes an htmlLink URL.",
+        displayMessage: "📅 Fetching events{{#query}} matching \"{{query}}\"{{/query}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -441,6 +473,7 @@ return {
       {
         name: "calendar_get_event",
         description: "Get a single calendar event by ID. Returns full details including attendees, location, description, and htmlLink URL.",
+        displayMessage: "📅 Reading event details for {{eventId}}",
         inputSchema: {
           type: "object",
           properties: {

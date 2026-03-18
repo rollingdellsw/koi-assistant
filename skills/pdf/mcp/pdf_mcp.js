@@ -453,6 +453,7 @@ return {
       {
         name: "pdf_load",
         description: "Load a PDF into memory for reading/searching. Supports URL, base64 data, or active browser tab. Returns handle + metadata (title, author, page count).",
+        displayMessage: "📄 Loading PDF{{#activeTab}} from active tab{{/activeTab}}{{#url}} from URL{{/url}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -465,6 +466,7 @@ return {
       {
         name: "pdf_read",
         description: "Read pages from a loaded PDF. Returns text for every page. Can optionally return base64 JPEG images for pages with visual content if renderImages is true (warning: slow). Defaults to page 1. Use pdf_search on large docs to find relevant pages first.",
+        displayMessage: "📖 Reading PDF pages {{pages|default:1}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -479,6 +481,7 @@ return {
       {
         name: "pdf_search",
         description: "Full-text search across all pages. Returns page numbers and text snippets. Use on large docs before pdf_read.",
+        displayMessage: '🔍 Searching PDF for "{{query}}"',
         inputSchema: {
           type: "object",
           properties: {
@@ -492,6 +495,7 @@ return {
       {
         name: "pdf_get_links",
         description: "Extract hyperlink URLs from PDF pages.",
+        displayMessage: "🔗 Extracting links from PDF",
         inputSchema: {
           type: "object",
           properties: {
@@ -504,6 +508,7 @@ return {
       {
         name: "pdf_release",
         description: "Release a loaded PDF to free memory.",
+        displayMessage: "🗑️ Releasing PDF from memory",
         inputSchema: {
           type: "object",
           properties: {

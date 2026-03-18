@@ -23,6 +23,8 @@
 // Run with: /run context-stress-v3
 // ============================================================================
 
+await tools.readSkill({ name: "dom-interactor" });
+
 const CONTEXT_PATH = [
   { level: 0, type: 'main', name: 'Main Document', enter: null, selector: null },
   { level: 1, type: 'shadow', name: 'Shadow L1', enter: 'enterShadow', selector: '#shadow-host-L1' },

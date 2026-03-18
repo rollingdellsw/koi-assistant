@@ -62,6 +62,7 @@ return {
       {
         name: "onedrive_list",
         description: "List files from OneDrive root or a folder, or list recently accessed files. Each result includes a webUrl. Use recent=true for recently accessed files across all folders.",
+        displayMessage: "📁 Listing OneDrive files",
         inputSchema: {
           type: "object",
           properties: {
@@ -76,6 +77,7 @@ return {
       {
         name: "onedrive_search",
         description: "Search OneDrive files by name/content.",
+        displayMessage: "🔍 Searching OneDrive for \"{{query}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -88,6 +90,7 @@ return {
       {
         name: "onedrive_get_file_metadata",
         description: "Get metadata for a OneDrive file.",
+        displayMessage: "📄 Reading file metadata for {{itemId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -100,6 +103,7 @@ return {
       {
         name: "word_get_images",
         description: "List all embedded images in a Word document. Returns metadata (name, size, content type) for each image. Use word_download_image to fetch individual images.",
+        displayMessage: "🖼️ Listing images in Word document",
         inputSchema: {
           type: "object",
           properties: {
@@ -112,6 +116,7 @@ return {
       {
         name: "word_download_image",
         description: "Download a single embedded image from a Word document by its name. Returns the image as base64 for visual analysis. Get image names from word_get_images.",
+        displayMessage: "🖼️ Downloading image: {{imageName}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -125,6 +130,7 @@ return {
       {
         name: "onedrive_download_text",
         description: "Download a file's text content (for text/csv/html files).",
+        displayMessage: "📄 Downloading file content",
         inputSchema: {
           type: "object",
           properties: {
@@ -137,6 +143,7 @@ return {
       {
         name: "onedrive_resolve_link",
         description: "Convert a raw OneDrive or SharePoint sharing URL into an itemId and driveId so it can be used with other API tools (like word_read_content).",
+        displayMessage: "🔗 Resolving sharing link",
         inputSchema: {
           type: "object",
           properties: {
@@ -150,6 +157,7 @@ return {
       {
         name: "excel_list",
         description: "List recent Excel workbooks from OneDrive.",
+        displayMessage: "📋 Listing Excel workbooks",
         inputSchema: {
           type: "object",
           properties: {
@@ -160,6 +168,7 @@ return {
       {
         name: "excel_create",
         description: "Create a new Excel workbook in OneDrive root, or copy an existing one. Returns itemId and webUrl. Use copyFromId to duplicate an existing workbook (preserves all sheets, formulas, formatting, and data).",
+        displayMessage: "📊 Creating workbook \"{{title}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -172,6 +181,7 @@ return {
       {
         name: "excel_get_metadata",
         description: "Get workbook metadata: worksheets, named ranges.",
+        displayMessage: "📊 Reading workbook metadata for {{itemId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -184,6 +194,7 @@ return {
       {
         name: "excel_read_range",
         description: "Read a range of cells from an Excel workbook.",
+        displayMessage: "📊 Reading cells {{range}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -200,6 +211,7 @@ return {
       {
         name: "excel_read_as_csv",
         description: "Read an Excel range and return as CSV text.",
+        displayMessage: "📊 Reading {{range}} as CSV",
         inputSchema: {
           type: "object",
           properties: {
@@ -216,6 +228,7 @@ return {
       {
         name: "excel_write_range",
         description: "Write data to a range in an Excel workbook (own files only).",
+        displayMessage: "📝 Writing to {{range}} in workbook",
         inputSchema: {
           type: "object",
           properties: {
@@ -234,6 +247,7 @@ return {
       {
         name: "excel_batch_update",
         description: "Batch operations on Excel: add/delete/rename worksheets, format cells. Uses the Excel REST API batch endpoint. Own files only.",
+        displayMessage: "📊 Updating workbook",
         inputSchema: {
           type: "object",
           properties: {
@@ -250,6 +264,7 @@ return {
       {
         name: "excel_clear_range",
         description: "Clear values from a range (keeps formatting). Own files only.",
+        displayMessage: "🧹 Clearing {{range}} in workbook",
         inputSchema: {
           type: "object",
           properties: {
@@ -265,6 +280,7 @@ return {
       {
         name: "word_create",
         description: "Create a new Word document in OneDrive root, or copy an existing one. Returns itemId and webUrl. Use copyFromId to duplicate an existing document (preserves all content, formatting, and images).",
+        displayMessage: "📝 Creating document \"{{title}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -277,6 +293,7 @@ return {
       {
         name: "word_get_metadata",
         description: "Get Word document metadata: name, size, timestamps, webUrl.",
+        displayMessage: "📝 Reading document metadata",
         inputSchema: {
           type: "object",
           properties: {
@@ -289,6 +306,7 @@ return {
       {
         name: "word_read_content",
         description: "Read Word document content as HTML. Supports pagination via startIndex/endIndex character offsets.",
+        displayMessage: "📖 Reading document content",
         inputSchema: {
           type: "object",
           properties: {
@@ -303,6 +321,7 @@ return {
       {
         name: "word_batch_update",
         description: "Replace the content of a Word document by uploading new OOXML/HTML content. Own files only. NOTE: This replaces the entire file, not incremental edits.",
+        displayMessage: "📝 Updating document",
         inputSchema: {
           type: "object",
           properties: {
@@ -317,6 +336,7 @@ return {
       {
         name: "ppt_create",
         description: "Create a new PowerPoint presentation in OneDrive root, or copy an existing one. Returns itemId and webUrl. Use copyFromId to duplicate an existing presentation (preserves all slides, layouts, and media).",
+        displayMessage: "📽️ Creating presentation \"{{title}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -329,6 +349,7 @@ return {
       {
         name: "ppt_get_metadata",
         description: "Get presentation metadata: name, size, timestamps, webUrl, and per-slide metadata (index, objectId, title). Returns slideCount and slides array.",
+        displayMessage: "📽️ Reading presentation metadata",
         inputSchema: {
           type: "object",
           properties: {
@@ -341,6 +362,7 @@ return {
       {
         name: "ppt_read_content",
         description: "Read presentation slide content including text and image inventory. Each slide shows its text and lists any embedded images with name and size. Use ppt_download_image to fetch specific images for visual analysis. Supports pagination by slide range.",
+        displayMessage: "📖 Reading slides {{startSlide|default:1}} to {{endSlide|default:end}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -355,6 +377,7 @@ return {
       {
         name: "ppt_download_image",
         description: "Download embedded image(s) from a PowerPoint presentation. Returns base64 image(s) for visual analysis. Get image names from ppt_read_content output. Pass a single name or comma-separated names.",
+        displayMessage: "🖼️ Downloading image: {{imageName}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -368,6 +391,7 @@ return {
       {
         name: "ppt_batch_update",
         description: "Replace PowerPoint content by uploading new file. Own files only. NOTE: This replaces the entire file.",
+        displayMessage: "📽️ Updating presentation",
         inputSchema: {
           type: "object",
           properties: {
@@ -382,6 +406,7 @@ return {
       {
         name: "outlook_search",
         description: "Search Outlook messages. Returns message IDs, subject, from, receivedDateTime, preview.",
+        displayMessage: "📧 Searching Outlook: \"{{query}}\"",
         inputSchema: {
           type: "object",
           properties: {
@@ -395,6 +420,7 @@ return {
       {
         name: "outlook_get_message",
         description: "Get full content of an Outlook message by ID.",
+        displayMessage: "📧 Reading message {{messageId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -406,6 +432,7 @@ return {
       {
         name: "outlook_list_folders",
         description: "List all mail folders (Inbox, Sent, Drafts, etc.).",
+        displayMessage: "📁 Listing mail folders",
         inputSchema: {
           type: "object",
           properties: {},
@@ -414,6 +441,7 @@ return {
       {
         name: "outlook_get_thread",
         description: "Get all messages in a conversation thread.",
+        displayMessage: "📧 Reading email thread {{conversationId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -425,6 +453,7 @@ return {
       {
         name: "outlook_get_attachment",
         description: "Get an attachment from an Outlook message. By default returns metadata only.",
+        displayMessage: "📎 Fetching attachment {{attachmentId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -440,11 +469,13 @@ return {
       {
         name: "ms_calendar_list",
         description: "List calendars accessible to the user.",
+        displayMessage: "📅 Listing calendars",
         inputSchema: { type: "object", properties: {} },
       },
       {
         name: "ms_calendar_get_events",
         description: "Get calendar events within a time range.",
+        displayMessage: "📅 Fetching events{{#search}} matching \"{{search}}\"{{/search}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -460,6 +491,7 @@ return {
       {
         name: "ms_calendar_get_event",
         description: "Get a single calendar event by ID.",
+        displayMessage: "📅 Reading event details for {{eventId}}",
         inputSchema: {
           type: "object",
           properties: {
@@ -878,22 +910,10 @@ return {
       };
     }
 
-    if (args?.copyFromId || arguments[0]?.copyFromId) {
-      const copyFromId = arguments[0]?.copyFromId;
-      const data = await this._driveCopy(copyFromId, `${title}.xlsx`);
-      if (data._error) return data;
-      return {
-        content: [{
-          type: "text",
-          text: `Copied workbook: ${data.id}\nURL: ${data.webUrl}`,
-          _createdFileId: data.id,
-        }],
-      };
-    }
-
+    const filename = encodeURIComponent(`${title}.xlsx`);
     // Create empty .xlsx by uploading minimal content
     const data = await this._request("PUT",
-      `/me/drive/root:/${title}.xlsx:/content`,
+      `/me/drive/root:/${filename}:/content`,
       "", // Empty file — Graph creates a valid xlsx
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
@@ -1042,8 +1062,9 @@ return {
       };
     }
 
+    const filename = encodeURIComponent(`${title}.docx`);
     const data = await this._request("PUT",
-      `/me/drive/root:/${title}.docx:/content`,
+      `/me/drive/root:/${filename}:/content`,
       "",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     );
@@ -1269,8 +1290,9 @@ return {
       };
     }
 
+    const filename = encodeURIComponent(`${title}.pptx`);
     const data = await this._request("PUT",
-      `/me/drive/root:/${title}.pptx:/content`,
+      `/me/drive/root:/${filename}:/content`,
       "",
       "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     );

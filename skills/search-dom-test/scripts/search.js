@@ -18,6 +18,7 @@
 // Run with: /run discovery-workflow
 // ============================================================================
 
+await tools.readSkill({ name: "dom-interactor" });
 console.log("🗺️ ════════════════════════════════════════════════════════════");
 console.log("🗺️ DISCOVERY WORKFLOW TEST - Starting");
 console.log("🗺️ ════════════════════════════════════════════════════════════\n");

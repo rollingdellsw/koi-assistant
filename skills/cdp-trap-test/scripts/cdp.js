@@ -1,4 +1,6 @@
 // skills/cdp-trap-test/scripts/cdp.js
+await tools.readSkill({ name: "dom-interactor" });
+
 console.log("🚀 Starting Bridge Validation Suite (Handle-Based)...");
 
 // Refresh the test page to start clean

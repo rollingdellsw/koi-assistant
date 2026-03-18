@@ -4,9 +4,6 @@ description: Validates browser tool DOM search functions
 allowed-tools:
   - run_browser_script
   - new_page
-mcp-servers:
-  - name: dom-interactor
-    script: mcp/dom_interactor.js
 ---
 
 # Context Stress Test Skill
@@ -18,10 +15,6 @@ This skill validates the robustness of the browser toolchain, specifically focus
 Run the full verification suite:
 
 ```javascript
-// 1. Open the test fixture: the test page is already serving
-await new_page({ url: "http://localhost:8000/search_dom_stress_test.html" });
-
-// 2. Execute the stress test script
 run_browser_script({
   script_path: "search-dom-test:scripts/search.js",
 });
