@@ -55,6 +55,11 @@ Koi™ is designed to be a Co-Pilot, not a runaway bot. When navigating complex 
   <em>The agent analyzes the page and provides a non-intrusive visual overlay to guide your next action.</em>
 </div>
 
+
+#### Watch Koi™ Be a Simple Browser AI Assistant
+
+[![Watch AI Assistant demo](https://img.youtube.com/vi/P_UsVpNwpXA/0.jpg)](https://youtu.be/P_UsVpNwpXA)
+
 ---
 
 ## Quick Start
