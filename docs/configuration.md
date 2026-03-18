@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Koi™ uses a JSON-based configuration system managed through the Settings UI in the side panel. Configurations are stored in `chrome.storage.local`.
+Koi™ uses a JSON-based configuration system. In the browser extension, configurations are managed through the Settings UI and stored in `chrome.storage.local`. In CLI mode, config is loaded from the filesystem (e.g. `~/.config/deft/config.json` or `.deft/config.json`).
 
 ---
 
@@ -22,11 +22,13 @@ Koi ships with pre-built config profiles for popular providers. You can also cre
 
 ### Full Config Reference
 
-```json
+All values shown are examples. Defaults are noted in the [Configuration Sections](#configuration-sections) tables below. Fields marked optional can be omitted entirely.
+
+```jsonc
 {
   "llm": {
     "provider": "anthropic",
-    "apiKey": "your-api-key",
+    "apiKey": "${ANTHROPIC_API_KEY}",
     "model": "claude-sonnet-4-6",
     "baseUrl": "https://api.anthropic.com",
     "contextWindow": 200000,
@@ -47,7 +49,8 @@ Koi ships with pre-built config profiles for popular providers. You can also cre
     "maxIterations": 20
   },
   "tools": {
-    "whitelist": ["run_subtask", "run_cmd"]
+    "whitelist": ["run_subtask"],
+    "visibilityMode": "smart"
   },
   "agent": {
     "systemPrompt": "You are a web assistant with browser use tools.\n\n"
@@ -56,6 +59,9 @@ Koi ships with pre-built config profiles for popular providers. You can also cre
     "maxSessionStorageMb": 1000,
     "autoCleanupDays": 90
   },
+  "skills": {
+    "preload": []
+  },
   "reminders": [],
   "guardrails": "",
   "gateways": {
@@ -63,11 +69,28 @@ Koi ships with pre-built config profiles for popular providers. You can also cre
       "authMethod": "none",
       "url": "ws://localhost:8080"
     }
-  }
+  },
+  "defaultGateway": "default"
 }
 ```
 
-> **Note:** The `executor`, `storage`, `reminders`, `guardrails`, and `gateways` sections are optional. Sensible defaults are applied when omitted.
+> **Note:** The `executor`, `storage`, `skills`, `reminders`, `guardrails`, and `gateways` sections are optional. Sensible defaults are applied when omitted.
+
+---
+
+## Environment Variable Substitution
+
+`apiKey` and `baseUrl` fields support `${VAR}` syntax resolved at load time:
+
+- `${VAR}` — replaced with env var value; empty string if unset
+- `${VAR:-default}` — uses `default` if the variable is unset or empty
+
+```json
+"apiKey": "${ANTHROPIC_API_KEY}"
+"baseUrl": "${API_BASE_URL:-https://api.anthropic.com}"
+```
+
+All real-world config examples in this repo use env var substitution for API keys rather than hardcoded strings.
 
 ---
 
@@ -77,11 +100,11 @@ Koi supports direct connections to multiple LLM providers. Each provider uses th
 
 ### Anthropic (Claude)
 
-```json
+```jsonc
 {
   "llm": {
     "provider": "anthropic",
-    "apiKey": "your-anthropic-api-key",
+    "apiKey": "${ANTHROPIC_API_KEY}",
     "model": "claude-sonnet-4-6",
     "baseUrl": "https://api.anthropic.com",
     "contextWindow": 200000,
@@ -106,11 +129,11 @@ Supported models: `claude-sonnet-4-6`, `claude-opus-4-5`, `claude-haiku-4-5`, `c
 
 ### Google Gemini
 
-```json
+```jsonc
 {
   "llm": {
     "provider": "gemini",
-    "apiKey": "your-gemini-api-key",
+    "apiKey": "${GEMINI_API_KEY}",
     "model": "gemini-3-flash-preview",
     "baseUrl": "https://generativelanguage.googleapis.com",
     "contextWindow": 1000000,
@@ -137,7 +160,7 @@ Supported models: `claude-sonnet-4-6`, `claude-opus-4-5`, `claude-haiku-4-5`, `c
 {
   "llm": {
     "provider": "openai",
-    "apiKey": "your-openai-api-key",
+    "apiKey": "${OPENAI_API_KEY}",
     "model": "gpt-5.2",
     "baseUrl": "https://api.openai.com/v1",
     "contextWindow": 400000,
@@ -160,17 +183,18 @@ Supported models: `claude-sonnet-4-6`, `claude-opus-4-5`, `claude-haiku-4-5`, `c
 
 ### OpenRouter (Multi-Provider Gateway)
 
-Access multiple models through one API key:
+Access multiple models through one API key. Use `topP` (camelCase) — the `top-p` hyphenated form is silently ignored by the schema.
 
 ```json
 {
   "llm": {
     "provider": "openrouter",
-    "apiKey": "your-openrouter-api-key",
-    "model": "qwen/qwen3.5-122b-a10b",
+    "apiKey": "${OPENROUTER_API_KEY}",
+    "model": "qwen/qwen3.5-397b-a17b",
     "baseUrl": "https://openrouter.ai/api/v1",
     "contextWindow": 262144,
     "temperature": 0.7,
+    "topP": 1.0,
     "maxTokens": 16384,
     "thinking": {
       "enabled": true,
@@ -197,6 +221,36 @@ Access multiple models through one API key:
 
 **OpenRouter free tier:** Use `"model": "openrouter/free"` for zero-cost experimentation.
 
+### Alibaba DashScope (Qwen)
+
+DashScope hosts Qwen models via an OpenAI-compatible endpoint. Use `provider: "llamacpp"` with the DashScope base URL:
+
+```json
+{
+  "llm": {
+    "provider": "llamacpp",
+    "apiKey": "${DASHSCOPE_API_KEY}",
+    "model": "qwen3.5-plus",
+    "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "contextWindow": 262144,
+    "temperature": 0.7,
+    "topP": 1.0,
+    "maxTokens": 16384,
+    "thinking": {
+      "enabled": true,
+      "budgetLevel": "high",
+      "fallbackToPrompt": false
+    }
+  },
+  "executor": {
+    "enabled": true,
+    "model": "qwen3.5-plus",
+    "timeoutMs": 180000,
+    "maxIterations": 20
+  }
+}
+```
+
 ### Llama.cpp (Local)
 
 Connect to a local Llama.cpp server on your network:
@@ -208,6 +262,7 @@ Connect to a local Llama.cpp server on your network:
     "apiKey": "None",
     "model": "qwen/qwen3.5-27b",
     "baseUrl": "http://192.168.68.116:8080/v1",
+    "topP": 0.95,
     "contextWindow": 262144,
     "temperature": 1.0,
     "maxTokens": 16384,
@@ -270,41 +325,42 @@ Connect to a local Llama.cpp server on your network:
 
 ### LLM Configuration
 
-| Option          | Required | Description                                                              |
-| --------------- | -------- | ------------------------------------------------------------------------ |
-| `provider`      | Yes      | `anthropic`, `gemini`, `openai`, `openrouter`, `llamacpp`, `vllm`, `mlx` |
-| `apiKey`        | Yes\*    | API key (use `"None"` for local providers)                               |
-| `model`         | Yes      | Model identifier                                                         |
-| `baseUrl`       | No       | API endpoint URL                                                         |
-| `contextWindow` | No       | Context window size in tokens (used for low-context reminders)           |
-| `temperature`   | No       | Sampling temperature (0–2, default: 0.7)                                 |
-| `maxTokens`     | No       | Maximum output tokens (default: 4096)                                    |
-| `topP`          | No       | Top-p sampling parameter                                                 |
-| `topK`          | No       | Top-k sampling parameter                                                 |
-| `thinking`      | No       | Reasoning/thinking configuration (see below)                             |
+| Option            | Required | Default | Description                                                                                      |
+| ----------------- | -------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `provider`        | Yes      | —       | `anthropic`, `gemini`, `openai`, `openrouter`, `llamacpp`, `vllm`, `mlx`                         |
+| `apiKey`          | No\*     | —       | API key. Optional for GCP ADC providers. Use `"None"` for local. Supports `${VAR}` substitution. |
+| `model`           | Yes      | —       | Model identifier string                                                                          |
+| `baseUrl`         | No       | —       | API endpoint URL. Required for local providers.                                                  |
+| `contextWindow`   | No       | —       | Model context size in tokens. **Required** for `low_context_window` reminders to fire.           |
+| `temperature`     | No       | `0.7`   | Sampling temperature (0–2)                                                                       |
+| `maxTokens`       | No       | `4096`  | Maximum output tokens                                                                            |
+| `topP`            | No       | —       | Top-p sampling. **Must use camelCase** — `top-p` is silently ignored.                            |
+| `topK`            | No       | —       | Top-k sampling                                                                                   |
+| `thinking`        | No       | —       | Reasoning configuration (see below)                                                              |
+| `providerRouting` | No       | —       | OpenRouter only — provider selection control                                                     |
+| `projectId`       | No       | —       | GCP project ID for Vertex AI / Gemini with ADC billing                                           |
 
 ### Thinking Configuration
 
-Controls LLM reasoning capabilities. Supported natively by Anthropic, Gemini, OpenAI, and via prompt fallback for others.
-
-| Option             | Values                                              | Description                                                     |
-| ------------------ | --------------------------------------------------- | --------------------------------------------------------------- |
-| `enabled`          | `true` / `false`                                    | Enable thinking mode                                            |
-| `budgetLevel`      | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` | Token budget for reasoning                                      |
-| `fallbackToPrompt` | `true` / `false`                                    | Use `<think>` prompt blocks when native thinking is unavailable |
+| Option             | Default  | Values                                              | Description                                                  |
+| ------------------ | -------- | --------------------------------------------------- | ------------------------------------------------------------ |
+| `enabled`          | `false`  | `true` / `false`                                    | Enable thinking mode                                         |
+| `budgetLevel`      | `"high"` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` | Token budget for reasoning                                   |
+| `fallbackToPrompt` | `true`   | `true` / `false`                                    | Use `<think>` prompt blocks when native thinking unavailable |
 
 ### Executor Configuration
 
-The executor handles sub-task delegation using a secondary (often faster/cheaper) LLM:
-
-| Option          | Default | Description                                            |
-| --------------- | ------- | ------------------------------------------------------ |
-| `enabled`       | `true`  | Enable/disable executor for sub-tasks                  |
-| `model`         | —       | Model for executor (often a faster/cheaper model)      |
-| `timeoutMs`     | `60000` | Timeout for executor calls in ms (recommended: 180000) |
-| `maxIterations` | `10`    | Maximum tool iterations per sub-task                   |
-
-The executor inherits `provider`, `apiKey`, and `baseUrl` from the main `llm` section when not explicitly set.
+| Option            | Default | Description                                                                                                            |
+| ----------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `enabled`         | `true`  | Enable/disable executor for sub-tasks                                                                                  |
+| `model`           | —       | Model for executor. Inherits `llm.model` when omitted.                                                                 |
+| `timeoutMs`       | `60000` | Timeout per call in ms. **Recommended: `180000`** — the default is too short for complex tasks like PDF summarization. |
+| `maxIterations`   | `10`    | Max tool iterations per sub-task. Real-world tasks often need `20`.                                                    |
+| `maxTokens`       | `4096`  | Max output tokens for executor responses                                                                               |
+| `provider`        | —       | Inherits `llm.provider` when omitted                                                                                   |
+| `apiKey`          | —       | Inherits `llm.apiKey` when omitted                                                                                     |
+| `baseUrl`         | —       | Inherits `llm.baseUrl` when omitted                                                                                    |
+| `providerRouting` | —       | OpenRouter routing (can differ from main LLM)                                                                          |
 
 ### Provider Routing (OpenRouter)
 
@@ -321,21 +377,49 @@ When using OpenRouter, control which underlying providers handle your requests:
 
 ### Storage Configuration
 
-| Option                | Default | Description                                     |
-| --------------------- | ------- | ----------------------------------------------- |
-| `maxSessionStorageMb` | `100`   | Maximum storage for sessions in MB              |
-| `autoCleanupDays`     | —       | Automatically delete sessions older than N days |
+| Option                | Default | Description                                                                                           |
+| --------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
+| `maxSessionStorageMb` | `100`   | Max session storage in MB. When exceeded, oldest unnamed sessions with < 3 messages are auto-rotated. |
+| `autoCleanupDays`     | —       | Delete sessions older than N days (disabled if omitted)                                               |
 
-Sessions are stored in IndexedDB. When storage exceeds the limit, the oldest unnamed sessions with fewer than 3 messages are automatically rotated.
+Sessions are stored in IndexedDB (browser) or the filesystem (CLI).
 
 ### Tool Whitelist
 
-Tools in the whitelist execute without user confirmation:
+Tools in the whitelist execute without user confirmation. All other tools pause for user approval.
 
 ```json
 {
   "tools": {
-    "whitelist": ["run_subtask", "run_cmd"]
+    "whitelist": ["run_subtask"]
+  }
+}
+```
+
+### Tool Visibility Mode
+
+Controls which tools are shown to the main LLM (does not affect availability — executor and subtask agents are governed separately):
+
+| Value               | Behaviour                                                                                                                                   |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `"smart"` (default) | Hides low-level search tools (`search_files`, `git_log`, etc.) to encourage `agentic_search`. Executor still receives full search tool set. |
+| `"manual"`          | All tools visible to all agents. Use when you want full control.                                                                            |
+| `"hybrid"`          | Main LLM sees both high- and low-level search tools.                                                                                        |
+
+```json
+{ "tools": { "visibilityMode": "smart" } }
+```
+
+### Skills Configuration
+
+| Option    | Description                                                                                                                       |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `preload` | Skill names to load at startup. Tools from preloaded skills are available immediately without the LLM calling `read_skill` first. |
+
+```json
+{
+  "skills": {
+    "preload": ["google-workspace", "pdf"]
   }
 }
 ```
@@ -385,7 +469,7 @@ A JavaScript string evaluated in the sandbox. Uses the same `module.exports = { 
 
 ### Gateways (Remote MCP)
 
-Configure WebSocket gateways for remote MCP servers (databases, native protocols):
+Configure WebSocket gateways for remote MCP servers (databases, native protocols). `defaultGateway` sets the fallback used when a skill's `gateway:` field is omitted.
 
 ```json
 {
@@ -394,11 +478,12 @@ Configure WebSocket gateways for remote MCP servers (databases, native protocols
       "authMethod": "none",
       "url": "ws://localhost:8080"
     }
-  }
+  },
+  "defaultGateway": "default"
 }
 ```
 
-Skills reference gateways by name (e.g., `gateway: default` in SKILL.md).
+Skills reference gateways by name (`gateway: default` in SKILL.md). `defaultGateway` is a top-level field alongside `gateways`, not nested inside it.
 
 ---
 
@@ -406,6 +491,6 @@ Skills reference gateways by name (e.g., `gateway: default` in SKILL.md).
 
 Skills are installed via the Settings UI (folder picker) or imported as JSON bundles. They are stored in `chrome.storage.local` and managed through the Skills panel.
 
-Skills are not loaded automatically — the LLM calls `read_skill` when it needs a skill's capabilities. You can list installed skills in Settings.
+Skills are not loaded automatically unless listed in `skills.preload` — otherwise the LLM calls `read_skill` on demand. You can list installed skills in Settings.
 
 → [Skills System Guide](./skill_api.md)

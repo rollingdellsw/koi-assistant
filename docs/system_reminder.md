@@ -1,8 +1,15 @@
 # Reminder System
 
-> Dynamic context injection for precision LLM control
+> Dynamic context injection for precision LLM control.
 
-The Reminder System is a core feature for getting consistent, high-quality output from any LLM. Instead of bloating your system prompt with rules that may not apply, reminders fire only when relevant - keeping context focused and improving model adherence.
+The Reminder System injects guidance into the LLM's context based on events — tool calls, user messages, iteration counts, and agent state. Instead of bloating your system prompt with rules that may not apply, reminders fire only when relevant, keeping context focused and improving model adherence.
+
+Reminders come in two scopes:
+
+- **Global** — always active, loaded from JSON files (CLI) or the config profile (browser). Documented below.
+- **Skill-scoped** — active only while a specific skill is loaded. Declared inline in `SKILL.md`. See [Skill-Scoped Reminders](#skill-scoped-reminders).
+
+Both scopes use the same rule format, trigger system, and engine.
 
 ---
 
@@ -69,6 +76,15 @@ The sub-task agent will follow these instructions as part of its primary goal.
 
 ---
 
+## Deduplication and State
+
+- **Per-turn dedup:** A reminder never fires more than once per user-assistant exchange, regardless of how many tool calls match its trigger during that turn. The engine clears per-turn state after each exchange.
+- **`one_shot` lifetime:** Fires exactly once per session. State resets on session reset.
+- **`sticky` lifetime:** Once triggered, re-injects on every subsequent turn automatically — you don't need to re-trigger it. State resets on session reset.
+- **Session reset:** Starting a new session re-arms all `one_shot` rules and clears all `sticky` state.
+
+---
+
 ## Why Reminders?
 
 ### The Problem with Static Prompts
@@ -114,6 +130,36 @@ Create `~/.config/deft/reminders.json`:
 ```
 
 That's it. Next time you work with TypeScript files, the reminder activates automatically.
+
+---
+
+## Skill-Scoped Reminders
+
+Declare reminders inline in `SKILL.md` frontmatter. They are registered when the skill is loaded via `read_skill` and merged into the same engine as global reminders.
+
+```yaml
+---
+name: osd-controller
+reminders:
+  - id: "osd:saccadic-memory"
+    trigger:
+      type: "tool_result"
+      toolName: "create_workspace"
+    content: |
+      Focus Shifted: You have created a new active Visual Workspace.
+      Previous workspaces are now low-res thumbnails.
+      Before moving on, use <scratchpad_update>...</scratchpad_update> to record findings.
+    strategy: "sticky"
+    priority: "high"
+---
+```
+
+**Scoping rules:**
+
+- Skill reminder IDs should be namespaced (e.g. `"skillname:reminder-id"`) to avoid colliding with global rules.
+- If a skill reminder has the same `id` as a global rule, the skill version overrides it.
+- Skill reminders are **not** removed when a skill is unloaded mid-session — once registered, they remain active for the session.
+- Multiple skills can be loaded simultaneously; all their reminders are merged and active.
 
 ---
 
@@ -180,7 +226,7 @@ Fires when working with files matching a regex pattern.
 
 ### `user_message`
 
-Fires when user message matches a pattern.
+Fires when user message matches a pattern. Patterns are matched with **case-insensitive** and **dotAll** flags (`/pattern/is`), unlike other triggers which use default (case-sensitive) matching.
 
 ```json
 {
@@ -193,7 +239,7 @@ Fires when user message matches a pattern.
 
 ### `tool_call`
 
-Fires **after** a tool executes. Best used sparingly for redirecting toward better tool choices rather than general guidance (use `tool_result` or `tool_error` for post-execution blocking check).
+Fires when a tool is about to execute (pre-execution). The reminder is **queued** and injected into the LLM's context in the **next iteration**, after the tool result arrives — so the LLM sees both the result and the reminder together. Best used sparingly for redirecting toward better tool choices. For post-execution reactions, prefer `tool_result` or `tool_error`.
 
 ```json
 {
@@ -397,6 +443,8 @@ Activate with `/tag database` command, deactivate with `/untag database`.
 
 > **Note:** `low_context_window` requires `contextWindow` to be configured in your LLM settings. The `threshold` defaults to 10000 tokens if not specified.
 
+**`session_needs_title`** only fires for the main assistant role — sub-agents (subtask, agentic_search) never trigger it.
+
 **Session needs title:**
 
 ```json
@@ -413,6 +461,32 @@ Activate with `/tag database` command, deactivate with `/untag database`.
 ```
 
 This condition fires when the session has no title. Typically used internally.
+
+---
+
+## Browser Mode (Koi Extension)
+
+In browser mode, global reminders are stored as a JSON array in the active config profile (`chrome.storage.local`) and loaded via `addRules()` at session start — the same merge/override logic applies (same `id` overwrites).
+
+Skill-scoped reminders work identically to CLI mode: declared in `SKILL.md`, registered when the skill loads, merged into the shared engine.
+
+### Trigger Availability in Browser Mode
+
+Not all trigger types are equally useful in browser mode since there is no filesystem or shell:
+
+| Trigger                  | Browser Mode                                                              |
+| ------------------------ | ------------------------------------------------------------------------- |
+| `always`                 | ✅ Works                                                                  |
+| `user_message`           | ✅ Works                                                                  |
+| `tool_call`              | ✅ Works (browser tool names like `navigate_page`, `take_screenshot`)     |
+| `tool_result`            | ✅ Works                                                                  |
+| `tool_error`             | ✅ Works                                                                  |
+| `iteration`              | ✅ Works                                                                  |
+| `context`                | ✅ Works (`loop_detected`, `low_context_window`, `session_needs_title`)   |
+| `file_pattern`           | ⚠️ No filesystem — never fires in browser mode                            |
+| `context: tag_active`    | ⚠️ The `/tag` command is CLI-specific; not available in the Koi extension |
+| `context: tool_not_used` | ✅ Works (tracks browser tool usage)                                      |
+| `tool_call: filePattern` | ⚠️ Matches file paths in tool args — not meaningful for browser tools     |
 
 ---
 
@@ -440,7 +514,7 @@ Once triggered, stays active for the entire session.
 
 ### `persistent`
 
-Always active on every user message (requires `always` trigger).
+Always evaluates its trigger on every event — never suppressed by one_shot/sticky gating. Typically paired with `always` trigger for universal rules, but can use any trigger type (e.g., a `persistent` + `file_pattern` rule fires on every turn where a matching file is active).
 
 **Use for:**
 
@@ -459,6 +533,49 @@ Controls injection order:
 | `high`   | First (most prominent) |
 | `medium` | Middle (default)       |
 | `low`    | Last                   |
+
+---
+
+## Schema Reference
+
+> **Note:** The `toolName` and `pattern` fields support JavaScript regex syntax.
+
+```typescript
+type ReminderStrategy = "one_shot" | "sticky" | "persistent";
+type ReminderPriority = "low" | "medium" | "high";
+
+type ReminderTrigger =
+  | { type: "always" }
+  | { type: "file_pattern"; pattern: string }
+  | { type: "user_message"; pattern: string }
+  | { type: "tool_call"; toolName: string; filePattern?: string } // pre-execution, queued for next iteration
+  | {
+      type: "tool_result";
+      toolName: string;
+      outputPattern?: string;
+      success?: boolean;
+    }
+  | { type: "tool_error"; toolName: string }
+  | { type: "iteration"; every?: number; remainingBelow?: number }
+  | { type: "context"; condition: ContextCondition };
+
+type ContextCondition =
+  | { type: "tool_not_used"; toolName: string; turns: number }
+  | { type: "repeated_failures"; toolName: string; count: number }
+  | { type: "loop_detected" }
+  | { type: "tag_active"; tag: string }
+  | { type: "low_context_window"; threshold?: number } // default: 10000
+  | { type: "session_needs_title" }; // main assistant role only
+
+interface ReminderRule {
+  id: string;
+  description?: string; // not injected into LLM — author notes only
+  trigger: ReminderTrigger;
+  content: string;
+  strategy: ReminderStrategy;
+  priority?: ReminderPriority; // default: "medium"
+}
+```
 
 ---
 
@@ -583,47 +700,6 @@ Project `.deft/reminders.json`:
 Result: Project rule wins (same `id`).
 
 ---
-
-## Schema Reference
-
-> **Note:** The `toolName` and `pattern` fields support JavaScript regex syntax.
-
-```typescript
-type ReminderStrategy = "one_shot" | "sticky" | "persistent";
-type ReminderPriority = "low" | "medium" | "high";
-
-type ReminderTrigger =
-  | { type: "always" }
-  | { type: "file_pattern"; pattern: string }
-  | { type: "user_message"; pattern: string }
-  | { type: "tool_call"; toolName: string; filePattern?: string } // toolName is regex
-  | {
-      type: "tool_result";
-      toolName: string; // regex, use ".*" to match all tools
-      outputPattern?: string;
-      success?: boolean;
-    }
-  | { type: "tool_error"; toolName: string } // toolName is regex
-  | { type: "iteration"; every?: number; remainingBelow?: number }
-  | { type: "context"; condition: ContextCondition };
-
-type ContextCondition =
-  | { type: "tool_not_used"; toolName: string; turns: number }
-  | { type: "repeated_failures"; toolName: string; count: number }
-  | { type: "loop_detected" }
-  | { type: "tag_active"; tag: string }
-  | { type: "low_context_window"; threshold?: number }
-  | { type: "session_needs_title" };
-
-interface ReminderRule {
-  id: string;
-  description?: string;
-  trigger: ReminderTrigger;
-  content: string;
-  strategy: ReminderStrategy;
-  priority?: ReminderPriority; // default: "medium"
-}
-```
 
 ---
 
