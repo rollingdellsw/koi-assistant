@@ -369,15 +369,23 @@ async function readPages(handleId, pages, renderScale, renderImages = false) {
   return { totalPages, returnedPages: results.length, pages: results };
 }
 
-async function searchPdf(handleId, query, maxResults) {
+async function searchPdf(handleId, query, maxResults, pageStart, pageEnd) {
   const { doc, metadata } = getHandle(handleId);
   const totalPages = metadata.pageCount;
   const limit = maxResults || 20;
   const queryLower = query.toLowerCase();
 
+  // Clamp page range — default to a 100-page window from pageStart
+  const MAX_SEARCH_PAGES = 100;
+  const effectiveStart = Math.max(1, Math.min(pageStart || 1, totalPages));
+  const effectiveEnd = Math.min(
+    totalPages,
+    pageEnd || (effectiveStart + MAX_SEARCH_PAGES - 1)
+  );
+
   const matches = [];
 
-  for (let pageNum = 1; pageNum <= totalPages && matches.length < limit; pageNum++) {
+  for (let pageNum = effectiveStart; pageNum <= effectiveEnd && matches.length < limit; pageNum++) {
     // Yield periodically during long searches
     if (pageNum % 5 === 0) await new Promise(r => setTimeout(r, 0));
 
@@ -403,7 +411,15 @@ async function searchPdf(handleId, query, maxResults) {
     }
   }
 
-  return { query, totalPages, matchCount: matches.length, matches };
+  return {
+    query,
+    totalPages,
+    searchedRange: { from: effectiveStart, to: effectiveEnd },
+    hasMore: effectiveEnd < totalPages,
+    nextPageStart: effectiveEnd < totalPages ? effectiveEnd + 1 : null,
+    matchCount: matches.length,
+    matches,
+  };
 }
 
 async function getLinks(handleId, pages) {
@@ -480,14 +496,16 @@ return {
       },
       {
         name: "pdf_search",
-        description: "Full-text search across all pages. Returns page numbers and text snippets. Use on large docs before pdf_read.",
-        displayMessage: '🔍 Searching PDF for "{{query}}"',
+        description: "Full-text search across a page range. Returns page numbers, snippets, and progress info. Searches up to 100 pages per call starting from pageStart (default 1). For large docs, search in successive ranges using nextPageStart from the response.",
+        displayMessage: '🔍 Searching PDF for "{{query}}" from page {{pageStart|default:1}}',
         inputSchema: {
           type: "object",
           properties: {
             handle: { type: "string", description: "PDF handle from pdf_load" },
             query: { type: "string", description: "Search text (case-insensitive)" },
             maxResults: { type: "number", description: "Max matches (default: 20)" },
+            pageStart: { type: "number", description: "First page to search (default: 1)" },
+            pageEnd: { type: "number", description: "Last page to search (default: pageStart + 99). Max window is 100 pages per call." },
           },
           required: ["handle", "query"],
         },
@@ -551,7 +569,7 @@ return {
         }
 
         case "pdf_search": {
-          const result = await searchPdf(args.handle, args.query, args.maxResults);
+          const result = await searchPdf(args.handle, args.query, args.maxResults, args.pageStart, args.pageEnd);
           return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         }
 

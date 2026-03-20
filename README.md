@@ -58,7 +58,14 @@ Koi™ is designed to be a Co-Pilot, not a runaway bot. When navigating complex 
 
 #### Watch Koi™ Be a Simple Browser AI Assistant
 
-[![Watch AI Assistant demo](https://img.youtube.com/vi/P_UsVpNwpXA/0.jpg)](https://youtu.be/P_UsVpNwpXA)
+Ask questions on multiple open tabs:
+
+[![multiple tabs demo](https://img.youtube.com/vi/P_UsVpNwpXA/0.jpg)](https://youtu.be/P_UsVpNwpXA)
+
+Breeze through 1,299-page tech spec pdf with ease:
+
+[![1000 page pdf demo](https://img.youtube.com/vi/TIox-X4Tw4g/0.jpg)](https://youtu.be/TIox-X4Tw4g)
+
 
 ---
 
@@ -271,7 +278,7 @@ This support for managed deployment is the only feature difference between paid 
 
 Skills are installed via the UI (folder picker) or imported as JSON.
 
-- [Skills System Guide](./docs/skills.md)
+- [Skills System Guide](./docs/skill_api.md)
 - [Guardrails API Reference](./docs/guardrails_api.md)
 - [Reminder System Guide](./docs/system_reminder.md)
 
