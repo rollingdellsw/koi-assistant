@@ -28,7 +28,7 @@ allowed-tools:
 
 # Sessions Report Generator
 
-Orchestrates `postgresql` and `google-wrokspace` skills to generate reports.
+Orchestrates `postgresql` and `google-workspace` skills to generate reports.
 
 ## Usage
 

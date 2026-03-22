@@ -94,22 +94,22 @@ module.exports = {
    * @returns {{ override: boolean, result?: object }}
    */
   output: async (ctx) => {
-    const { name, result } = ctx.tool;
+    const { name } = ctx.tool;
+    const result = ctx.result;
 
     // After a create tool, extract the created file ID and track it
-    if (CREATE_TOOLS.has(name) && result?.content) {
-      for (const block of result.content) {
-        // Primary: structured _createdFileId field from MCP response
-        if (block._createdFileId) {
-          createdFileIds.add(block._createdFileId);
-        }
-        // Fallback: parse from text "Created spreadsheet: <ID>" / "Created document: <ID>" / "Created presentation: <ID>"
-        if (typeof block.text === 'string') {
-          const match = block.text.match(/(?:Created|Copied) (?:spreadsheet|document|presentation): (\S+)/);
-          if (match && match[1]) {
-            createdFileIds.add(match[1]);
-          }
-        }
+    if (CREATE_TOOLS.has(name) && result && !result.isError) {
+      const content = result.content || '';
+      // ctx.result.content is a string (JSON-serialized), not an array
+      // Check for _createdFileId in the serialized string
+      const idMatch = content.match(/"_createdFileId"\s*:\s*"([^"]+)"/);
+      if (idMatch && idMatch[1]) {
+        createdFileIds.add(idMatch[1]);
+      }
+      // Fallback: parse from "Created spreadsheet: <ID>" / "Created document: <ID>" pattern
+      const textMatch = content.match(/(?:Created|Copied) (?:spreadsheet|document|presentation): (\S+)/);
+      if (textMatch && textMatch[1]) {
+        createdFileIds.add(textMatch[1]);
       }
     }
 

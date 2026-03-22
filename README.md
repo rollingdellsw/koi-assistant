@@ -10,14 +10,15 @@ _Koi™ brings peace to your mind_
 
 ### 'Out of Box' Use Cases
 
-- **Google Workspace & Microsoft 365 Orchestration:** Use the agent to read Gmail or Outlook threads, Calendar, query Google Sheets or Excel, and generate formatted Docs or Word files via OAuth-secured local MCP servers.
-- **Intelligent PDF & Document Analysis:** Spawn independent sub-agents to digest high-volume PDF attachments or long-form documents locally, returning consolidated summaries without overflowing your main conversation's context window.
-- **Visual Discussion & Annotation:** Capture any on-screen region using `CTRL + Mouse Select` to start a grounded bi-directional conversation where both you and the AI can draw rectangles, arrows, and text directly over the UI to debug or explain complex layouts.
+- **Personal Office Assistant**: Read Docs, Email, Slides, Sheets, and Calendars from Google Workspace & Microsoft 365.
+- **Meeting Notes**: Capture notes on lengthy Google Meets with zero LLM token consumption; the AI then summarizes them automatically for your review.
+- **Thousand-Page PDFs**: Intelligently load and search-read any PDF document, whether it is a local file or an online doc.
+- **Visual Discussion & Annotation:** Capture any on-screen region using `CTRL + Mouse Select` to start a grounded, bi-directional conversation where both you and the AI can draw rectangles, arrows, and text directly over the UI.
 
 ### Extensibility with 'Skills and MCPs in a Sandbox'
 
-- **Cross-Source Data Reporting:** Chain multiple data sources together, such as querying a PostgreSQL database via a remote gateway and automatically exporting the results into a formatted Google Sheet.
-- **Per-page Browser Automation with JS Code:** Write your own Skill's JavaScript code to control your web pages, automate your workflows with **deterministic** precision, low-cost, yet maximum security.
+- **Smart Dashboards:** Query enterprise PostgreSQL databases, let the AI analyze results, and automatically export reports into formatted Google Sheets.
+- **Per-Page Browser Automation with JS:** Write your own JavaScript skills to control web pages and automate workflows with **deterministic** precision, low cost, and maximum security.
 - **Event Triggered Automation:** Program your skill to [watch for](./skills/wait-for-demo/) asynchronous events, then launch sub-agents in a [for loop](./skills/gmail-summarizer/scripts/analyze.js) to handle workflows automatically.
 
 [![Summarize an Outlook email with PDF, Word, and PNG attachments](https://img.youtube.com/vi/WOCZ1AfRJ5E/0.jpg)](https://youtu.be/WOCZ1AfRJ5E)
@@ -66,6 +67,10 @@ Breeze through 1,299-page tech spec pdf with ease:
 
 [![1000 page pdf demo](https://img.youtube.com/vi/TIox-X4Tw4g/0.jpg)](https://youtu.be/TIox-X4Tw4g)
 
+Take your personal meeting note:
+
+
+[![Google Meet note demo](https://img.youtube.com/vi/O2-2u8NG9_Q/0.jpg)](https://youtu.be/O2-2u8NG9_Q)
 
 ---
 
@@ -106,7 +111,7 @@ Breeze through 1,299-page tech spec pdf with ease:
 
 The captured region is displayed as an overlay on the page at its original position. Both you and the LLM can annotate it with rectangles, arrows, and text. The overlay persists until you dismiss it, keeping the conversation grounded in what you're looking at. An image stack in the side panel preserves visual history across turns.
 
-#### Watch Koi™ Working on a 100M-pixel Pathology Image
+#### Watch Koi™ Working on a 7.5 Billion-pixel Pathology Image
 
 [![Watch OpenSeadragon demo](https://img.youtube.com/vi/UlqHjMf5eUc/0.jpg)](https://youtu.be/UlqHjMf5eUc)
 

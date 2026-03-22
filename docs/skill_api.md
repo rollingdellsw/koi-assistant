@@ -13,6 +13,8 @@ When a skill script is executed via `run_browser_script`, it runs inside an isol
 > ```
 > my-skill/
 >   SKILL.md          # Required — frontmatter + documentation
+>                     # Frontmatter: machine-readable config (YAML between --- delimiters)
+>                     # Body (below frontmatter): LLM-facing instructions injected into the system prompt
 >   scripts/           # Skill scripts executed via run_browser_script
 >     main.js
 >     helper.js
@@ -51,6 +53,17 @@ The signatures below show the actual script API. For tools that accept a single 
 These methods are built into the script runtime. No skill needs to be loaded first.
 
 - `await tools.readSkill({ name: string })` — Load a skill and its MCP servers into the current script's `tools` object. After calling this, newly registered MCP tools may take a moment to appear; poll with a short `while` loop. Returns `{ success: true }`.
+
+> **Important: `readSkill` in scripts shares tools with the LLM session.**
+>
+> When a script calls `tools.readSkill({ name: "google-workspace" })`, the skill's MCP servers are registered into a **shared MCP router** (`getSharedMCPRouter()` in `script-runner.ts`). This router is a singleton — the same instance used by both the script sandbox and the LLM's main tool executor. Once the script finishes, the MCP tools it loaded **remain registered** and become available to the LLM for direct tool calls in subsequent conversation turns.
+>
+> This means:
+>
+> - If a skill script loads `google-workspace` to call `calendar_get_events` internally, the LLM can call `docs_create` in a later turn **without** needing a separate `read_skill("google-workspace")` call — the tools are already registered from the script's `readSkill`.
+> - This is by design: it enables the two-step pattern where a script does deterministic work (loading dependencies, querying data) and the LLM follows up with reasoning-dependent tool calls using the same loaded tools.
+> - The tools persist for the remainder of the session. They are not unloaded when the script completes.
+
 - `await tools.run_subtask({ goal: string, verification_command: string, timeoutMs?: number, context_files?: string[], image_data?: Array<{base64: string, mimeType: string, filename?: string}> })` — Spawn an independent LLM agent with its own context window. Returns an MCP-style result object `{ content: [{ type: "text", text: string }], isError: boolean }`. Parse the text field as JSON to access `.content` (the agent's final response) or `.history` (full message log, fallback if content is empty). See Section 4.
 - `await tools.sleep(ms: number)` — Wait for `ms` milliseconds.
 
@@ -383,6 +396,52 @@ if (typeof tools.gmail_get_message !== "function") {
 | **Skill**      | The package/orchestrator (`SKILL.md`).     | Defines instructions, parameters, scripts, reminders, guardrails, and declares which tools/MCPs the LLM can use. It is the "brain." |
 | **MCP Server** | The Model Context Protocol implementation. | Exposes generic tools (e.g., `postgres_query`, `onedrive_list`). It has no prompt instructions. It is the "hands."                  |
 
+### 5.1 SKILL.md: Two Audiences, One File
+
+`SKILL.md` serves two distinct audiences within a single file:
+
+1. **Frontmatter (YAML between `---` delimiters)** — Machine-readable configuration consumed by the extension runtime. This declares metadata (`name`, `description`), infrastructure (`mcp-servers`, `allowed-tools`, `url-patterns`), behavior modifiers (`reminders`, `guardrails`), and the skill's callable interface (`runnable`, `parameters`). The extension parser reads this; the LLM does not see raw YAML.
+
+2. **Body (Markdown below the closing `---`)** — LLM-facing instructions injected into the system prompt when the skill is loaded via `read_skill`. This is where you tell the LLM _how_ to use the skill: when to call which scripts, what arguments to pass, what workflow to follow, and what the expected outputs are.
+
+**The body is written FOR the LLM, not for human developers.** Treat it like a system prompt fragment. Common mistakes:
+
+- ❌ Writing human-oriented documentation (installation steps, prerequisites, architecture diagrams)
+- ❌ Explaining how the MCP server works internally — the LLM doesn't need to know implementation details
+- ❌ Assuming the LLM will remember to call back after a long-running operation — if a workflow takes minutes (e.g., monitoring a live meeting), the script itself must block/poll and handle the full lifecycle
+- ✅ Telling the LLM which scripts to call via `run_browser_script` and with what `args`
+- ✅ Describing the expected return values so the LLM can interpret results
+- ✅ Providing workflow sequences ("first call X, then use the result to call Y")
+- ✅ Noting edge cases the LLM should handle ("if the result has `found: false`, retry with different parameters")
+
+**Example — good SKILL.md body (for a long-running skill):**
+
+```markdown
+When the user wants to capture meeting notes, call:
+
+run_browser_script({ script_path: "meet-notes:scripts/capture.js", args: [] })
+
+The script handles the entire lifecycle: starts capture, polls until the meeting
+ends, enriches with calendar data, generates notes via subtask, and creates a
+Google Doc. It blocks for the duration of the meeting.
+
+Returns `{ success: true, docUrl: "...", meetingNotes: "..." }` on success.
+If it returns `{ success: false }`, report the error to the user.
+```
+
+### 5.2 `runnable` and `parameters`: Skill as a Callable Unit
+
+A Skill is more than a collection of MCP tools and scripts — `runnable` and `parameters` elevate it into a **callable unit** with a named interface. This is what distinguishes a Skill from a raw MCP server:
+
+- **`parameters`** define the skill's input contract — named, typed arguments with descriptions and defaults. When the LLM invokes the skill via `run_browser_script`, it fills these parameters as `args`. When a human invokes via `/skill`, the same parameters are prompted in the UI or passed as `--param` flags. Both paths feed into the same `args[]` array in the script.
+- **`runnable: true`** marks the skill as directly executable. This enables two invocation paths:
+  1. **LLM path**: The LLM reads the SKILL.md body, decides to call `run_browser_script({ script_path: "my-skill:scripts/main.js", args: [...] })`, and passes parameter values as args.
+  2. **Human path**: The user types `/skill my-skill/scripts/main.js --full-auto` in Koi's input box, bypassing the LLM entirely. Parameter values come from the UI prompt or `--param` flags.
+
+The key insight: **MCP servers expose generic tools (the "hands"). Skills compose those tools into purposeful workflows with a named interface (the "brain").** A `postgres_query` MCP tool is generic; a `db-to-gsheet-report` skill with `parameters: [query, sheetTitle]` is a reusable action.
+
+**Do not** put `/skill` command examples in the SKILL.md body — the LLM will see them and attempt to use `/skill` syntax instead of `run_browser_script`. Document `/skill` usage for human developers in a separate `README.md` or in code comments.
+
 ---
 
 ## 6. Handling OAuth in Skills (Microsoft 365 Example)
@@ -660,16 +719,17 @@ For corporate and enterprise usage, Koi enforces strict cryptographic and isolat
 
 ## Appendix: SKILL.md Frontmatter Reference
 
-| Field           | Type    | Required | Description                                                                                                         |
-| --------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string  | ✅       | Skill identifier. Lowercase alphanumeric and hyphens only (e.g. `my-skill`).                                        |
-| `description`   | string  | ✅       | One-line description shown in the Skills UI and injected into the LLM system prompt.                                |
-| `runnable`      | boolean |          | If `true`, the skill can be executed directly via `/skill` without being loaded by the LLM. Default: `false`.       |
-| `parameters`    | list    |          | Parameters the LLM should fill when invoking the skill. Each entry: `name`, `description`, `required`, `default`.   |
-| `allowed-tools` | list    |          | Tools the LLM may call when this skill is active. Also controls which tools are available to skill scripts.         |
-| `url-patterns`  | list    |          | Glob patterns (e.g. `https://mail.google.com/*`). If the active tab matches, the skill is auto-loaded.              |
-| `mcp-servers`   | list    |          | MCP server declarations. See Sections 5–6 for full syntax.                                                          |
-| `reminders`     | list    |          | System prompt reminder rules. See [reminder guide](./system_reminder.md).                                           |
-| `guardrails`    | string  |          | Path to a guardrail script (e.g. `scripts/guardrail.js`) or inline JS. See [guardrails guide](./guardrails_api.md). |
+| Field           | Type    | Required | Description                                                                                                                                           |
+| --------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`          | string  | ✅       | Skill identifier. Lowercase alphanumeric and hyphens only (e.g. `my-skill`).                                                                          |
+| `description`   | string  | ✅       | One-line description shown in the Skills UI and injected into the LLM system prompt.                                                                  |
+| `runnable`      | boolean |          | If `true`, the skill is directly executable — both by the LLM via `run_browser_script` and by humans via `/skill` in the input box. Default: `false`. |
+| `parameters`    | list    |          | Parameters the LLM should fill when invoking the skill. Each entry: `name`, `description`, `required`, `default`.                                     |
+| `allowed-tools` | list    |          | Tools the LLM may call when this skill is active. Also controls which tools are available to skill scripts.                                           |
+| `url-patterns`  | list    |          | Glob patterns (e.g. `https://mail.google.com/*`). If the active tab matches, the skill is auto-loaded.                                                |
+| `mcp-servers`   | list    |          | MCP server declarations. See Sections 5–6 for full syntax.                                                                                            |
+| `reminders`     | list    |          | System prompt reminder rules. See [reminder guide](./system_reminder.md).                                                                             |
+| `guardrails`    | string  |          | Path to a guardrail script (e.g. `scripts/guardrail.js`) or inline JS. See [guardrails guide](./guardrails_api.md).                                   |
+| `prerequisites` | list    |          | User-facing checklist shown in the Run dialog before skill execution. Each entry is a plain-text instruction (e.g. `"Enable Closed Captions (CC)"`).  |
 
 > **Note:** `version` and `license` fields can appear in frontmatter (see the `postgresql` skill example) and are stored in the skill data, but they are not extracted or validated by the YAML parser (`skill-parser.ts`). They are passed through only when the install pipeline stores them (e.g., bundled install in `background/index.ts`).

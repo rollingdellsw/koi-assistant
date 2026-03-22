@@ -60,19 +60,18 @@ module.exports = {
   },
 
   output: async (ctx) => {
-    const { name, result } = ctx.tool;
+    const { name } = ctx.tool;
+    const result = ctx.result;
 
-    if (CREATE_TOOLS.has(name) && result?.content) {
-      for (const block of result.content) {
-        if (block._createdFileId) {
-          createdFileIds.add(block._createdFileId);
-        }
-        if (typeof block.text === 'string') {
-          const match = block.text.match(/(?:Created|Copied) (?:workbook|document|presentation): (\S+)/);
-          if (match && match[1]) {
-            createdFileIds.add(match[1]);
-          }
-        }
+    if (CREATE_TOOLS.has(name) && result && !result.isError) {
+      const content = result.content || '';
+      const idMatch = content.match(/"_createdFileId"\s*:\s*"([^"]+)"/);
+      if (idMatch && idMatch[1]) {
+        createdFileIds.add(idMatch[1]);
+      }
+      const textMatch = content.match(/(?:Created|Copied) (?:workbook|document|presentation): (\S+)/);
+      if (textMatch && textMatch[1]) {
+        createdFileIds.add(textMatch[1]);
       }
     }
 
