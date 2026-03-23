@@ -1,4 +1,4 @@
-# Koi™ Assistant - The Browser AI Agent
+# Koi™ Assistant - The Enterprise Browser AI Agent
 
 _Koi™ brings peace to your mind_
 
@@ -45,6 +45,8 @@ To realize the true ROI of AI in the enterprise, we must shift our perspective o
 
 ► [Air-Gapped Enterprise AI](https://www.youtube.com/watch?v=oyxBI8R7hWk) — Watch Koi orchestrate a 14-page document analysis using an on-premise LLM server, keeping 100% of the data behind the firewall.
 
+- [Full product definition doc](./PRODUCT.md)
+
 ### Gentle, Non-Intrusive Guidance
 
 Koi™ is designed to be a Co-Pilot, not a runaway bot. When navigating complex web applications, Koi™ doesn't just hijack your mouse; it gently highlights elements on the page with clear, context-aware tooltips, ensuring you remain in control of the workflow.
@@ -55,7 +57,6 @@ Koi™ is designed to be a Co-Pilot, not a runaway bot. When navigating complex 
   <br>
   <em>The agent analyzes the page and provides a non-intrusive visual overlay to guide your next action.</em>
 </div>
-
 
 #### Watch Koi™ Be a Simple Browser AI Assistant
 
@@ -68,7 +69,6 @@ Breeze through 1,299-page tech spec pdf with ease:
 [![1000 page pdf demo](https://img.youtube.com/vi/TIox-X4Tw4g/0.jpg)](https://youtu.be/TIox-X4Tw4g)
 
 Take your personal meeting note:
-
 
 [![Google Meet note demo](https://img.youtube.com/vi/O2-2u8NG9_Q/0.jpg)](https://youtu.be/O2-2u8NG9_Q)
 
@@ -85,8 +85,7 @@ Take your personal meeting note:
 > **Getting Your API Key:**
 > Koi™ requires an LLM API key to function. If you choose to use Google Gemini, you will need to generate a key via Google Cloud.
 >
-> *Tip: If you are new to Google Cloud, Google currently offers a $300 free credit for new accounts to explore their APIs. You can check your eligibility and sign up from their website.*
-
+> _Tip: If you are new to Google Cloud, Google currently offers a $300 free credit for new accounts to explore their APIs. You can check your eligibility and sign up from their website._
 
 → [Full Configuration Guide](./docs/configuration.md)
 
