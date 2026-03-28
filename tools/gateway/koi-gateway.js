@@ -264,8 +264,9 @@ class Gateway {
       console.log(`[Gateway] Connection closed for ${serverName}`);
       if (mcpProcess) {
         mcpProcess.removeMessageHandler(messageHandler);
-        // Note: We don't stop the MCP process here to allow reuse
-        // In production, you'd want connection pooling with timeouts
+        // MCP process is kept alive for reuse by subsequent connections.
+        // TODO: Add idle timeout to reclaim processes with no active clients,
+        // and connection pooling for high-concurrency deployments.
       }
     });
 
@@ -287,10 +288,14 @@ class Gateway {
   }
 
   validateAuth(token) {
-    // In 'sso' mode, validate the token
-    // For now, this is a placeholder
+    // SSO validation architecture (see enterprise-data-security.md):
+    // The Gateway validates the user's SSO token against the corporate IdP
+    // (Okta, Azure AD, Google Workspace). It does NOT implement SSO itself —
+    // the browser extension obtains the token via chrome.identity and forwards
+    // it here. The Gateway's job is to confirm the token is valid before
+    // proxying MCP requests to backend servers that hold sensitive credentials.
     if (this.config.auth.mode === 'sso') {
-      // TODO: Implement actual SSO validation
+      // TODO: Implement IdP token verification (e.g. OIDC introspection endpoint)
       return token && token.length > 0;
     }
     return true;
