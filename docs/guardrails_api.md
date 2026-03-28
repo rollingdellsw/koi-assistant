@@ -6,10 +6,6 @@ Guardrails come in two scopes: **global** (applies to every tool call in every s
 
 ---
 
-> **Browser Mode Note:** In the Koi Chrome Extension (standalone browser mode), guardrails run in a sandboxed iframe. The `ctx.system.fs` and `ctx.system.cmd` helpers are **not available** — there is no filesystem or shell access. Guardrails in browser mode have access to `ctx.tool`, `ctx.history`, `ctx.memory`, and `ctx.result`. Note that all `ctx.std` helpers are currently **unavailable** in the browser sandbox due to `postMessage` serialization limits (functions are stripped during transit). All other guardrail features (input/output hooks, retry limits, fail mode, module-level state) work identically.
-
----
-
 ## Scope of Application
 
 Guardrails apply to **all tool executions**, including:
@@ -50,7 +46,7 @@ When writing custom guardrails, be aware of what state is shared across agent lo
 
 **Implications for custom guardrails:**
 
-1. **Shared memory snapshot** — The `ctx.memory.snapshot` map tracks file reads globally across sub-tasks. In CLI mode, `ctx.std.checkStaleContext()` uses this map. In browser mode, `ctx.std` is unavailable — use `ctx.memory.snapshot` directly if needed.
+1. **Shared memory snapshot** — The `ctx.memory.snapshot` map tracks file reads globally across sub-tasks.
 
 2. **`ctx.history.messages` reflects main conversation only** — If your guardrail parses message history to check "did the LLM read this file?", it will miss sub-task actions. Use `ctx.memory.snapshot` instead.
 
@@ -77,11 +73,14 @@ input: async (ctx) => {
 // ✅ GOOD: Use the snapshot map
 input: async (ctx) => {
   if (ctx.tool.name === "patch") {
-    const staleFiles = await ctx.std.checkStaleContext(
-      ctx.tool.args.unified_diff,
-    );
-    if (staleFiles.length > 0) {
-      return { allowed: false, message: `Re-read: ${staleFiles.join(", ")}` };
+    // Check ctx.memory.snapshot for stale files before allowing patch
+    const targetPath = ctx.tool.args.path;
+    const entry = ctx.memory.snapshot?.get(targetPath);
+    if (!entry) {
+      return {
+        allowed: false,
+        message: `Re-read ${targetPath} before patching`,
+      };
     }
   }
   return { allowed: true };
@@ -94,36 +93,20 @@ input: async (ctx) => {
 
 The `ctx` object passed to your hooks contains:
 
-| Property                          | Description                                                      |
-| --------------------------------- | ---------------------------------------------------------------- |
-| `ctx.tool.name`                   | Name of the tool being executed (e.g., `"patch"`, `"read_file"`) |
-| `ctx.tool.args`                   | Arguments passed to the tool                                     |
-| `ctx.result`                      | **(output hook only)** `{ content: string, isError: boolean }`   |
-| `ctx.history.messages`            | Full conversation history                                        |
-| `ctx.history.lastUserMessage`     | Last message from the user                                       |
-| `ctx.memory.snapshot`             | Map of files the LLM has read (path → `{ checksum, lastRead }`)  |
-| `ctx.system.fs.readFile(path)`    | Read a file (sandboxed to working directory)                     |
-| `ctx.system.fs.getChecksum(path)` | Get SHA256 of a file                                             |
-| `ctx.system.cmd.exec(cmd)`        | Run a shell command, returns `{ exitCode, stdout, stderr }`      |
-| `ctx.workingDirectory`            | Absolute path to project root                                    |
-| `ctx.std`                         | Standard library helpers (see below)                             |
+| Property                          | Description                                                                 |
+| --------------------------------- | --------------------------------------------------------------------------- |
+| `ctx.tool.name`                   | Name of the tool being executed (e.g., `"patch"`, `"read_file"`)            |
+| `ctx.tool.args`                   | Arguments passed to the tool                                                |
+| `ctx.result`                      | **(output hook only)** `{ content: string, isError: boolean }`              |
+| `ctx.history.messages`            | Full conversation history                                                   |
+| `ctx.history.lastUserMessage`     | Last message from the user                                                  |
+| `ctx.memory.snapshot`             | Map of files the LLM has read (path → `{ checksum, lastRead }`)             |
+| `ctx.system.fs.readFile(path)`    | Read a file (CLI mode only — not available in browser sandbox)              |
+| `ctx.system.fs.getChecksum(path)` | Get SHA256 of a file (CLI mode only)                                        |
+| `ctx.system.cmd.exec(cmd)`        | Run a shell command (CLI mode only), returns `{ exitCode, stdout, stderr }` |
+| `ctx.workingDirectory`            | Absolute path to project root                                               |
 
 > **`ctx.result.content` shape:** In both CLI and browser mode, `content` is always a **string** (the JSON-serialized tool output). To extract structured data, parse it: `const data = JSON.parse(ctx.result.content)`. Do not assume `content` is an array — the MCP `content: [{ type: "text", text: "..." }]` array is serialized into a flat string before reaching the guardrail hook.
-
-**Standard Library (`ctx.std`)**
-
-High-level helpers to avoid boilerplate:
-
-| Method                         | Description                                                     |
-| ------------------------------ | --------------------------------------------------------------- |
-| `checkStaleContext(diff)`      | Returns files in the diff that have changed since LLM read them |
-| `parseUnifiedDiff(diff)`       | Extract file paths from a unified diff string                   |
-| `isGitClean(ctx.system.cmd)`   | Check if git working directory is clean                         |
-| `computeChecksum(content)`     | Compute SHA256 hash of a string                                 |
-| `argMatches(args, key, regex)` | Test if an argument matches a pattern                           |
-| `isFileStale(filepath)`        | Check if a single file has changed since LLM read it            |
-
-> **Output hook snapshot timing:** When your output hook runs, `ctx.memory.snapshot` is already updated. The engine updates snapshots for `patch`, `edit_lines`, `write_file`, and `read_file` **before** calling output hooks, so `checkStaleContext` and `isFileStale` reflect the post-operation state.
 
 ## Hook Return Types
 
@@ -321,7 +304,7 @@ For security-critical environments, you can configure fail-closed behavior in yo
 ### Block tools on specific file patterns
 
 ```javascript
-if (ctx.std.argMatches(ctx.tool.args, "path", /\.prod\.env$/)) {
+if (/\.prod\.env$/.test(ctx.tool.args.path)) {
   return { allowed: false, message: "Cannot modify production env files" };
 }
 ```

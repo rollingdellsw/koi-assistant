@@ -158,7 +158,7 @@ reminders:
 
 - Skill reminder IDs should be namespaced (e.g. `"skillname:reminder-id"`) to avoid colliding with global rules.
 - If a skill reminder has the same `id` as a global rule, the skill version overrides it.
-- Skill reminders are **not** removed when a skill is unloaded mid-session — once registered, they remain active for the session.
+- Skill reminders persist for the lifetime of the session. There is no mid-session "unload" — skills are loaded once and remain active, because the LLM's context window already contains the skill's instructions and removing reminders without clearing context would work against LLM context cache.
 - Multiple skills can be loaded simultaneously; all their reminders are merged and active.
 
 ---

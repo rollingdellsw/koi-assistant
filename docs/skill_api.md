@@ -489,28 +489,13 @@ _Security Note:_ Tokens are strictly restricted via the `allowed_domains` array.
 
 ---
 
-### 6.3 Pre-loading Libraries in MCP Scripts (`libs`)
+### 6.3 Bundling Libraries with MCP Scripts
 
-Local MCP servers can declare a `libs` array to pre-load JavaScript libraries before the MCP script runs. This is required for libraries like `pdf.js` that must be available as globals.
+Local MCP servers that depend on JavaScript libraries should bundle them as static assets shipped with the extension or included directly in the skill's scripts. For example, the built-in PDF skill uses `pdf.mjs` and the document skill uses `mammoth.browser.min.js`, both packaged in the extension's `lib/` directory.
 
-```yaml
-mcp-servers:
-  - name: pdf
-    type: local
-    script: mcp/pdf_mcp.js
-    libs:
-      - url: "chrome-extension://__MSG_@@extension_id__/lib/pdf.mjs"
-        globalName: "pdfjsLib"
-```
+This approach is required for Chrome Web Store compliance, which prohibits remote code loading. Libraries are loaded via `<script>` tags in the sandbox iframe before the MCP script executes.
 
-Each entry can be:
-
-- `{ url: string, globalName?: string }` — loaded via `<script>` tag; `globalName` names the expected global to verify load success.
-- `{ code: string }` — inline JavaScript evaluated directly (for bundled libs).
-
-> **Implementation note:** The `libs` array is processed by `sandbox-mcp.js` at server startup. Libraries are loaded sequentially before the MCP script executes. If a library fails to load, the error is logged but execution continues (the MCP script will fail if it depends on the missing lib).
->
-> Currently, `libs` is not declared in `SkillMCPServerConfig` or the YAML parser — it must be passed directly in the server init message. If you need `libs` support, ensure your skill installation pipeline includes the `libs` array in the MCP server config object.
+> **For skill authors:** If your MCP script requires a third-party library, include it in your skill's `scripts/` or `resources/` directory. The sandbox will load it as a local asset. Do not rely on CDN or remote URLs — these will be blocked by the extension's Content Security Policy.
 
 ### 6.4 Tool Display Messages
 
