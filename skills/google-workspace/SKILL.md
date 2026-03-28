@@ -51,6 +51,11 @@ mcp-servers:
       - https://www.googleapis.com/auth/presentations
       - https://www.googleapis.com/auth/gmail.readonly
       - https://www.googleapis.com/auth/calendar.readonly
+    oauth:
+      authority: https://accounts.google.com/o/oauth2/v2/auth
+      client_id: 474535101182-poobgugcnom698jmuq6o0io9376el2jl.apps.googleusercontent.com
+      allowed_domains:
+        - googleapis.com
 guardrails: scripts/guardrail.js
 ---
 

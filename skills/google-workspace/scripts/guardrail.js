@@ -12,6 +12,8 @@
 
 // Persistent across calls within the same session (module-level closure)
 const createdFileIds = new Set();
+// Auth-failure detection state (persists across calls within a session)
+let needsAuth = false;
 
 // Tools that create new files — always allowed, and we track the IDs
 const CREATE_TOOLS = new Set([
@@ -38,6 +40,8 @@ const MUTATE_ID_ARG = {
   slides_batch_update: 'presentationId',
 };
 
+const AUTH_ERROR_RE = /\b(401|UNAUTHENTICATED)\b/;
+
 module.exports = {
   /**
    * Input guardrail: called BEFORE each MCP tool invocation.
@@ -50,6 +54,15 @@ module.exports = {
    */
   input: async (ctx) => {
     const { name, args } = ctx.tool;
+    // If a previous tool flagged an auth failure, block with a re-auth prompt.
+    // Reset the flag so the user can retry after logging in.
+    if (needsAuth) {
+      needsAuth = false;
+      return {
+        allowed: false,
+        message: "⚠️ AUTHENTICATION REQUIRED: Your Google session has expired. Please click 'Sign in' in the side panel to re-connect your account before continuing."
+      };
+    }
 
     // Create tools: always allowed
     if (CREATE_TOOLS.has(name)) {
@@ -96,6 +109,14 @@ module.exports = {
   output: async (ctx) => {
     const { name } = ctx.tool;
     const result = ctx.result;
+
+    // Detect auth failures in tool results and flag for next input check.
+    if (ctx.result && ctx.result.isError) {
+      const resultString = typeof ctx.result === 'string' ? ctx.result : JSON.stringify(ctx.result);
+      if (AUTH_ERROR_RE.test(resultString)) {
+        needsAuth = true;
+      }
+    }
 
     // After a create tool, extract the created file ID and track it
     if (CREATE_TOOLS.has(name) && result && !result.isError) {

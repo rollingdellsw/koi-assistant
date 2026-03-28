@@ -1,8 +1,9 @@
-# Release 03/22/2026
+# Release 1.0.11
 
 1. Add Google Meet Skill
-2. Fix bug in Google workspace and Windows 365 guardrail: LLM can not update files created by itself.
-3. Update global guardrail and system reminder for OAuth expired failure.
+1. Add Zoom Meeting Skill
+3. Enhance Google workspace OAuth flow for secondary accounts.
+4. Fix bug in Google workspace and Windows 365 guardrail: LLM can not update files created by itself.
 
 # Release 1.0.10
 

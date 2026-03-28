@@ -3,20 +3,9 @@
  */
 const history = [];
 const LIMIT = 3;
-let needsAuth = false;
 
 module.exports = {
   input: async (ctx) => {
-    // If a previous tool flagged an auth failure, block the next call with a UI popup.
-    // We reset the flag here so the user can "Retry" after logging in.
-    if (needsAuth) {
-      needsAuth = false;
-      return {
-        allowed: false,
-        message: "⚠️ AUTHENTICATION REQUIRED: Your session has expired or is invalid. Please click the 'Sign in' or 'Consent' button in the side panel to re-connect your account before continuing."
-      };
-    }
-
     const browserTools = ['click', 'navigate_page', 'search_dom', 'fill', 'execute_isolated_script'];
     if (!browserTools.includes(ctx.tool.name)) return { allowed: true };
 
@@ -43,15 +32,6 @@ module.exports = {
       };
     }
     return { allowed: true };
-  },
-
-  output: async (ctx) => {
-    // Intercept tool results to check for global authentication failure patterns.
-    const resultString = JSON.stringify(ctx.result);
-    if (ctx.result.isError && (resultString.includes("401") || resultString.includes("UNAUTHENTICATED"))) {
-      needsAuth = true;
-    }
-    return { override: false };
   }
 };
 

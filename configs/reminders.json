@@ -47,7 +47,7 @@
   },
   {
     "id": "auth-failure-handler",
-    "trigger": { "type": "tool_result", "toolName": ".*", "outputPattern": "(401|UNAUTHENTICATED)" },
+    "trigger": { "type": "tool_result", "toolName": "(sheets|drive|docs|slides|gmail|calendar)_.*", "outputPattern": "\\b(401|UNAUTHENTICATED)\\b" },
     "content": "CRITICAL: The previous tool failed due to expired or missing authentication. You cannot proceed with this skill until the user re-authenticates. Stop your current workflow and explain to the user exactly why the tool failed.",
     "strategy": "persistent",
     "priority": "high"
