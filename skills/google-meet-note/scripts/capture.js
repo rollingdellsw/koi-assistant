@@ -1,5 +1,8 @@
 // scripts/capture.js — Native Readable Snapshot Polling (Bulletproof)
 
+// args[0] = meeting duration in minutes (default: 30)
+// The caller MUST set run_browser_script timeout >= (duration + 5) * 60 * 1000
+
 async function run() {
   console.log("📦 Loading dependencies...");
   try {
@@ -9,8 +12,12 @@ async function run() {
   console.log("\n🔍 Phase 1: Initializing Native DOM Capture...");
   console.log("   ✓ Using highly reliable 'Readable Snapshot' mode.");
 
+  const meetingDurationMin = parseInt(args[0], 10) || 30;
+  console.log("   ⏱ Meeting duration limit: " + meetingDurationMin + " minutes");
+
   const POLL_INTERVAL_MS = 2000;
-  const MAX_MEETING_MS = 4 * 60 * 60 * 1000;
+  const MAX_MEETING_MS = meetingDurationMin * 60 * 1000;
+  const STALE_TIMEOUT_MS = 3 * 60 * 1000; // 3 min with no new content → assume ended
   const captureStartTime = Date.now();
 
   let meetingEnded = false;
@@ -21,6 +28,7 @@ async function run() {
   let lineCount = 0;
   let consecutiveErrors = 0;
   let pollCount = 0;
+  let lastNewContentTime = Date.now();
 
   // ══════════════════════════════════════════════════════════════
   // PHASE 2: Poll until meeting ends
@@ -31,6 +39,13 @@ async function run() {
 
     if ((Date.now() - captureStartTime) > MAX_MEETING_MS) {
       endReason = "max_duration";
+      break;
+    }
+
+    // Stale content timeout — no new captions for a while means meeting likely ended
+    if (lineCount > 0 && (Date.now() - lastNewContentTime) > STALE_TIMEOUT_MS) {
+      endReason = "stale_timeout";
+      console.log("   ⏰ No new captions for " + (STALE_TIMEOUT_MS / 1000) + "s. Assuming meeting ended.");
       break;
     }
 
@@ -128,6 +143,7 @@ async function run() {
                 // Genuine new line (Speaker name or Caption text)
                 fullTranscriptLines.push(line);
                 lineCount++;
+                lastNewContentTime = Date.now();
 
                 if (lineCount % 10 === 0) {
                     console.log("   📝 Captured " + lineCount + " readable lines...");
@@ -141,7 +157,7 @@ async function run() {
         console.log("   ⚠ Snapshot exception: " + (err.message || err) + " (consecutive: " + consecutiveErrors + ")");
     }
 
-    if (consecutiveErrors >= 5) {
+    if (consecutiveErrors >= 15) {
       endReason = "tab_closed_or_disconnected";
       console.log("   ❌ Lost connection (" + consecutiveErrors + " consecutive errors). Ending capture.");
       break;

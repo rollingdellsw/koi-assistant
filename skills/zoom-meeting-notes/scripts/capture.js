@@ -1,5 +1,7 @@
 // scripts/capture.js — Zoom Web Client Caption Capture via Readable Snapshot Polling
 //
+// args[0] = meeting duration in minutes (default: 30)
+//
 // ─── DESIGN RATIONALE ────────────────────────────────────────────────────────
 //
 // This script is a direct adaptation of the Google Meet capture.js for the
@@ -59,6 +61,9 @@ async function run() {
   console.log("\n🔍 Phase 1: Initializing Zoom Caption Capture...");
   console.log("   ✓ Using 'Readable Snapshot' polling on Zoom Web Client.");
 
+  const meetingDurationMin = parseInt(args[0], 10) || 30;
+  console.log("   ⏱ Meeting duration limit: " + meetingDurationMin + " minutes");
+
   // ── Enter the meeting iframe ──────────────────────────────────
   //
   // CRITICAL: Zoom's PWA web client renders the actual meeting inside
@@ -109,7 +114,8 @@ async function run() {
   }
 
   const POLL_INTERVAL_MS = 2000;
-  const MAX_MEETING_MS = 4 * 60 * 60 * 1000;
+  const MAX_MEETING_MS = meetingDurationMin * 60 * 1000;
+  const STALE_TIMEOUT_MS = 3 * 60 * 1000; // 3 min with no new content → assume ended
   const captureStartTime = Date.now();
 
   let meetingEnded = false;
@@ -120,6 +126,7 @@ async function run() {
   let lineCount = 0;
   let consecutiveErrors = 0;
   let pollCount = 0;
+  let lastNewContentTime = Date.now();
 
   // ══════════════════════════════════════════════════════════════
   // CAPTION SELECTOR DISCOVERY
@@ -330,6 +337,13 @@ async function run() {
       break;
     }
 
+    // Stale content timeout — no new captions for a while means meeting likely ended
+    if (lineCount > 0 && (Date.now() - lastNewContentTime) > STALE_TIMEOUT_MS) {
+      endReason = "stale_timeout";
+      console.log("   ⏰ No new captions for " + (STALE_TIMEOUT_MS / 1000) + "s. Assuming meeting ended.");
+      break;
+    }
+
     pollCount++;
     if (pollCount % 10 === 1) {
       console.log("   🔄 Poll #" + pollCount + " (errors: " + consecutiveErrors + ", lines: " + lineCount + ", selector: " + (activeSelector || "searching...") + ")");
@@ -486,6 +500,7 @@ async function run() {
               // Genuine new line (Speaker name/timestamp or caption text)
               fullTranscriptLines.push(line);
               lineCount++;
+              lastNewContentTime = Date.now();
 
               if (lineCount % 10 === 0) {
                 console.log("   📝 Captured " + lineCount + " readable lines...");
@@ -508,7 +523,7 @@ async function run() {
 
 
 
-    if (consecutiveErrors >= 5) {
+    if (consecutiveErrors >= 15) {
       endReason = "tab_closed_or_disconnected";
       console.log("   ❌ Lost connection (" + consecutiveErrors + " consecutive errors). Ending capture.");
       break;

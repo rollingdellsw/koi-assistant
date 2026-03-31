@@ -7,6 +7,10 @@ parameters:
     description: "reserved for future use"
     required: false
     default: ""
+  - name: duration
+    description: "Meeting duration limit in minutes. The script will stop capturing after this long."
+    required: false
+    default: "30"
 prerequisites:
   - "Enable Closed Captions (CC) — click the **CC** button at the bottom of the Google Meet window"
 url-patterns:
@@ -41,11 +45,20 @@ This skill acts as a privacy-first Executive Assistant. It captures lossy, real-
 
 ## Step 1: Capture
 
-When the user asks to take notes, capture the meeting, or start the skill, you must IMMEDIATELY call the capture script:
+When the user asks to take notes, capture the meeting, or start the skill, first determine the meeting duration. Ask the user if not obvious. Default is 30 minutes.
 
-    run_browser_script({ script_path: "google-meet-notes:scripts/capture.js", args: [] })
+Then IMMEDIATELY call the capture script with the duration and a matching timeout:
 
-The script handles everything: tab locking, native readable snapshot polling of captions, detecting meeting end, and calendar attendee lookup.
+    run_browser_script({
+      script_path: "google-meet-notes:scripts/capture.js",
+      args: ["<duration_in_minutes>"],
+      timeout: (<duration_in_minutes> + 5) * 60 * 1000
+    })
+
+For example, for a 30-minute meeting: `args: ["30"], timeout: 2100000`
+For a 60-minute meeting: `args: ["60"], timeout: 3900000`
+
+The script handles everything: tab locking, native readable snapshot polling of captions, detecting meeting end (including stale-caption detection), and calendar attendee lookup.
 
 It returns:
 

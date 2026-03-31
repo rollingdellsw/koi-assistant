@@ -31,6 +31,7 @@ When a skill script is executed via `run_browser_script`, it runs inside an isol
 An array of string arguments passed to the script by the LLM. Inside the sandbox, `args` is always a `string[]`. Arguments are populated differently depending on how the script is invoked:
 
 - **LLM invocation** (`run_browser_script`): The LLM provides `args` as a string array via `run_browser_script({ script_path: "skill:scripts/main.js", args: ["val1", "val2"] })`. Access as `args[0]`, `args[1]`, etc.
+- **LLM invocation** (`run_browser_script`): The LLM provides `args` as a string array via `run_browser_script({ script_path: "skill:scripts/main.js", args: ["val1", "val2"], timeout: 120000 })`. Access as `args[0]`, `args[1]`, etc.
 - **Direct invocation** (`/skill` command): Skill parameter values (from the UI prompt or `--param` flags) are passed as positional strings via `Object.values(params)`. Parameter order follows the order of the `parameters` list in `SKILL.md`.
 - **Delegation from background**: When the background service worker delegates `execute_isolated_script` to the sidepanel, args come from the caller (usually the LLM's `run_browser_script` call).
 
@@ -180,6 +181,24 @@ Both tools work transparently inside shadow DOMs and iframes — use `tools.ente
 
 **Why use it?**
 If a process is strictly deterministic (e.g., clicking 5 specific buttons to export a report), forcing the LLM to do it step-by-step wastes tokens, takes minutes, and risks hallucination. By bundling a script, the LLM simply calls `run_browser_script({ script_path: "my-skill:scripts/export.js" })` to execute the macro instantly.
+
+### 3.0. Parameters
+
+| Parameter     | Type     | Required | Description                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `script_path` | string   | ✅       | Script path in format `skill-name:scripts/file.js`. The skill-name prefix is required.                                                                                                                                                                                                                                                                                         |
+| `args`        | string[] |          | Arguments to pass to the script. Available as `args[0]`, `args[1]`, etc. inside the script.                                                                                                                                                                                                                                                                                    |
+| `timeout`     | number   |          | Execution timeout in milliseconds. Default: `240000` (4 minutes). For long-running scripts (e.g. meeting capture), set this to match the expected duration plus a buffer. Example: for a 30-minute meeting, use `2100000` ((30 + 5) × 60 × 1000). The timeout propagates through the full execution chain: `browser-dependencies.ts` → `tool-executor.ts` → sidepanel sandbox. |
+
+**Example — long-running script with custom timeout:**
+
+```
+run_browser_script({
+  script_path: "meet-notes:scripts/capture.js",
+  args: ["30"],
+  timeout: 2100000
+})
+```
 
 ### 3.1. Advanced Page Interaction: The Handle System
 
