@@ -342,6 +342,222 @@ Signed skills must be delivered to employee browsers. Supported distribution met
 
 ---
 
+## Phase 7: Skill Development Environment
+
+Enterprise mode enforces signed skills, locked configs, and IT-controlled policies — but Koi is designed as a skill operating system. Employees should be able to develop their own skills. This phase describes how IT can provision a secure development environment that preserves the full enterprise security stack while giving developers a fast iteration loop.
+
+### 7.1 Architecture Overview
+
+The developer runs a **second copy of the extension** (the "dev extension") alongside the production extension on the same managed device. The dev extension is built from the same source as the production extension but uses a different `key` in `manifest.json`, giving it a distinct Chrome extension ID. IT controls this dev extension via a separate managed policy scoped to the developer's device.
+
+The security model does not change. Enterprise mode is still active: skills must be signed, configs are locked, and the license is validated. The key difference is:
+
+- The dev extension's managed policy restricts its [runtime_allowed_hosts](https://support.google.com/chrome/a/answer/9867568) to a narrow set of URLs (e.g., a single internal test page), the dev policy is applied to the developer's managed device only by IT upon request, limiting the blast radius of any skill under development.
+- Skill signing is handled by a **self-service signing RPC** operated by IT. Developers call the RPC to sign their skills on demand. The RPC logs every signing event (who, what skill, content hash, timestamp) for audit.
+- The developer authenticates with the same corporate SSO. Gateway access, LLM routing, and guardrails all work identically to production.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Developer's Managed Device                         │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  ┌─────────────────────────────┐  ┌──────────────────────────────────┐ │
+│  │ Production Extension        │  │ Dev Extension                    │ │
+│  │ ID: aedfofod...             │  │ ID: <dev-extension-id>           │ │
+│  │                             │  │                                  │ │
+│  │ • IT-signed skills only     │  │ • Self-service signed skills     │ │
+│  │ • Full host access          │  │ • Scoped to test URLs only       │ │
+│  │ • allowed_skill_names: [..] │  │ • allowed_skill_names: ["*"]     │ │
+│  │ • Production policy         │  │ • Dev policy (per-device)        │ │
+│  └─────────────────────────────┘  └──────────────────────────────────┘ │
+│                │                              │                        │
+│                └──────────┬───────────────────┘                        │
+│                           ▼                                            │
+│              Same SSO · Same Gateway · Same LLM                        │
+│              Same Global Guardrails · Same License                     │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 IT Setup (One-Time)
+
+#### 7.2.1 Generate the Dev Extension Key
+
+Generate a keypair whose public key will be embedded in the dev extension's `manifest.json`. This key determines the dev extension ID. All developers share the same key so all dev extensions have the same ID, allowing IT to write one policy template.
+
+```bash
+# Generate a fresh RSA keypair for the dev extension identity
+# (This is a Chrome extension packaging key, NOT the skill signing key)
+openssl genrsa 2048 | openssl pkcs8 -topk8 -nocrypt -out dev-extension.pem
+
+# Extract the public key in the DER format Chrome expects
+openssl rsa -in dev-extension.pem -pubout -outform DER -out dev-extension-pub.der
+
+# Convert to base64 for manifest.json
+base64 -w0 dev-extension-pub.der > dev-extension-pub.b64
+```
+
+Publish `dev-extension-pub.b64` to an internal wiki, shared drive, or developer portal. The `.pem` private key is not needed by developers — it is only required if IT wants to produce a `.crx` package. For the unpacked-extension workflow described below, only the public key is used.
+
+#### 7.2.2 Determine the Dev Extension ID
+
+Chrome derives the extension ID from the public key. To find the ID before any developer loads the extension:
+
+```bash
+# Compute the extension ID from the DER public key
+cat dev-extension-pub.der | openssl dgst -sha256 -binary | head -c 16 | xxd -p | tr '0-9a-f' 'a-p'
+```
+
+Record this ID — it is the target for the dev managed policy (e.g., `bfcmjegopkhnface...`).
+
+#### 7.2.3 Deploy the Self-Service Skill Signing RPC
+
+Set up an internal service (HTTP endpoint, CLI tool, or CI job) that:
+
+1. Accepts a skill folder upload (or Git ref) and the developer's SSO token.
+2. Validates the SSO token against the corporate IdP.
+3. Runs `node tools/koi-sign.js --pub-key <key> --priv-key <key> <skill-folder>` using the **same** skill signing keypair used for production (Phase 5).
+4. Returns the signed skill folder (with `skill.sig` included).
+5. Logs an audit record: developer identity, skill name, content hash (SHA-256), timestamp.
+
+Using the same skill signing key for dev and production is intentional. The security gate for production deployment is not the signing key — it is the `allowed_skill_names` whitelist in the production extension's managed policy. A dev-signed skill cannot load in the production extension unless IT explicitly adds its name to the production whitelist.
+
+#### 7.2.4 Prepare the Dev Managed Policy Template
+
+Create a policy template identical to the production policy (§3.1) but with these differences:
+
+| Field                   | Production Policy                  | Dev Policy                                          |
+| ----------------------- | ---------------------------------- | --------------------------------------------------- |
+| Extension ID in path    | `aedfofodkbfgnjknkjpockkgajemkbng` | `<dev-extension-id>` from §7.2.2                    |
+| `allowed_skill_names`   | Curated list                       | `["*"]` (unrestricted — URL scoping is the control) |
+| `runtime_allowed_hosts` | (not set — full access)            | Scoped to developer's approved test URLs            |
+
+All other fields (`license_key`, `organization_id`, `skill_signing_public_key`, `configs`, `default_config`) are the same as production.
+
+### 7.3 Provisioning a Developer (Per-Developer, IT Action)
+
+When a developer requests a skill development environment:
+
+1. Developer submits a request specifying the target URL(s) they need to develop against (e.g., `https://staging.internal.corp/*`).
+2. IT approves the request and logs it (ticket system, access review tool, etc.).
+3. IT enables Chrome developer mode on the developer's managed device (via MDM policy for the developer's OU or device).
+4. IT pushes the dev managed policy to the developer's device, with `runtime_allowed_hosts` set to the approved URL(s).
+
+Example dev policy (Linux, `/etc/opt/chrome/policies/managed/koi-dev.json`):
+
+```json
+{
+  "3rdparty": {
+    "extensions": {
+      "<dev-extension-id>": {
+        "license_key": "ENTERPRISE EXTENSION LICENSE-...",
+        "organization_id": "fe1d02a0-6354-4cb9-bd05-52abfbafc707",
+        "skill_signing_public_key": "-----BEGIN PUBLIC KEY-----\nMFkw...",
+        "allowed_skill_names": ["*"],
+        "default_config": "corp-gemini",
+        "configs": {
+          "corp-gemini": { "...same as production..." }
+        }
+      }
+    }
+  },
+  "ExtensionSettings": {
+    "<dev-extension-id>": {
+      "runtime_allowed_hosts": [
+        "https://staging.internal.corp/*"
+      ]
+    }
+  }
+}
+```
+
+Because the policy is pushed per-device, different developers can have different URL scopes while sharing the same dev extension ID.
+
+### 7.4 Developer Setup (One-Time)
+
+#### 7.4.1 Extract the Production Extension
+
+Locate the installed production extension on disk. Chrome stores installed extensions at:
+
+| OS      | Path                                                                                          |
+| ------- | --------------------------------------------------------------------------------------------- |
+| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\Default\Extensions\aedfofodkbfgnjknkjpockkgajemkbng\` |
+| macOS   | `~/Library/Google/Chrome/Default/Extensions/aedfofodkbfgnjknkjpockkgajemkbng/`                |
+| Linux   | `~/.config/google-chrome/Default/Extensions/aedfofodkbfgnjknkjpockkgajemkbng/`                |
+
+Copy the version subfolder (e.g., `1.0.9_0/`) to a working directory:
+
+```bash
+cp -r ~/.config/google-chrome/Default/Extensions/aedfofodkbfgnjknkjpockkgajemkbng/1.0.9_0 \
+  ~/koi-dev-extension
+```
+
+#### 7.4.2 Patch manifest.json
+
+Replace the `key` field in `manifest.json` with the dev public key published by IT:
+
+```bash
+cd ~/koi-dev-extension
+
+# Read the base64 public key from IT's published file
+DEV_KEY=$(cat /path/to/dev-extension-pub.b64)
+
+# Replace the key field in manifest.json
+jq --arg k "$DEV_KEY" '.key = $k' manifest.json > manifest.tmp && mv manifest.tmp manifest.json
+```
+
+#### 7.4.3 Load the Dev Extension
+
+1. Open `chrome://extensions/`
+2. Enable **Developer mode** (toggle in top-right)
+3. Click **Load unpacked** and select the `~/koi-dev-extension` directory
+4. Verify the extension ID matches the dev extension ID from §7.2.2
+5. Open `chrome://policy/` and confirm the dev policy values appear under the dev extension ID
+
+The production extension remains installed and active. Both extensions run side by side — the production extension has full host access, the dev extension is scoped to the approved URLs.
+
+### 7.5 Development Loop
+
+```
+┌──────────┐     ┌──────────────┐     ┌───────────┐     ┌──────────┐
+│  Write   │────▶│ Sign via RPC │────▶│  Install  │────▶│   Test   │
+│  skill   │     │ (self-serve) │     │  in dev   │     │ on scope │
+└──────────┘     └──────────────┘     │ extension │     │  pages   │
+     ▲                                └───────────┘     └────┬─────┘
+     │                                                       │
+     └───────────────────────────────────────────────────────┘
+                        iterate
+```
+
+1. **Write or modify** the skill locally (SKILL.md, scripts, MCP servers).
+2. **Sign** by calling the IT signing RPC. The RPC returns the skill folder with a valid `skill.sig`.
+3. **Install** the signed skill into the dev extension via the Skills Manager UI.
+4. **Test** against the scoped URL(s). The full Koi sandbox, guardrails, SSO, and gateway stack are active — the only constraint is the URL scope.
+5. **Iterate** — modify the skill, re-sign, re-install. Each signing event is logged.
+
+### 7.6 Promotion to Production
+
+When a skill is ready for org-wide deployment:
+
+1. Developer submits the skill folder for IT review (e.g., opens a pull request to the internal skills repository).
+2. IT reviews the skill code — scripts, MCP servers, guardrails, SKILL.md.
+3. The skill is already signed with the production signing key (the signing RPC uses the same keypair). No re-signing is needed.
+4. IT adds the skill name to the production extension's `allowed_skill_names` policy.
+5. IT distributes the skill via Phase 6 channels (bundled, Skills UI upload, or preload config).
+
+### 7.7 Revoking Developer Access
+
+To revoke a developer's skill development environment:
+
+1. Remove the dev managed policy from the developer's device (via MDM).
+2. The dev extension loses its enterprise configuration on next Chrome restart and can no longer load skills.
+3. Optionally, disable Chrome developer mode on the device to prevent loading unpacked extensions.
+
+The audit log from the signing RPC retains all historical signing events for compliance.
+
+---
+
+
 ## Troubleshooting
 
 | Symptom                                          | Console Evidence                                       | Cause                                                           | Fix                                                                                                       |
@@ -373,13 +589,14 @@ To revoke a specific instance, use the Polar API or dashboard to deactivate the 
 
 ## Security Model Summary
 
-| Layer                | Mechanism                                                  |
-| -------------------- | ---------------------------------------------------------- |
-| LLM traffic routing  | Config locked via managed policy; user cannot edit         |
-| Skill integrity      | ECDSA P-256 signatures verified at install + resolve time  |
-| Authentication (ADC) | `chrome.identity.getAuthToken` → Google IAM enforces roles |
-| License enforcement  | Polar.sh activation on startup; no activation = no agent   |
-| Config immutability  | Enterprise mode disables save/edit/add/delete in UI        |
+| Layer                | Mechanism                                                             |
+| -------------------- | --------------------------------------------------------------------- |
+| LLM traffic routing  | Config locked via managed policy; user cannot edit                    |
+| Skill integrity      | ECDSA P-256 signatures verified at install + resolve time             |
+| Authentication (ADC) | `chrome.identity.getAuthToken` → Google IAM enforces roles            |
+| License enforcement  | Polar.sh activation on startup; no activation = no agent              |
+| Config immutability  | Enterprise mode disables save/edit/add/delete in UI                   |
+| Skill development    | Dev extension scoped to approved URLs; signing RPC audits every build |
 
 ```
 
