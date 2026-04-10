@@ -206,51 +206,73 @@ When interacting with complex, memory-heavy JavaScript objects on a webpage (lik
 
 Koi provides a **Handle System** to manage object references entirely on the target page. The workflow has two parts:
 
-1. **Find & register** the object using `runtime.evaluateScript()` — your finder script runs in the page's `MAIN` world, locates the object, and stores it in `window.__deftHandles`.
+1. **Find & register** the object. Two acquisition paths exist, and choosing the right one matters on hardened sites — see the next two subsections.
 2. **Operate on it by handle** using `runtime.invokeOnHandle()` and `runtime.getFromHandle()` — these call methods or read properties without ever serializing the object across the boundary.
 
 > **Note:** The Handle System is for MCP server scripts (`mcp/*.js`) that need to interact with complex non-serializable JS objects (e.g., a WebGL viewer instance, a large React state tree). For ordinary DOM property reads and method calls, use the `dom-interactor` skill instead — it handles the handle machinery for you.
 
-#### Object Discovery with `evaluateScript` (MCP scripts only)
+#### Object Discovery: Two Paths
 
-The finder script is passed as a **function expression** (not an IIFE) — the runtime calls it with `(document, __ctx, args)` where `__ctx` is the current shadow root or document context. This is what makes handle-based lookups work correctly inside shadow DOMs.
+Koi exposes **two** acquisition APIs. Pick the simplest one that fits.
+
+**Path A — `runtime.findHandle` / `runtime.findHandleByGlobal` (preferred).** For acquiring a DOM element by CSS selector, or a global object by dotted path. Routes through a static page function injected via `chrome.scripting.executeScript` with a function reference, so it does **not** consume the page's CSP `unsafe-eval` budget. Works on hardened sites like claude.ai, github.com, and any page with a strict `script-src` policy. Context-aware: honors the current shadow/iframe path tracked by the background context manager.
+``javascript
+// Example: finding a DOM element or global object (from dom_interactor.js).
+// This is the implementation pattern used by the dom-interactor skill itself.
+async \_getHandle(args) {
+const res = args.selector
+? await runtime.findHandle({ selector: args.selector })
+: await runtime.findHandleByGlobal({ path: args.global || "window" });
+
+if (res && res.error) throw new Error(`Target not found: ${res.error}`);
+const handleId = res && (res.handleId || (res.result && res.result.handleId));
+if (!handleId) throw new Error("Target not found: finder returned no handleId");
+return handleId; // e.g., "h_1"
+}
+
+````
+
+**Path B — `runtime.evaluateScript` with a finder script.** For acquisition that needs *domain-specific discovery logic* — walking React Fiber internals, sniffing window properties for a viewer instance, traversing framework state. The finder script is passed as a **function expression** (not an IIFE) — the runtime calls it with `(document, __ctx, args)` where `__ctx` is the current shadow root or document context.
+
+This path uses `new Function(code)` inside the page's MAIN world, which **fails on sites that disallow `unsafe-eval` in their CSP** (most modern apps with strict CSP). Use it only when Path A's selector/global lookup is insufficient — i.e., when the discovery logic itself is the skill's domain knowledge and cannot be expressed as a single CSS selector.
 
 ```javascript
-// Example: finding a DOM element or global object (from dom_interactor.js)
-async _getHandle(args) {
-  const selector = args.selector;
-
+// Example: domain-specific discovery — finding an OpenSeadragon viewer
+// instance attached to a DOM element. Path A can't express this; the
+// skill needs page-context JS to walk a private property.
+async _getViewerHandle(elementSelector) {
   const FINDER_SCRIPT = `(document, __ctx) => {
-    // Bootstrap the handle registry if not yet injected
     if (!window.__deftHandles) {
+      // Bootstrap registry (only needed when going through evaluateScript;
+      // findHandle initializes the registry on the background side)
       let nextId = 1;
       const registry = new Map();
       window.__deftHandles = {
-        store: function(obj) { const id = "h_" + (nextId++); registry.set(id, obj); return id; },
+        store: function(o) { var id = "h_" + (nextId++); registry.set(id, o); return id; },
         get:     function(id) { return registry.get(id); },
         release: function(id) { return registry.delete(id); }
       };
     }
 
-    const sel = ${JSON.stringify(selector || "")};
-    if (sel) {
-      // Use __ctx (shadow root or document) so this works inside shadow DOMs
-      const el = (__ctx || document).querySelector(sel);
-      if (!el) return { error: "Element not found: " + sel };
-      return { handleId: window.__deftHandles.store(el) };
-    }
-
-    // ... resolve global path, store in registry, return handleId ...
+    const el = (__ctx || document).querySelector("${elementSelector}");
+    if (!el) return { error: "Host element not found" };
+    // Domain-specific: OpenSeadragon stashes the viewer here
+    const viewer = el.__osdViewer || (el.querySelector("[data-osd]") || {}).__osdViewer;
+    if (!viewer) return { error: "No OpenSeadragon viewer attached" };
+    return { handleId: window.__deftHandles.store(viewer) };
   }`;
 
   const res = await runtime.evaluateScript(FINDER_SCRIPT, {}, "MAIN");
   const result = res.result !== undefined ? res.result : res;
   if (result.error) throw new Error(result.error);
-  return result.handleId; // e.g., "h_1"
+  return result.handleId;
 }
-```
+``
+
+> **Rule of thumb:** If your finder is just `querySelector(sel)` or `window.foo.bar`, use Path A. If it walks framework internals or sniffs page-script state, use Path B and accept that the skill won't work on sites with strict CSP.
 
 #### Operating on Handles
+
 
 Once you have a `handleId`, use the handle API methods. These operate by reference — the object is never serialized across the sandbox boundary:
 
@@ -263,28 +285,30 @@ const zoom = await runtime.getFromHandle(handleId, "viewport.zoom");
 
 // Release when done
 await runtime.releaseHandle(handleId);
-```
+````
 
 > **Design principle — "Smart Skill, Dumb Pipe":** The extension core is a generic transport layer. All domain-specific logic (React Fiber traversal, OpenSeadragon detection, etc.) lives inside the skill's MCP script, not in the extension. This keeps the extension CWS-reviewable and makes skills independently evolvable.
 
-> **Security note:** `evaluateScript` is only available to signature-verified MCP server scripts running inside the MCP sandbox (`sandbox-mcp.html`). The LLM cannot call `evaluateScript` directly — it is deliberately omitted from the browser tool set exposed to the agent.
+> **Security note:** Both `findHandle` and `evaluateScript` are only available to signature-verified MCP server scripts running inside the MCP sandbox (`sandbox-mcp.html`). The LLM cannot call them directly — they are deliberately omitted from the browser tool set exposed to the agent. The handle acquisition primitives (`acquire_handle`) are likewise gated to the sandbox-runtime path and never appear in `BROWSER_TOOL_NAMES`. This two-layer isolation — LLM → signed sandbox → page — prevents prompt-injection from acquiring handles to arbitrary page state.
 
 ### 3.2 MCP Runtime API Reference
 
 Inside `mcp/*.js` scripts, the `runtime` object provides the following APIs:
 
-| Method                                               | Description                                                                                                                                                                      |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `runtime.fetch(url, options?)`                       | Authenticated HTTP proxy. Attaches the OAuth token for the server's configured scopes. Supports `options.skipAuth = true` for public APIs. Returns a standard `Response` object. |
-|                                                      | Additional `options`: `responseFormat` (`"text"` or `"base64"` — use `"base64"` for binary downloads like PDFs/images), `method`, `headers`, `body`.                             |
-| `runtime.evaluateScript(code, args?, worldId?)`      | Execute a function-expression string on the target page. `worldId` is `"MAIN"` (page context) or `"ISOLATED"` (default). Returns `{ result }`.                                   |
-| `runtime.invokeOnHandle(handleId, methodPath, args)` | Call a method on a registered handle by dot-notation path (e.g. `"viewport.zoomTo"`).                                                                                            |
-| `runtime.getFromHandle(handleId, propertyPath)`      | Read a primitive property from a registered handle by dot-notation path (e.g. `"scrollTop"`). Do **not** use for method calls.                                                   |
-| `runtime.releaseHandle(handleId)`                    | Release a handle to free memory on the target page. Fire-and-forget.                                                                                                             |
-| `runtime.getAuthToken(scopes?)`                      | Get a raw OAuth token for the server's configured provider. Low-level alternative to `runtime.fetch` for custom auth flows.                                                      |
-| `runtime.getGoogleAuthToken(scopes?)`                | Get a raw Google OAuth token via `chrome.identity`. Low-level; prefer `runtime.fetch` for most cases.                                                                            |
-| `runtime.console.log/warn/error/info(...)`           | Forward log messages to the Koi side panel. Use `runtime.console` (not the global `console`) inside MCP scripts.                                                                 |
-| `runtime.config`                                     | Frozen object containing the server's config block from `SKILL.md` (e.g. `runtime.config.database`, `runtime.config.name`).                                                      |
+| Method                                               | Description                                                                                                                                                                                                                                                                                                                                                |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `runtime.fetch(url, options?)`                       | Authenticated HTTP proxy. Attaches the OAuth token for the server's configured scopes. Supports `options.skipAuth = true` for public APIs. Returns a standard `Response` object.                                                                                                                                                                           |
+|                                                      | Additional `options`: `responseFormat` (`"text"` or `"base64"` — use `"base64"` for binary downloads like PDFs/images), `method`, `headers`, `body`.                                                                                                                                                                                                       |
+| `runtime.findHandle({ selector })`                   | Acquire a handle to a DOM element by CSS selector. Context-aware (honors current shadow/iframe). **Works on CSP-strict sites.** Returns `{ handleId }` or `{ error }`.                                                                                                                                                                                     |
+| `runtime.findHandleByGlobal({ path })`               | Acquire a handle to a global object by dotted path (e.g. `"document"`, `"window.location"`). **Works on CSP-strict sites.** Returns `{ handleId }` or `{ error }`.                                                                                                                                                                                         |
+| `runtime.evaluateScript(code, args?, worldId?)`      | Execute a function-expression string on the target page. `worldId` is `"MAIN"` (page context) or `"ISOLATED"` (default). Returns `{ result }`. **MAIN-world execution uses `new Function(code)` and is subject to the page's CSP — fails on sites without `unsafe-eval`.** For simple selector/global lookups, prefer `findHandle` / `findHandleByGlobal`. |
+| `runtime.invokeOnHandle(handleId, methodPath, args)` | Call a method on a registered handle by dot-notation path (e.g. `"viewport.zoomTo"`).                                                                                                                                                                                                                                                                      |
+| `runtime.getFromHandle(handleId, propertyPath)`      | Read a primitive property from a registered handle by dot-notation path (e.g. `"scrollTop"`). Do **not** use for method calls.                                                                                                                                                                                                                             |
+| `runtime.releaseHandle(handleId)`                    | Release a handle to free memory on the target page. Fire-and-forget.                                                                                                                                                                                                                                                                                       |
+| `runtime.getAuthToken(scopes?)`                      | Get a raw OAuth token for the server's configured provider. Low-level alternative to `runtime.fetch` for custom auth flows.                                                                                                                                                                                                                                |
+| `runtime.getGoogleAuthToken(scopes?)`                | Get a raw Google OAuth token via `chrome.identity`. Low-level; prefer `runtime.fetch` for most cases.                                                                                                                                                                                                                                                      |
+| `runtime.console.log/warn/error/info(...)`           | Forward log messages to the Koi side panel. Use `runtime.console` (not the global `console`) inside MCP scripts.                                                                                                                                                                                                                                           |
+| `runtime.config`                                     | Frozen object containing the server's config block from `SKILL.md` (e.g. `runtime.config.database`, `runtime.config.name`).                                                                                                                                                                                                                                |
 
 #### MCP Server Contract
 
@@ -299,6 +323,7 @@ return {
         name: "my_tool",
         description: "Does something useful.",
         displayMessage: "⚙️ Doing something with {{arg}}",
+        tier: "safe",
         inputSchema: {
           type: "object",
           properties: { arg: { type: "string" } },
@@ -325,6 +350,44 @@ return {
 ```
 
 `callTool` must return `{ content: Array<{ type: "text", text: string }> }` on success, or `{ isError: true, content: [...] }` on failure.
+
+#### Declaring a Security Tier on MCP Tools
+
+Each tool entry in `listTools()` may declare an optional `tier` field that
+tells Koi how cautiously to gate calls to that tool. The tier is a property
+of the tool itself — not of which skill happens to expose it — so it
+applies uniformly whether the tool is called by the LLM directly or from
+inside a skill script.
+
+| Tier             | Confirmation behaviour                                                                                                |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `safe`           | Never confirms. Use for read-only operations (fetching data, looking up metadata, parsing).                           |
+| `navigation`     | First-use confirmation per script run. Use for context-changing reads.                                                |
+| `mutating`       | Confirms on direct LLM calls; first-use per script run from skill scripts. Use for writes that change external state. |
+| `dangerous`      | Confirms on **every** call, even in `--full-auto`. Use for arbitrary code execution.                                  |
+| `skill-injected` | Default when `tier` is omitted. Equivalent to first-use confirmation.                                                 |
+
+**The tier overrides `allowed-tools`.** Listing a tool in a skill's
+`allowed-tools` is a _capability_ declaration ("this skill is permitted to
+call this tool"); it does not weaken the security gate. A `mutating` or
+`dangerous` tool always confirms regardless of whether the active skill
+lists it.
+
+Example: a Slack MCP server marks reads as `safe` and writes as `mutating`:
+
+```javascript
+listTools() {
+  return [
+    { name: "slack_conversations_history", tier: "safe", description: "Read messages.", inputSchema: { /* ... */ } },
+    { name: "slack_users_info",            tier: "safe", description: "Look up a user.", inputSchema: { /* ... */ } },
+    { name: "slack_chat_post_message",     tier: "mutating", description: "Post a message.", inputSchema: { /* ... */ } },
+  ];
+}
+```
+
+With this declaration, the read tools run silently while every post-message
+call is gated by an Accept/Reject prompt — even though all three appear in
+the same `allowed-tools` list.
 
 ---
 
@@ -633,14 +696,25 @@ Koi employs different confirmation lifecycles depending on _who_ is calling the 
 
 ### 8.1 Direct LLM Calls
 
-When the LLM directly outputs a tool call (e.g., `navigate_page`), the execution is paused, and a UI dialog is immediately presented to the user to Accept or Reject the action.
+When the LLM directly outputs a tool call, Koi gates execution based on the
+tool's tier (see §3.2 for declaring tiers on MCP tools):
+
+- `safe` tools execute immediately with no prompt.
+- `mutating` and `dangerous` tools always present an Accept/Reject dialog,
+  even if the active skill lists the tool in its `allowed-tools`. The tier
+  is authoritative — `allowed-tools` is a capability gate, not a trust
+  bypass.
+- Tools without a declared tier (e.g. unannotated MCP tools) fall back to
+  the legacy whitelist behaviour: `allowed-tools` membership grants
+  pass-through, otherwise the user is prompted.
 
 ### 8.2 Skill Script Execution (`run_browser_script`)
 
 When a script runs, prompting the user 100 times in a `for` loop is bad UX. Instead, Koi uses an **Approval State** tied to the specific script run.
 
-- **Tiered Security:** Tools are categorized into tiers (`safe`, `navigation`, `mutating`, `skill-injected`, `dangerous`).
-- **First-Use Confirmation:** If a script attempts a `navigation` or `mutating` tool (e.g., `navigatePage`), the script pauses _once_ to ask for permission. Once the user approves that tool for the current script run, subsequent calls proceed automatically. MCP-provided tools (like `click`, `fill` from chrome-developer-tools) are classified as `skill-injected` and also use first-use confirmation.
+- **Tiered Security:** Tools are categorised into tiers (`safe`, `navigation`, `mutating`, `skill-injected`, `dangerous`). Built-in browser tools have fixed tiers; MCP tools declare their own tier in `listTools()` (see §3.2).
+- **`safe` Tools:** Read-only tools marked `tier: "safe"` execute without prompting. A typical pattern is to mark every read tool an MCP server exposes as `safe` and reserve confirmation for writes.
+- **First-Use Confirmation:** When a script first invokes a `navigation`, `mutating`, or `skill-injected` tool, it pauses once to ask for permission. Subsequent calls of the same tool in the same script run proceed automatically.
 - **Dangerous Exceptions:** Tools classified as `dangerous` _always_ require confirmation on every call, even in `--full-auto` mode. Currently no built-in tools occupy the `dangerous` tier (the `TOOL_TIERS.dangerous` array in `constants.ts` is empty) — it exists as a classification for future use or custom extensions. Direct page mutation tools like `click` and `fill` are only available through the `chrome-developer-tools` skill MCP server, not as built-in tools.
 
 ### 8.3 Debug Skill Script Without LLM Session
@@ -713,6 +787,79 @@ module.exports = {
 
 ## → [Full guardrail guide](./guardrails_api.md)
 
+### 9.3 Pre-Send Hooks
+
+A pre-send hook is a deterministic, agent-side check that runs **before** the user's message is dispatched to the LLM. Unlike reminders and guardrails, **the LLM never sees pre-send hooks** — they are pure UX guards that live entirely on the client side.
+
+**Use case:** the Slack co-pilot binds a session to a specific channel. If the user navigates to a different channel and clicks Send, the pre-send hook detects the mismatch and blocks the send with a user-facing message ("This conversation is about #design. Switch back, or start a new session."). The user's draft is preserved; nothing reaches the LLM. This prevents cross-channel context bleed without requiring the model to reason about staleness.
+
+**Declaration.** Add `pre-send-hook: scripts/pre_send.js` to `SKILL.md` frontmatter (sibling to `guardrails`). The path is relative to the skill root.
+
+```yaml
+pre-send-hook: scripts/pre_send.js
+```
+
+**Hook signature.** The hook is a sandboxed script — same execution environment as `analyze.js` and other `run_browser_script` scripts. It receives the user's draft text as `args[0]` and can call any tool the skill has access to (including its own MCP tools, so it can read module-scope state set by other scripts).
+
+It returns either:
+
+```javascript
+{ block: false }                              // allow send
+{ block: true, message: "Reason for block" }  // block send, show message
+```
+
+**Example** — block send when the active Slack tab no longer matches the channel the session was bound to:
+
+```javascript
+// scripts/pre_send.js
+async function run() {
+  const pagesRes = await tools.listPages({});
+  if (!pagesRes || pagesRes.isError) return { block: false }; // fail open
+
+  const pages = Array.isArray(pagesRes.content)
+    ? JSON.parse(String(pagesRes.content[0].text))
+    : pagesRes;
+  const tabList = Array.isArray(pages) ? pages : pages.pages || [];
+  const slackTab = tabList.find(
+    (p) => typeof p.url === "string" && p.url.includes("app.slack.com/client/"),
+  );
+  if (!slackTab) return { block: false };
+
+  const parseRes = await tools.slack_parse_channel_url({ url: slackTab.url });
+  if (parseRes.isError) return { block: false };
+  const parsed = JSON.parse(String(parseRes.content[0].text));
+  if (!parsed.matched || !parsed.hasChannel) return { block: false };
+
+  // Compare against state set by analyze.js (module scope in slack_mcp.js)
+  const stateRes = await tools.slack_get_fetch_state({
+    channel: parsed.channelId,
+  });
+  if (stateRes.isError) return { block: false };
+  const { lastActiveChannel } = JSON.parse(String(stateRes.content[0].text));
+  if (lastActiveChannel === null) return { block: false }; // first send
+
+  if (lastActiveChannel !== parsed.channelId) {
+    return {
+      block: true,
+      message:
+        "This conversation is about a different Slack channel. Switch back to that channel, or start a new session.",
+    };
+  }
+  return { block: false };
+}
+return run();
+```
+
+**Execution rules:**
+
+- **Timeout: 2 seconds per hook.** Pre-send hooks run on every Send click and must be fast. Cheap state comparisons only — no network calls, no LLM calls, no waiting on user input. When multiple skills with hooks are loaded, hooks run sequentially, so worst-case latency before send is `2s × number_of_hooks`.
+- **Fail-open on error or timeout.** A buggy hook must never lock the user out of their own UI. If the hook throws, times out, or its script can't be loaded, the send proceeds and a warning is logged. This matches the `failMode: "open"` philosophy of guardrails.
+- **`fullAuto` mode.** Tool calls inside a pre-send hook do **not** trigger the user-confirmation modal — the user already trusted the skill at load time. This makes hooks usable for tools like `listPages` that would otherwise prompt.
+- **Chaining.** When multiple skills with pre-send hooks are loaded simultaneously, hooks run sequentially in load order. The **first** hook to return `{block: true}` wins; remaining hooks are skipped. This matches the input-hook chaining behavior in [the guardrails API](./guardrails_api.md).
+- **Dedup.** Re-loading the same skill is idempotent — the hook is keyed by skill name, not registered twice.
+- **Session lifetime.** Hooks are cleared when the agent session is reset (new session, load saved session). Skills are re-registered automatically as they auto-load for the new session.
+- **The LLM never sees the hook or its result.** Blocked sends do not appear in conversation history. The user just sees a banner above the input area and clicks Send again after fixing the situation.
+
 ## 10. Security Model & Enterprise Deployment
 
 For corporate and enterprise usage, Koi enforces strict cryptographic and isolation boundaries.
@@ -734,6 +881,7 @@ For corporate and enterprise usage, Koi enforces strict cryptographic and isolat
 | `mcp-servers`   | list    |          | MCP server declarations. See Sections 5–6 for full syntax.                                                                                            |
 | `reminders`     | list    |          | System prompt reminder rules. See [reminder guide](./system_reminder.md).                                                                             |
 | `guardrails`    | string  |          | Path to a guardrail script (e.g. `scripts/guardrail.js`) or inline JS. See [guardrails guide](./guardrails_api.md).                                   |
+| `pre-send-hook` | string  |          | Path to a script (e.g. `scripts/pre_send.js`) that runs before each user-message send. Can block the send with a user-facing message. See §9.3.       |
 | `prerequisites` | list    |          | User-facing checklist shown in the Run dialog before skill execution. Each entry is a plain-text instruction (e.g. `"Enable Closed Captions (CC)"`).  |
 
 > **Note:** `version` and `license` fields can appear in frontmatter (see the `postgresql` skill example) and are stored in the skill data, but they are not extracted or validated by the YAML parser (`skill-parser.ts`). They are passed through only when the install pipeline stores them (e.g., bundled install in `background/index.ts`).

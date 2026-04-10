@@ -1,3 +1,7 @@
+# Release 1.0.12
+1. Add Slack skill
+2. Make dom-interactor handle acquisition CSP-safe
+
 # Release 1.0.11
 
 1. Add Google Meet Skill

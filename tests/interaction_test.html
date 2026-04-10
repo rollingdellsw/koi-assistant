@@ -2,6 +2,17 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <!--
+    Strict CSP — mirrors the shape of claude.ai / github.com / most modern
+    apps. Specifically, `script-src` permits inline scripts via hash but
+    does NOT include `unsafe-eval`, so any code path that does
+    `new Function(...)` or `eval(...)` in this page's MAIN world will be
+    blocked by the browser. This is the regression net for the
+    dom-interactor handle-acquisition path: the eval-free `findHandle`
+    route must work here; the legacy `evaluateScript`-based finder must
+    fail with the canonical "Evaluating a string as JavaScript violates..." error.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'">
   <title>Koi Interaction & Trap Test</title>
   <style>
     body { background: #1a1a2e; color: #eee; font-family: sans-serif; padding: 20px; }
@@ -24,7 +35,8 @@
     <br><br>
     <div id="hover-target"
          onmouseenter="this.innerText='HOVERED_JS'"
-         onmouseleave="this.innerText='Hover Me'">
+         onmouseleave="this.innerText='Hover Me'"
+         onclick="this.innerText='CLICKED_BY_USER'">
       Hover Me
     </div>
   </div>

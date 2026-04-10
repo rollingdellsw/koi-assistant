@@ -12,6 +12,7 @@ await tools.waitFor({ event: "load", timeout: 5000 });
 // FIX: Force reset to Main Context to clear state from previous tests
 console.log("🔄 Resetting context to Main Document...");
 await tools.resetContext();
+await tools.readSkill({ name: "dom-interactor" });
 
 // Helper: Typed wrapper for DOM tools
 const dom = {

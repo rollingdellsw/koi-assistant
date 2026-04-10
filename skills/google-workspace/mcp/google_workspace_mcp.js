@@ -1020,6 +1020,25 @@ return {
   },
 
   async docsReadContent(documentId, tabId, startIndex, endIndex) {
+    // TODO(non-native-files): Google Drive serves uploaded .docx files under
+    // /document/d/<id>/edit URLs, identical to native Google Docs URLs. The
+    // autoloader matches both and routes the model here, but the Docs API
+    // (docs.googleapis.com/v1/documents) only accepts native Google Docs and
+    // returns an opaque 400 for .docx (or any other non-native MIME type).
+    // That 400 currently triggers the OAuth account-mismatch circuit breaker
+    // in browser-mcp-manager.ts and produces a spurious account picker
+    // followed by tool failure, after which the model falls back to
+    // take_snapshot/take_screenshot — bad UX for a common case.
+    //
+    // Real fix is at the routing layer, not here: either (a) the autoloader
+    // does a Drive metadata pre-check before binding /document/d/ URLs to
+    // the google-workspace skill, or (b) a new tool (e.g. drive_read_file)
+    // dispatches by mimeType — native Doc -> existing Docs API path,
+    // .docx -> drive alt=media + a docx_load parser tool (mirroring how
+    // pdf_load handles PDFs from Drive today via /file/d/ URLs).
+    //
+    // Patching this function to silently branch on mimeType would muddy
+    // its contract ("read a Google Doc") and is not the right layer.
     const url = `https://docs.googleapis.com/v1/documents/${documentId}?includeTabsContent=true`;
     const response = await runtime.fetch(url);
     if (!response.ok) {
