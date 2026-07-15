@@ -1,10 +1,10 @@
 {
   "llm": {
     "provider": "openai",
-    "apiKey": "${OPENAI_API_KEY}",
-    "model": "gpt-5.2",
+    "apiKey": "sk-dummy-key",
+    "model": "gpt-5.5",
     "contextWindow": 400000,
-    "baseUrl": "https://api.openai.com/v1",
+    "baseUrl": "http://localhost:8317/v1",
     "temperature": 1.0,
     "maxTokens": 128000,
     "thinking": {
@@ -15,13 +15,13 @@
   },
   "executor": {
     "enabled": true,
-    "model": "gpt-5.2",
+    "model": "gpt-5.5",
     "timeoutMs": 180000,
     "maxIterations": 20
   },
   "tools": {
     "whitelist": [
-      "run_subtask"
+      "runSubtask"
     ]
   },
   "agent": {
@@ -34,7 +34,7 @@
   "skills": {
     "preload": [
     ],
-    "comment": "Preload skills make their tools available immediately without LLM calling read_skill"
+    "comment": "Preload skills make their tools available immediately without LLM calling readSkill"
   },
   "gateways": {
     "default": {

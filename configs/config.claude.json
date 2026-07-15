@@ -1,12 +1,11 @@
 {
   "llm": {
     "provider": "anthropic",
-    "apiKey": "${ANTHROPIC_API_KEY}",
-    "model": "claude-sonnet-4-6",
-    "contextWindow": 200000,
+    "apiKey": "sk-dummy-key",
+    "model": "claude-opus-4-8",
+    "contextWindow": 1000000,
     "comment": "Reminder LLM when remaining contextWindow is less than 10000",
-    "baseUrl": "https://api.anthropic.com",
-    "temperature": 1,
+    "baseUrl": "http://localhost:8317",
     "maxTokens": 64000,
     "thinking": {
       "enabled": true,
@@ -16,13 +15,13 @@
   },
   "executor": {
     "enabled": true,
-    "model": "claude-haiku-4-5",
+    "model": "claude-sonnet-5",
     "timeoutMs": 180000,
     "maxIterations": 20
   },
   "tools": {
     "whitelist": [
-      "run_subtask"
+      "runSubtask"
     ]
   },
   "agent": {
@@ -35,7 +34,7 @@
   "skills": {
     "preload": [
     ],
-    "comment": "Preload skills make their tools available immediately without LLM calling read_skill"
+    "comment": "Preload skills make their tools available immediately without LLM calling readSkill"
   },
   "gateways": {
     "default": {

@@ -22,7 +22,7 @@
   },
   "tools": {
     "whitelist": [
-      "run_subtask"
+      "runSubtask"
     ]
   },
   "agent": {
@@ -35,7 +35,7 @@
   "skills": {
     "preload": [
     ],
-    "comment": "Preload skills make their tools available immediately without LLM calling read_skill"
+    "comment": "Preload skills make their tools available immediately without LLM calling readSkill"
   },
   "gateways": {
     "default": {

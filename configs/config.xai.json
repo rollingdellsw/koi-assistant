@@ -1,12 +1,12 @@
 {
   "llm": {
-    "provider": "gemini",
+    "provider": "xai",
     "apiKey": "sk-dummy-key",
-    "model": "gemini-3-flash",
-    "baseUrl": "http://localhost:8317",
-    "temperature": 0.7,
-    "contextWindow": 1000000,
-    "maxTokens": 65536,
+    "model": "grok-4.5",
+    "contextWindow": 500000,
+    "baseUrl": "http://localhost:8317/v1",
+    "temperature": 1.0,
+    "maxTokens": 128000,
     "thinking": {
       "enabled": true,
       "budgetLevel": "high",
@@ -14,8 +14,8 @@
     }
   },
   "executor": {
-    "model": "gemini-3-flash",
     "enabled": true,
+    "model": "grok-4.5",
     "timeoutMs": 180000,
     "maxIterations": 20
   },

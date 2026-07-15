@@ -2,11 +2,11 @@
  * Koi Browser Loop Detection
  */
 const history = [];
-const LIMIT = 3;
+const LIMIT = 8;
 
 module.exports = {
   input: async (ctx) => {
-    const browserTools = ['click', 'navigate_page', 'search_dom', 'fill', 'execute_isolated_script'];
+    const browserTools = ['click', 'navigatePage', 'searchDom', 'fill', 'executeIsolatedScript'];
     if (!browserTools.includes(ctx.tool.name)) return { allowed: true };
 
     const target = ctx.tool.args.selector || ctx.tool.args.url || ctx.tool.args.script_path || "action";
@@ -28,7 +28,7 @@ module.exports = {
       return {
         allowed: false,
         message: "Context overflow risk. LLMs cannot process raw base64 data directly.",
-        suggestion: "Use run_browser_script to execute a JS script that fetches the base64 data and pipes it directly into pdf_load or other processing tools."
+        suggestion: "Use runBrowserScript to execute a JS script that fetches the base64 data and pipes it directly into pdf_load or other processing tools."
       };
     }
     return { allowed: true };
