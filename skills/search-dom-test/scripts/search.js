@@ -8,9 +8,9 @@
 //   CODEBASE WORKFLOW:          BROWSER WORKFLOW:
 //   ─────────────────           ────────────────
 //   ls (list files)        →    list_structure (iframes, shadows)
-//   tree (directory tree)  →    search_dom (get element overview)
-//   grep (find patterns)   →    search_dom (find specific elements)
-//   cat (read content)     →    inspect_element (get details)
+//   tree (directory tree)  →    searchDom (get element overview)
+//   grep (find patterns)   →    searchDom (find specific elements)
+//   cat (read content)     →    inspectElement (get details)
 //   vim (edit)             →    click / fill (interact)
 //
 // Snapshot Modes: readable (default, clean text), dom (selector tree), full (raw textContent)
@@ -24,7 +24,7 @@ console.log("🗺️ DISCOVERY WORKFLOW TEST - Starting");
 console.log("🗺️ ════════════════════════════════════════════════════════════\n");
 
 // Refresh the test page to start clean
-await tools.navigatePage('http://localhost:8000/search_dom_stress_test.html');
+await tools.navigatePage('http://localhost:8000/searchDom_stress_test.html');
 await tools.waitFor({ event: "load", timeout: 5000 });
 
 await tools.resetContext();
@@ -39,12 +39,12 @@ const dom = {
       ? { selector: selectorOrGlobal, property: prop }
       : { global: selectorOrGlobal, property: prop };
 
-    const res = await tools.dom_get_property(args);
+    const res = await tools.domGetProperty(args);
     if (res.isError) throw new Error(res.content[0].text);
     return JSON.parse(res.content[0].text);
   },
   call: async (selector, method, args=[]) => {
-    const res = await tools.dom_call_method({ selector, method, args });
+    const res = await tools.domCallMethod({ selector, method, args });
     if (res.isError) throw new Error(res.content[0].text);
     return JSON.parse(res.content[0].text);
   }
@@ -299,7 +299,7 @@ if (bobRowSearch.count > 0) {
   console.log(`    Scanning ${bobRowSearch.count} rows for bob@example.com...`);
 
   // For this specific case, we know the delete button structure
-  // In a real scenario, the LLM would use inspect_element on the row first
+  // In a real scenario, the LLM would use inspectElement on the row first
   const deleteSelector = '[data-action="delete"][data-user="user-002"]';
   const deleteSearch = await tools.searchDom(deleteSelector);
 
@@ -343,9 +343,9 @@ This mirrors file system navigation:
 Key Principles:
   • Start broad, narrow down
   • Check visibility before acting
-  • Use take_snapshot mode='dom' to discover selectors efficiently
-  • Use take_snapshot mode='readable' (default) for text content
-  • Use take_screenshot resolution='low' (default) to save context tokens
+  • Use takeSnapshot mode='dom' to discover selectors efficiently
+  • Use takeSnapshot mode='readable' (default) for text content
+  • Use takeScreenshot resolution='low' (default) to save context tokens
   • Use data-testid when available
   • Switch contexts explicitly for shadow/iframe
   • Verify actions with follow-up queries

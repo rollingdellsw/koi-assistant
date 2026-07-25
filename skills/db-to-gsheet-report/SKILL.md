@@ -23,7 +23,7 @@ parameters:
     default: "200"
 
 allowed-tools:
-  - run_browser_script
+  - runBrowserScript
 ---
 
 # Sessions Report Generator
@@ -34,7 +34,7 @@ Orchestrates `postgresql` and `google-workspace` skills to generate reports.
 
 ```javascript
 // 1. Run the integration test
-run_browser_script({
+runBrowserScript({
   script_path: "db-to-gsheet-report:scripts/main.js",
 });
 ```

@@ -2,8 +2,8 @@
 name: context-stress-test
 description: Validates browser tool context isolation and switching
 allowed-tools:
-  - run_browser_script
-  - new_page
+  - runBrowserScript
+  - newPage
 ---
 
 # Context Stress Test Skill
@@ -15,7 +15,7 @@ This skill validates the robustness of the browser toolchain, specifically focus
 Run the full verification suite:
 
 ```javascript
-run_browser_script({
+runBrowserScript({
   script_path: "context-stress-test:scripts/stress.js",
 });
 ```

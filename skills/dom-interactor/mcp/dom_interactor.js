@@ -5,7 +5,7 @@ return {
   listTools() {
     return [
       {
-        name: "dom_get_property",
+        name: "domGetProperty",
         description: "Get a property from a DOM element or global object.",
         inputSchema: {
           type: "object",
@@ -18,7 +18,7 @@ return {
         }
       },
       {
-        name: "dom_call_method",
+        name: "domCallMethod",
         description: "Call a method on a DOM element or global object.",
         inputSchema: {
           type: "object",
@@ -41,7 +41,7 @@ return {
   // Helper to get a handle to a DOM element or global object.
   //
   // Uses runtime.findHandle / runtime.findHandleByGlobal, which route to
-  // the background's acquire_handle tool. That tool uses
+  // the background's acquireHandle tool. That tool uses
   // chrome.scripting.executeScript with a static page function — it does
   // NOT consume the page's CSP `unsafe-eval` budget, so this works on
   // hardened sites like claude.ai where the previous evaluateScript-based
@@ -75,12 +75,12 @@ return {
     try {
       const handle = await this._getHandle(args);
 
-      if (name === "dom_get_property") {
+      if (name === "domGetProperty") {
         const res = await runtime.getFromHandle(handle, args.property);
         return { content: [{ type: "text", text: JSON.stringify(res.result ?? null) }] };
       }
 
-      if (name === "dom_call_method") {
+      if (name === "domCallMethod") {
         const res = await runtime.invokeOnHandle(handle, args.method, args.args || []);
         return { content: [{ type: "text", text: JSON.stringify(res.result ?? null) }] };
       }

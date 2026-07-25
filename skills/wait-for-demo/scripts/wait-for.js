@@ -24,12 +24,12 @@ const dom = {
       ? { selector: selectorOrGlobal, property: prop }
       : { global: selectorOrGlobal, property: prop };
 
-    const res = await tools.dom_get_property(args);
+    const res = await tools.domGetProperty(args);
     if (res.isError) throw new Error(res.content[0].text);
     return JSON.parse(res.content[0].text);
   },
   call: async (selector, method, args=[]) => {
-    const res = await tools.dom_call_method({ selector, method, args });
+    const res = await tools.domCallMethod({ selector, method, args });
     if (res.isError) throw new Error(res.content[0].text);
     return JSON.parse(res.content[0].text);
   }
@@ -62,7 +62,7 @@ console.log("ℹ️ Assistant is guiding you via a visual hint...");
 const targetSelector = '#hover-target';
 
 // Ensure the element is visible
-await tools.dom_call_method({ selector: targetSelector, method: 'scrollIntoView' });
+await tools.domCallMethod({ selector: targetSelector, method: 'scrollIntoView' });
 
 // Use highlightElement to show the persistent "hint" overlay
 await tools.requestAction({

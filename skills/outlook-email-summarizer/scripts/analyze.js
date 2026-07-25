@@ -44,64 +44,133 @@ async function run() {
     return { success: false, error: "Required Microsoft 365 tools failed to register." };
   }
 
-  // If we still have a URL or long hash (not a Graph API ID), resolve via browser tab + search
-  // Message IDs start with "AAMk" or "AQMk" + "A...R" (containing "ARg" or "AAAI")
-  // Conversation IDs start with "AQQk" — these are NOT valid for /me/messages/{id}
+  // The Outlook Web URL /id/ segment is NOT a Graph /me/messages/{id} value:
+  //   - Graph message IDs start with "AAMk" or "AQMk".
+  //   - "AQQk" is a conversation/OWA id — invalid for /me/messages/{id}.
+  // The OWA tab title is the generic mailbox name ("Mail - <user> - Outlook"),
+  // not the subject, so it can't be used to resolve the message either.
+  // Instead, resolve from the message that is actually open in the reading pane:
+  // read its subject + sender off the page, search Graph, and ONLY accept a result
+  // whose subject is literally visible on the page. Never guess "most recent".
   const isConversationId = messageId.startsWith("AQQk");
   const isLikelyMessageId = (messageId.startsWith("AAMk") || messageId.startsWith("AQMk")) && !isConversationId;
   if (!isLikelyMessageId) {
-    console.log("Could not extract Graph message ID from URL. Resolving via browser tab title...");
+    console.log("URL exposes a conversation/OWA id, not a Graph message id. Resolving from the open reading pane...");
     let resolved = false;
 
-    if (typeof tools.listPages === "function") {
+    // ── Extract subject + sender candidates from the currently open message ──
+    let pageText = "";
+    let candidateSubject = "";
+    const pageEmails = [];
+    if (typeof tools.getPageContext === "function") {
       try {
-        const pagesRes = await tools.listPages({});
-        if (pagesRes && !pagesRes.isError) {
-          const pagesData = JSON.parse(String(pagesRes.content[0].text));
-          // Outlook tab titles are like "Subject - sender@email.com - Outlook"
-          const currentTab = pagesData.find(
-            p => typeof p.url === "string" && (p.url.includes("outlook.live.com") || p.url.includes("outlook.office.com"))
-          );
+        const ctxRes = await tools.getPageContext({});
+        // getPageContext may return {readable,...} directly or wrapped as MCP {content:[{text}]}.
+        let ctx = ctxRes;
+        if (ctxRes && Array.isArray(ctxRes.content) && ctxRes.content[0] && typeof ctxRes.content[0].text === "string") {
+          try { ctx = JSON.parse(String(ctxRes.content[0].text)); } catch (_) { ctx = ctxRes; }
+        }
+        pageText = String((ctx && ctx.readable) || "");
 
-          if (currentTab && typeof currentTab.title === "string") {
-            const titleParts = currentTab.title.split(" - ");
-            if (titleParts.length > 0) {
-              const subject = String(titleParts[0]).trim();
-              console.log(`Extracted subject from tab title: "${subject}". Searching Outlook API...`);
-              const searchRes = await tools.outlook_search({ query: subject, maxResults: 1 });
+        // All email addresses on the page (unique, in order) — used as from: candidates.
+        const emailRe = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+        let em;
+        while ((em = emailRe.exec(pageText)) !== null) {
+          if (!pageEmails.includes(em[0])) pageEmails.push(em[0]);
+        }
 
-              if (searchRes && !searchRes.isError) {
-                const searchData = JSON.parse(String(searchRes.content[0].text));
-                const messages = Array.isArray(searchData.messages) ? searchData.messages : [];
-                if (messages.length > 0) {
-                  messageId = String(messages[0].id);
-                  console.log(`Resolved to API Message ID: ${messageId}`);
-                  resolved = true;
-                }
-              }
+        // Subject candidate: first non-trivial heading line ("# ...") in the readable text.
+        const heading = pageText.split("\n").map(l => l.trim())
+          .find(l => l.startsWith("#") && l.replace(/^#+\s*/, "").length > 2);
+        if (heading) candidateSubject = heading.replace(/^#+\s*/, "").trim();
+
+        // If readable text didn't give a heading, try searching the DOM directly
+        if (!candidateSubject && typeof tools.searchDom === "function") {
+          try {
+            const domRes = await tools.searchDom('[id$="_SUBJECT"][role="heading"]');
+            if (domRes && domRes.matches && domRes.matches.length > 0) {
+              const validMatch = domRes.matches.find(m => m.text && m.text.trim().length > 0);
+              if (validMatch) candidateSubject = validMatch.text.trim();
             }
+          } catch (e) {
+            console.log(`DOM subject extraction failed: ${String(e)}`);
           }
         }
+
+        console.log(`Reading pane → subject candidate: "${candidateSubject}", emails: [${pageEmails.join(", ")}]`);
       } catch (e) {
-        console.log(`Context resolution failed: ${String(e)}`);
+        console.log(`Reading-pane extraction failed: ${String(e)}`);
+      }
+    }
+
+    // Normalizer + validator: a result is only acceptable if its subject appears on the page.
+    const norm = s => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const pageNorm = norm(pageText);
+    const pickValidated = (messages) => {
+      const list = Array.isArray(messages) ? messages : [];
+      const confirmed = list.filter(m => m.subject && pageNorm.includes(norm(m.subject)));
+      if (confirmed.length > 0) {
+        // Most recent among page-confirmed matches (handles same-subject threads).
+        return confirmed.slice().sort(
+          (a, b) => String(b.receivedDateTime || "").localeCompare(String(a.receivedDateTime || ""))
+        )[0];
+      }
+      // Only trust an unvalidated result when the search was unambiguous.
+      return list.length === 1 ? list[0] : null;
+    };
+
+    const runSearch = async (query) => {
+      const res = await tools.outlook_search({ query, maxResults: 25 });
+      if (!res || res.isError) return [];
+      try {
+        const data = JSON.parse(String(res.content[0].text));
+        return Array.isArray(data.messages) ? data.messages : [];
+      } catch (_) { return []; }
+    };
+
+    // Build queries in priority order. Subject is the strongest identifier (and we
+    // validate it against the page); sender addresses are the fallback filter.
+    const queries = [];
+    if (candidateSubject && pageEmails[0]) queries.push(`subject:"${candidateSubject}" from:${pageEmails[0]}`);
+    if (candidateSubject) queries.push(`subject:"${candidateSubject}"`);
+    for (const addr of pageEmails.slice(0, 3)) queries.push(`from:${addr}`);
+
+    // Only accept a search result whose subject actually corresponds to the
+    // subject read off the page. Never fall back to "the single result" — a
+    // lone unrelated hit would silently summarize the wrong email. Also require
+    // a non-empty candidate subject, otherwise norm("").includes-style matching
+    // would treat every result as a match. If nothing validates, we fail below.
+    const cand = norm(candidateSubject);
+    for (const q of queries) {
+      console.log(`Searching Outlook: ${q}`);
+      const results = await runSearch(q);
+      const picked =
+        cand === ""
+          ? null
+          : results.find((m) => {
+              const s = norm(m.subject);
+              return s !== "" && (s.includes(cand) || cand.includes(s));
+            }) || null;
+
+      if (picked) {
+        messageId = String(picked.id);
+        console.log(`Resolved to message ID: ${messageId} (subject: "${picked.subject}")`);
+        resolved = true;
+        break;
       }
     }
 
     if (!resolved) {
-      console.log("Could not resolve from tab. Falling back to most recent email with attachments...");
-      const fallbackRes = await tools.outlook_search({ query: "hasAttachments:true", maxResults: 1 });
-      if (fallbackRes && !fallbackRes.isError) {
-        const searchData = JSON.parse(String(fallbackRes.content[0].text));
-        const messages = Array.isArray(searchData.messages) ? searchData.messages : [];
-        if (messages.length > 0) {
-          messageId = String(messages[0].id);
-          console.log(`Resolved to API Message ID (fallback): ${messageId}`);
-        } else {
-          return { success: false, error: "Could not resolve message ID and no recent attachments found." };
-        }
-      } else {
-        return { success: false, error: "Could not resolve message ID via search." };
-      }
+      return {
+        success: false,
+        error: "Could not resolve the Graph message id for the open email. The Outlook URL only " +
+          "carries a conversation id, and no search result matched the message shown in the reading pane" +
+          (candidateSubject || pageEmails.length
+            ? ` (tried subject: "${candidateSubject}", from: [${pageEmails.slice(0, 3).join(", ")}]).`
+            : " (no subject or sender could be read from the page).") +
+          " Open the specific message in its own view and retry, or pass an explicit Graph message id " +
+          "(AAMk…/AQMk…) as the argument.",
+      };
     }
   }
 
@@ -113,17 +182,49 @@ async function run() {
   }
 
   const msg = JSON.parse(String(msgRes.content[0].text));
-  const fromStr = msg.from ? `${msg.from.name || ""} <${msg.from.address || ""}>` : "Unknown";
+  const fromStr = msg.from
+    ? `${msg.from.name || ""} <${msg.from.address || ""}>`.trim()
+    : "Unknown";
   const toStr = Array.isArray(msg.to)
     ? msg.to.map(r => `${r.name || ""} <${r.address || ""}>`.trim()).join(", ")
     : "Unknown";
+  let summaryText = `Subject: ${String(msg.subject || "(no subject)")}\nFrom: ${fromStr}\nTo: ${toStr}\nDate: ${String(msg.receivedDateTime || "")}\n\n--- Body ---\n${String(msg.body || "")}\n\n--- Attachments ---\n`;
 
-  let summaryText = `Subject: ${String(msg.subject || "(no subject)")}\n` +
-    `From: ${fromStr}\n` +
-    `To: ${toStr}\n` +
-    `Date: ${String(msg.receivedDateTime || "")}\n\n` +
-    `--- Email Body ---\n${String(msg.body || "")}\n\n` +
-    `--- Attachments ---\n`;
+  // Extract the finished text from a runSubtask result. content[0].text is a
+  // JSON string ({content, history}), not the summary itself, so parse it out;
+  // fall back to the last non-empty assistant turn, and handle truncation.
+  const extractSubtaskText = (subtask) => {
+    if (!subtask || subtask.isError) {
+      const err =
+        subtask && subtask.content && subtask.content[0]
+          ? String(subtask.content[0].text)
+          : "unknown error";
+      return `(Subtask failed: ${err})`;
+    }
+    let text = String(subtask.content[0].text);
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed.content === "string") text = parsed.content;
+      if (text === "" && Array.isArray(parsed.history)) {
+        const last = parsed.history
+          .slice()
+          .reverse()
+          .find(
+            (m) =>
+              m.role === "assistant" &&
+              typeof m.content === "string" &&
+              m.content.trim() !== "",
+          );
+        if (last) text = last.content;
+      }
+    } catch (_) {
+      if (text.includes("[... Output truncated")) {
+        text = "(Subtask output was too large and was truncated. It likely timed out.)";
+      }
+    }
+    return text === "" ? "(Subtask returned empty output)" : text;
+  };
+
 
   // ── Step 3: Detect OneDrive/SharePoint links in body ────────────
   const oneDriveLinks = [];
@@ -158,7 +259,7 @@ async function run() {
     summaryText += `\n[Attachment: ${filename} (${contentType}, ${att.size} bytes)]\n`;
 
     // ── PDF ──
-    if (contentType === "application/pdf") {
+    if (contentType === "application/pdf" || filename.toLowerCase().endsWith(".pdf")) {
       console.log(`Processing PDF: ${filename}`);
       try {
         const attRes = await tools.outlook_get_attachment({
@@ -183,33 +284,13 @@ async function run() {
         const handle = String(handleData.handle);
 
         console.log(`PDF loaded (${handle}). Delegating summary to subtask...`);
-        const subtaskRes = await tools.run_subtask({
+        const subtaskRes = await tools.runSubtask({
           goal: `Read the PDF document with handle '${handle}' using the pdf_read tool. After reading, you MUST generate a final text response containing a comprehensive summary. Do NOT finish the task without writing the summary.`,
           verification_command: `pdf_read with handle '${handle}' returns content`,
           timeoutMs: 240000,
         });
 
-        if (subtaskRes.isError) {
-          summaryText += `Subtask failed to summarize PDF: ${String(subtaskRes.content[0].text)}\n`;
-        } else {
-          let pdfSummary = String(subtaskRes.content[0].text);
-          try {
-            const parsed = JSON.parse(pdfSummary);
-            if (typeof parsed.content === "string") pdfSummary = parsed.content;
-            if (pdfSummary === "" && Array.isArray(parsed.history)) {
-              const lastMsg = parsed.history.slice().reverse().find(
-                m => m.role === "assistant" && typeof m.content === "string" && m.content.trim() !== ""
-              );
-              if (lastMsg) pdfSummary = lastMsg.content;
-            }
-          } catch (_) {
-            if (pdfSummary.includes("[... Output truncated")) {
-              pdfSummary = "(Subtask output was too large and was truncated. It likely timed out.)";
-            }
-          }
-          if (pdfSummary === "") pdfSummary = "(Subtask returned empty summary)";
-          summaryText += `PDF Summary:\n${pdfSummary}\n`;
-        }
+        summaryText += `PDF Summary:\n${extractSubtaskText(subtaskRes)}\n`;
 
         console.log("Releasing PDF handle...");
         await tools.pdf_release({ handle });
@@ -232,7 +313,7 @@ async function run() {
           const base64 = String(rawData.base64);
 
           console.log(`Delegating image "${filename}" to subtask for visual analysis (using vision)...`);
-          const subtaskRes = await tools.run_subtask({
+          const subtaskRes = await tools.runSubtask({
             goal: `Describe the image "${filename}" in detail. The image is provided inline for your visual analysis.`,
             verification_command: "Image is described",
             image_data: [
@@ -242,19 +323,7 @@ async function run() {
           });
 
           if (subtaskRes && !subtaskRes.isError) {
-            let imgDesc = String(subtaskRes.content[0].text);
-            try {
-              const parsed = JSON.parse(imgDesc);
-              if (typeof parsed.content === "string") imgDesc = parsed.content;
-              if (imgDesc === "" && Array.isArray(parsed.history)) {
-                const lastMsg = parsed.history.slice().reverse().find(
-                  m => m.role === "assistant" && typeof m.content === "string" && m.content.trim() !== ""
-                );
-                if (lastMsg) imgDesc = lastMsg.content;
-              }
-            } catch (_) {}
-            if (imgDesc === "") imgDesc = "(Subtask returned empty description)";
-            summaryText += `Image Description:\n${imgDesc}\n`;
+            summaryText += `Image Description:\n${extractSubtaskText(subtaskRes)}\n`;
           } else {
             summaryText += `(Subtask failed to describe image "${filename}")\n`;
           }
@@ -288,30 +357,14 @@ async function run() {
           readInstructions = `This is a PowerPoint presentation. After saving, use ppt_read_content to read slide text.`;
         }
 
-        const subtaskRes = await tools.run_subtask({
+        const subtaskRes = await tools.runSubtask({
           goal: `Download the ${docType} attachment "${filename}" from Outlook message "${messageId}" (attachment ID: "${attachmentId}") using outlook_get_attachment with returnRawBase64: true. The file is already an email attachment — you do NOT need to search for it. ${readInstructions} After reading, generate a comprehensive summary of the content. Do NOT finish without writing the summary.`,
           verification_command: `${docType} content is returned and summarized`,
           timeoutMs: 240000,
         });
 
         if (subtaskRes && !subtaskRes.isError) {
-          let docSummary = String(subtaskRes.content[0].text);
-          try {
-            const parsed = JSON.parse(docSummary);
-            if (typeof parsed.content === "string") docSummary = parsed.content;
-            if (docSummary === "" && Array.isArray(parsed.history)) {
-              const lastMsg = parsed.history.slice().reverse().find(
-                m => m.role === "assistant" && typeof m.content === "string" && m.content.trim() !== ""
-              );
-              if (lastMsg) docSummary = lastMsg.content;
-            }
-          } catch (_) {
-            if (docSummary.includes("[... Output truncated")) {
-              docSummary = "(Subtask output was too large and was truncated.)";
-            }
-          }
-          if (docSummary === "") docSummary = "(Subtask returned empty summary)";
-          summaryText += `${docType.charAt(0).toUpperCase() + docType.slice(1)} Summary:\n${docSummary}\n`;
+          summaryText += `${docType.charAt(0).toUpperCase() + docType.slice(1)} Summary:\n${extractSubtaskText(subtaskRes)}\n`;
         } else {
           summaryText += `(Subtask failed to process ${docType} "${filename}")\n`;
         }
@@ -332,33 +385,14 @@ async function run() {
       summaryText += `Link: ${link}\n`;
       console.log(`Delegating linked file "${link}" to subtask...`);
       try {
-        const subtaskRes = await tools.run_subtask({
-          goal: `Access the external shared link: "${link}".
-1. First, use 'onedrive_resolve_link' to convert this URL into an itemId and driveId.
-2. If successful, use the appropriate API tool to read the content (e.g., 'word_read_content', 'excel_read_as_csv', 'ppt_read_content', or 'onedrive_download_text') using the returned itemId and driveId.
-3. If the resolve fails or the API read fails (often due to external tenant permissions), fallback to the browser: use 'new_page' to open the URL.
-4. Wait for the page or Office Online viewer to load.
-5. Use 'take_snapshot' (mode: 'readable') to extract text.
-6. If text extraction fails (e.g., canvas viewer), use 'take_screenshot' to analyze it visually.
-7. Generate a comprehensive summary. Do NOT finish without writing the summary.`,
+        const subtaskRes = await tools.runSubtask({
+          goal: `Access the external shared link: "${link}".\n1. First, use 'onedrive_resolve_link' to convert this URL into an itemId and driveId.\n2. If successful, use the appropriate API tool to read the content (e.g., 'word_read_content', 'excel_read_as_csv', 'ppt_read_content', or 'onedrive_download_text') using the returned itemId and driveId.\n3. If the resolve fails or the API read fails (often due to external tenant permissions), fallback to the browser: use 'newPage' to open the URL.\n4. Wait for the page or Office Online viewer to load.\n5. Use 'takeSnapshot' (mode: 'readable') to extract text.\n6. If text extraction fails (e.g., canvas viewer), use 'takeScreenshot' to analyze it visually.\n7. Generate a comprehensive summary. Do NOT finish without writing the summary.`,
           verification_command: `Summary is generated from the shared link content`,
           timeoutMs: 300000,
         });
 
         if (subtaskRes && subtaskRes.isError === false) {
-          let linkSummary = String(subtaskRes.content[0].text);
-          try {
-            const parsed = JSON.parse(linkSummary);
-            if (typeof parsed.content === "string") linkSummary = parsed.content;
-            if (linkSummary === "" && Array.isArray(parsed.history)) {
-              const lastMsg = parsed.history.slice().reverse().find(
-                m => m.role === "assistant" && typeof m.content === "string" && m.content.trim() !== ""
-              );
-              if (lastMsg) linkSummary = lastMsg.content;
-            }
-          } catch (_) {}
-          if (linkSummary === "") linkSummary = "(Subtask returned empty summary)";
-          summaryText += `Linked File Summary:\n${linkSummary}\n`;
+          summaryText += `Linked File Summary:\n${extractSubtaskText(subtaskRes)}\n`;
         } else {
           summaryText += `(Subtask failed to process link "${link}")\n`;
         }

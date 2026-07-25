@@ -48,8 +48,8 @@ Read this before following the steps below.
 
 ## Prerequisites
 
-- A Linux environment. Verified on WSL2 Ubuntu 24.04 for Windows 11.
-- `systemd` enabled, check`/etc/wsl.conf` from the WSL2 Ubuntu instance:
+- **Windows**: Windows 10/11 with PowerShell.
+- **Linux / WSL2**: Verified on Ubuntu 24.04. Requires `systemd` enabled (check `/etc/wsl.conf` for `[boot] systemd=true`).
 
   ```ini
   [boot]
@@ -59,6 +59,8 @@ Read this before following the steps below.
 - An active subscription for the provider you intend to authenticate.
 
 ## Install CLIProxyAPI
+
+### Linux / WSL2
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/router-for-me/cliproxyapi-installer/refs/heads/master/cliproxyapi-installer | bash
@@ -77,7 +79,29 @@ Expected output (version verified at the time of writing):
 CLIProxyAPI Version: 7.2.77, Commit: c8803713, BuiltAt: 2026-07-14T20:50:47Z
 ```
 
+### Windows (PowerShell)
+
+See the [official Windows installation guide](https://router-for-me-cliproxyapi.mintlify.app/installation#windows). Run the following in PowerShell (No Admin required):
+
+```powershell
+# Download and extract the latest release
+$release = Invoke-RestMethod -Uri "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
+$version = $release.tag_name
+$versionNumber = $version.Substring(1)
+$url = "https://github.com/router-for-me/CLIProxyAPI/releases/download/$version/CLIProxyAPI_${versionNumber}_windows_amd64.zip"
+
+Invoke-WebRequest -Uri $url -OutFile "cli-proxy-api.zip" -UseBasicParsing
+$installPath = "$HOME\CLIProxyAPI"
+Expand-Archive -Path "cli-proxy-api.zip" -DestinationPath $installPath -Force
+
+# Add to User PATH
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$installPath", "User")
+$env:PATH += ";$installPath"
+```
+
 ## Authenticate Claude
+
+### Linux / WSL2
 
 ```bash
 cd ~/cliproxyapi
@@ -93,11 +117,20 @@ directory as a secret: it holds live OAuth tokens.
 Repeat this step for each provider you want to use — see
 [Other provider examples](#other-provider-examples).
 
+### Windows (PowerShell)
+
+```powershell
+# Ensure config file exists
+if (-not (Test-Path "$HOME\CLIProxyAPI\config.example.yaml")) { New-Item -Path "$HOME\CLIProxyAPI\config.example.yaml" -ItemType File -Force }
+
+cli-proxy-api.exe -config "$HOME\CLIProxyAPI\config.example.yaml" -claude-login --no-browser
+```
+
 ## Configure CLIProxyAPI for local Koi Assistant usage
 
 CLIProxyAPI listens on port `8317` by default.
 
-The installer generates random `api-keys` in `~/cliproxyapi/config.yaml`.
+The installer generates random `api-keys` in `~/cliproxyapi/config.yaml` (Linux) or `$HOME\CLIProxyAPI\config.example.yaml` (Windows).
 
 Remove the generated entries, or leave the list empty:
 
@@ -120,6 +153,8 @@ which the proxy ignores.
 
 ## Start CLIProxyAPI
 
+### Linux / WSL2
+
 Using systemd user service:
 
 ```bash
@@ -141,9 +176,41 @@ Follow the logs while debugging:
 journalctl --user -u cliproxyapi.service -f
 ```
 
+### Windows (PowerShell)
+
+To run the proxy silently in the background and auto-start on login, create a VBScript in your Startup folder:
+
+```powershell
+$exePath = "$HOME\CLIProxyAPI\cli-proxy-api.exe"
+$configPath = "$HOME\CLIProxyAPI\config.example.yaml"
+$startupFolder = "$HOME\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+$vbsPath = "$startupFolder\Start-CLIProxyAPI.vbs"
+
+# Create a VBScript that launches the proxy completely hidden
+$vbsCode = @"
+Dim q : q = Chr(34)
+CreateObject("WScript.Shell").Run q & "$exePath" & q & " -config " & q & "$configPath" & q, 0, False
+"@
+Set-Content -Path $vbsPath -Value $vbsCode -Encoding ASCII
+
+# Start it now
+& $vbsPath
+```
+
+To view its status:
+
+```powershell
+Get-Process -Name "cli-proxy-api" -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, CPU, WorkingSet64, StartTime
+Get-NetTCPConnection -LocalPort 8317 -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, State, OwningProcess
+```
+
+_(To stop the background process later, run `Stop-Process -Name "cli-proxy-api" -ErrorAction SilentlyContinue`)._
+
 ## Verify Claude works locally
 
 Before loading the Koi Assistant config, verify that the local proxy can serve a Claude model:
+
+### Linux / WSL2
 
 First get exact model name from the proxy endpoint:
 
@@ -170,6 +237,15 @@ curl -N http://localhost:8317/v1/messages \
 ```
 
 You should see a streamed response from the Claude model.
+
+### Windows (PowerShell)
+
+```powershell
+curl.exe -N http://localhost:8317/v1/messages `
+  -H "Content-Type: application/json" `
+  -H "anthropic-version: 2023-06-01" `
+  -d '{\"model\": \"claude-sonnet-5\", \"max_tokens\": 64, \"messages\": [{\"role\": \"user\", \"content\": \"Hello from PowerShell!\"}], \"stream\": true}'
+```
 
 ## Koi Assistant Claude config
 

@@ -557,7 +557,6 @@ The audit log from the signing RPC retains all historical signing events for com
 
 ---
 
-
 ## Troubleshooting
 
 | Symptom                                          | Console Evidence                                       | Cause                                                           | Fix                                                                                                       |

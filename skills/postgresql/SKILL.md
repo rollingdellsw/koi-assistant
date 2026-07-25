@@ -10,7 +10,7 @@ mcp-servers:
     server: postgres
 
 allowed-tools:
-  - run_browser_script
+  - runBrowserScript
 ---
 
 # PostgreSQL Provider

@@ -1,7 +1,7 @@
 // scripts/capture.js — Native Readable Snapshot Polling (Bulletproof)
 
 // args[0] = meeting duration in minutes (default: 30)
-// The caller MUST set run_browser_script timeout >= (duration + 5) * 60 * 1000
+// The caller MUST set runBrowserScript timeout >= (duration + 5) * 60 * 1000
 
 async function run() {
   console.log("📦 Loading dependencies...");

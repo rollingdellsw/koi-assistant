@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+#
+# koi-gateway-installer — install/manage the Koi Gateway as a systemd user service.
+#
+# The end-user interface is just:
+#     ./koi-gateway-installer            # install + enable + start (no editing)
+#     systemctl --user status koi-gateway
+#     systemctl --user restart koi-gateway
+#
+# The installer resolves the gateway directory and your Node (fnm/nvm/system)
+# itself and writes an absolute-path unit to ~/.config/systemd/user/ — you never
+# edit a file. Override Node detection with KOI_NODE_BIN=/abs/path ./koi-gateway-installer
+#
+set -euo pipefail
+
+SERVICE_NAME="koi-gateway"
+UNIT="${SERVICE_NAME}.service"
+
+# The installer lives in tools/gateway/ next to koi-gateway.js — resolve from
+# its own location so nothing is hard-coded to a particular checkout path.
+GATEWAY_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+WRAPPER="${GATEWAY_DIR}/run-gateway.sh"
+ENTRY="${GATEWAY_DIR}/koi-gateway.js"
+CONFIG="${GATEWAY_DIR}/gateway-config.json"
+# Credential paths masked inside the sandbox. The server has no built-in list —
+# it masks exactly what KOI_SANDBOX_EXCLUDE / --exclude gives it — so the policy
+# lives in this file and we bake it into the unit. Override the file location
+# with KOI_EXCLUDE_FILE, or bypass the file entirely by exporting a ready-made
+# KOI_SANDBOX_EXCLUDE list.
+EXCLUDE_FILE="${KOI_EXCLUDE_FILE:-${GATEWAY_DIR}/sandbox-exclude.default}"
+DOCS_REL="${GATEWAY_DIR}/../../docs/skill_api.md"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT_PATH="${UNIT_DIR}/${UNIT}"
+
+c_reset='\033[0m'; c_b='\033[0;34m'; c_g='\033[0;32m'; c_y='\033[0;33m'; c_r='\033[0;31m'
+info() { printf "${c_b}[INFO]${c_reset} %s\n" "$*"; }
+ok()   { printf "${c_g}[ OK ]${c_reset} %s\n" "$*"; }
+warn() { printf "${c_y}[WARN]${c_reset} %s\n" "$*" >&2; }
+err()  { printf "${c_r}[FAIL]${c_reset} %s\n" "$*" >&2; }
+
+# --- helpers ---------------------------------------------------------------
+
+# Resolve a Node that will still exist under systemd's minimal PATH. Deliberately
+# skips the ephemeral fnm "multishell" path that `command -v node` returns inside
+# an interactive shell — it's deleted when that shell exits. Returns "" if none.
+stable_node() {
+  if [ -n "${KOI_NODE_BIN:-}" ] && [ -x "${KOI_NODE_BIN}" ]; then
+    printf '%s\n' "${KOI_NODE_BIN}"; return 0
+  fi
+  local fnm_dir="${FNM_DIR:-$HOME/.local/share/fnm}"
+  if [ -x "${fnm_dir}/aliases/default/bin/node" ]; then
+    printf '%s\n' "${fnm_dir}/aliases/default/bin/node"; return 0
+  fi
+  local nvm_node
+  nvm_node="$(ls -d "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1 || true)"
+  if [ -n "${nvm_node}" ] && [ -x "${nvm_node}" ]; then
+    printf '%s\n' "${nvm_node}"; return 0
+  fi
+  local c
+  for c in /usr/local/bin/node /usr/bin/node; do
+    [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+have_systemd_user() { systemctl --user show-environment >/dev/null 2>&1; }
+
+# Can the gateway's one external import (`ws`) be resolved from GATEWAY_DIR?
+# Uses Node's own resolver instead of testing for node_modules/ws, so a
+# workspace-hoisted install counts as present.
+deps_ok() {
+  local node_bin="${1:-node}"
+  ( cd "$GATEWAY_DIR" \
+    && "$node_bin" -e \
+       "require('node:module').createRequire(process.cwd()+'/x.js').resolve('ws')" \
+       >/dev/null 2>&1 )
+}
+
+# systemd starts the unit with a minimal environment and installs nothing, so a
+# missing node_modules surfaces as an ERR_MODULE_NOT_FOUND restart loop rather
+# than as an install error. Resolve dependencies here, at install time, where
+# npm and the user's PATH are available.
+ensure_deps() {
+  local node_bin="${1:-}"
+  [ -n "$node_bin" ] || node_bin="node"
+  if deps_ok "$node_bin"; then
+    ok "Dependencies present ('ws' resolves from ${GATEWAY_DIR})"
+    return 0
+  fi
+
+  local npm_bin=""
+  [ -x "$(dirname "$node_bin")/npm" ] && npm_bin="$(dirname "$node_bin")/npm"
+  [ -n "$npm_bin" ] || npm_bin="$(command -v npm || true)"
+  if [ -z "$npm_bin" ]; then
+    err "'ws' is not installed and no npm was found. Install it manually:"
+    err "    cd ${GATEWAY_DIR} && npm install ws"
+    return 1
+  fi
+
+  # koi-gateway.js is ESM. If this directory has no package.json, npm would
+  # create a bare CommonJS one, which shadows any parent manifest and turns the
+  # missing-module failure into "Cannot use import statement outside a module".
+  # Write a correct manifest first.
+  if [ ! -f "${GATEWAY_DIR}/package.json" ]; then
+    cat > "${GATEWAY_DIR}/package.json" <<'PKGEOF'
+{
+  "name": "koi-gateway",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
+PKGEOF
+    ok "Wrote ${GATEWAY_DIR}/package.json"
+  fi
+
+  info "Installing gateway dependencies in ${GATEWAY_DIR} ..."
+  ( cd "$GATEWAY_DIR" && PATH="$(dirname "$node_bin"):$PATH" \
+      "$npm_bin" install --no-audit --no-fund ) || true
+  # An existing manifest that simply never listed `ws` needs it added.
+  deps_ok "$node_bin" || ( cd "$GATEWAY_DIR" && PATH="$(dirname "$node_bin"):$PATH" \
+      "$npm_bin" install --no-audit --no-fund ws ) || true
+
+  if ! deps_ok "$node_bin"; then
+    err "'ws' still does not resolve after npm install — fix that before starting:"
+    err "    cd ${GATEWAY_DIR} && npm install ws"
+    return 1
+  fi
+  ok "Installed gateway dependencies"
+}
+
+# Flatten sandbox-exclude.default (one path per line, `#` comments, blank lines)
+# into the single comma-separated value the sandbox server expects. An explicit
+# KOI_SANDBOX_EXCLUDE in the environment wins and is passed through untouched.
+# `$HOME` is rewritten to `~` because systemd would try to expand `$` itself in
+# an Environment= value; the server expands `~` on its own.
+flatten_excludes() {
+  if [ -n "${KOI_SANDBOX_EXCLUDE:-}" ]; then
+    printf '%s' "${KOI_SANDBOX_EXCLUDE}"
+    return 0
+  fi
+  [ -f "$EXCLUDE_FILE" ] || return 0
+  sed 's/#.*//' "$EXCLUDE_FILE" \
+    | tr -d ' \t' \
+    | sed 's/\$HOME/~/g' \
+    | grep -v '^$' \
+    | paste -sd, - \
+    || true
+}
+
+# Count entries in a flattened list.
+exclude_count() {
+  [ -n "${1:-}" ] || { printf '0'; return 0; }
+  printf '%s' "$1" | tr ',' '\n' | grep -c . || true
+}
+
+wsl_hint() {
+  warn "No systemd user instance is available."
+  if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+    cat >&2 <<'EOF'
+       On WSL2, enable systemd once:
+         1. Add to /etc/wsl.conf:      [boot]
+                                       systemd=true
+         2. From Windows:              wsl --shutdown   (then reopen the distro)
+       Then re-run this installer.
+EOF
+  else
+    echo "       This host has no user systemd instance; run the gateway manually with run-gateway.sh." >&2
+  fi
+}
+
+render_unit() {
+  local node_bin="$1" docs
+  docs="$(readlink -f "$DOCS_REL" 2>/dev/null || printf '%s' "$DOCS_REL")"
+  cat <<EOF
+# Generated by koi-gateway-installer on $(date -u +%Y-%m-%dT%H:%M:%SZ). Do not edit;
+# re-run the installer to regenerate.
+[Unit]
+Description=Koi Gateway (WebSocket<->MCP bridge for the Koi Assistant extension)
+Documentation=file://${docs}
+
+[Service]
+Type=simple
+# gateway-config.json uses relative paths (./sandbox-shell-mcp.mjs, ./lsp_search),
+# so the service runs from the gateway directory.
+WorkingDirectory=${GATEWAY_DIR}
+ExecStart=${WRAPPER}
+EOF
+  # Bake a stable Node path as a hint. run-gateway.sh re-validates it and falls
+  # back if it ever disappears (e.g. after a Node upgrade), so this is safe.
+  [ -n "${node_bin}" ] && printf 'Environment=KOI_NODE_BIN=%s\n' "${node_bin}"
+  [ "${KOI_ALLOW_CREDS:-}" = "1" ] && printf 'Environment=KOI_ALLOW_CREDS=1\n'
+  # Credential masking policy. The server masks nothing without this.
+  local excl; excl="$(flatten_excludes)"
+  [ -n "${excl}" ] && printf 'Environment=KOI_SANDBOX_EXCLUDE=%s\n' "${excl}"
+  cat <<'EOF'
+Restart=on-failure
+RestartSec=3
+# First start runs the lsp_search autoBuild (npm install + build) — allow time.
+TimeoutStartSec=600
+SyslogIdentifier=koi-gateway
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_render() {
+  render_unit "$(stable_node || true)"
+}
+
+cmd_install() {
+  [ -f "$ENTRY" ]   || { err "koi-gateway.js not found at ${ENTRY} — run this from the gateway dir."; exit 1; }
+  [ -f "$WRAPPER" ] || { err "run-gateway.sh not found at ${WRAPPER}."; exit 1; }
+  [ -f "$CONFIG" ]  || warn "gateway-config.json not found at ${CONFIG}; the gateway needs it at runtime."
+  chmod +x "$WRAPPER" 2>/dev/null || true
+
+  if ! have_systemd_user; then wsl_hint; exit 1; fi
+
+  local node_bin; node_bin="$(stable_node || true)"
+  if [ -n "$node_bin" ]; then
+    ok "Node: ${node_bin}"
+  else
+    warn "Could not find a stable Node path. run-gateway.sh will retry at runtime;"
+    warn "if start fails, re-run: KOI_NODE_BIN=\$(readlink -f \"\$(which node)\") ./koi-gateway-installer"
+  fi
+
+  # Before writing/starting the unit: an unresolvable import is a guaranteed
+  # restart loop, not a transient failure.
+  ensure_deps "$node_bin" || exit 1
+
+  mkdir -p "$UNIT_DIR"
+  render_unit "$node_bin" > "$UNIT_PATH"
+  ok "Wrote ${UNIT_PATH}"
+
+  # Masking is only as good as this list, so never let its state be implicit.
+  local excl n; excl="$(flatten_excludes)"; n="$(exclude_count "$excl")"
+  if [ -n "$excl" ]; then
+    if [ -n "${KOI_SANDBOX_EXCLUDE:-}" ]; then
+      ok "Credential masking: ${n} path(s) from \$KOI_SANDBOX_EXCLUDE"
+    else
+      ok "Credential masking: ${n} path(s) from $(basename "$EXCLUDE_FILE")"
+    fi
+  else
+    warn "No exclude list found at ${EXCLUDE_FILE} — the sandbox will mask NOTHING."
+    warn "Host secrets (~/.ssh, ~/.aws, shell history, ...) would be readable by the LLM session."
+  fi
+  if [ "${KOI_ALLOW_CREDS:-}" = "1" ]; then
+    warn "KOI_ALLOW_CREDS=1 is set — host credentials are deliberately exposed to the sandbox."
+  fi
+
+  systemctl --user daemon-reload
+  ok "Reloaded user systemd"
+
+  # NOTE: $USER is not always exported (minimal shells, su without -l, some WSL
+  # setups). Under `set -u` a bare "$USER" aborts the script *here* — after the
+  # unit is written but BEFORE enable/start — leaving an installed-but-dead
+  # service. Fall back to id(1).
+  if command -v loginctl >/dev/null 2>&1; then
+    local login_user="${USER:-$(id -un)}"
+    if loginctl enable-linger "$login_user" 2>/dev/null; then
+      ok "Lingering enabled (runs without an active login)"
+    else
+      warn "Could not enable lingering (loginctl enable-linger $login_user); the service will start on your next login."
+    fi
+  fi
+
+  if systemctl --user enable --now "$UNIT"; then
+    ok "Enabled + started ${SERVICE_NAME}"
+  else
+    err "enable/start failed — inspect: systemctl --user status ${SERVICE_NAME}"
+    exit 1
+  fi
+
+  # `enable --now` can report success while the unit dies immediately after
+  # (bad ExecStart, failed autoBuild, crashing MCP child). Surface that here
+  # instead of leaving the user to discover a dead service later.
+  sleep 1
+  # Drop any failure state left by an earlier restart loop so the check below
+  # reflects this start rather than the last one.
+  systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+  if ! systemctl --user is-active --quiet "$UNIT"; then
+    err "${SERVICE_NAME} is not active. Recent log:"
+    journalctl --user -u "$SERVICE_NAME" -n 25 --no-pager >&2 || true
+    exit 1
+  fi
+
+  echo
+  info "Gateway is running. Manage it with:"
+  echo "    systemctl --user status ${SERVICE_NAME}"
+  echo "    systemctl --user restart ${SERVICE_NAME}     # guaranteed clean slate"
+  echo "    journalctl --user -u ${SERVICE_NAME} -f      # follow logs"
+  echo "    ./koi-gateway-installer uninstall            # remove the service"
+}
+
+cmd_uninstall() {
+  if have_systemd_user; then
+    systemctl --user disable --now "$UNIT" 2>/dev/null || true
+  fi
+  if [ -f "$UNIT_PATH" ]; then
+    rm -f "$UNIT_PATH"
+    ok "Removed ${UNIT_PATH}"
+    have_systemd_user && systemctl --user daemon-reload || true
+  else
+    info "No unit installed at ${UNIT_PATH}"
+  fi
+}
+
+cmd_status() {
+  if ! have_systemd_user; then wsl_hint; exit 1; fi
+  [ -f "$UNIT_PATH" ] || { info "Not installed. Run: ./koi-gateway-installer"; exit 0; }
+  systemctl --user status "$UNIT" --no-pager || true
+}
+
+cmd_deps() {
+  ensure_deps "$(stable_node || true)"
+}
+
+cmd_excludes() {
+  local excl; excl="$(flatten_excludes)"
+  if [ -z "$excl" ]; then
+    warn "No exclude list (${EXCLUDE_FILE} missing/empty) — nothing would be masked."
+    return 0
+  fi
+  local src="${EXCLUDE_FILE}"
+  [ -n "${KOI_SANDBOX_EXCLUDE:-}" ] && src='$KOI_SANDBOX_EXCLUDE'
+  info "$(exclude_count "$excl") path(s) from ${src}:"
+  printf '%s' "$excl" | tr ',' '\n' | sed 's/^/  /'
+}
+
+usage() {
+  cat <<EOF
+koi-gateway-installer — run the Koi Gateway as a systemd user service.
+
+Usage: ./koi-gateway-installer [command]
+
+Commands:
+  install     (default) resolve paths + Node, write the unit, enable + start it
+  uninstall   stop, disable, and remove the unit
+  status      show service status
+  deps        install the gateway's npm dependencies (ws); touches no systemd unit
+  render      print the unit that would be installed (dry run; installs nothing)
+  excludes    print the credential paths that would be masked (dry run)
+  -h, --help  this help
+
+Env:
+  KOI_NODE_BIN=/abs/path/to/node   force a specific Node (else auto-detected)
+  KOI_ALLOW_CREDS=1                allow the sandbox to access host credentials (~/.ssh, ~/.npmrc, etc)
+  KOI_EXCLUDE_FILE=/abs/path       use a different exclude list (default: sandbox-exclude.default)
+  KOI_SANDBOX_EXCLUDE="a,b,c"      use this list verbatim instead of the file
+
+Credential masking:
+  The sandbox server has NO built-in credential list — it masks exactly what it
+  is given. This installer flattens sandbox-exclude.default into the unit as
+  Environment=KOI_SANDBOX_EXCLUDE. Edit that file and re-run the installer to
+  change the policy; check the result with './koi-gateway-installer excludes'.
+
+After install, the standard systemd commands work with no editing:
+  systemctl --user status|restart|stop|start ${SERVICE_NAME}
+  journalctl --user -u ${SERVICE_NAME} -f
+EOF
+}
+
+case "${1:-install}" in
+  install|upgrade) cmd_install ;;
+  uninstall|remove) cmd_uninstall ;;
+  status) cmd_status ;;
+  deps|deps-install) cmd_deps ;;
+  render|print) cmd_render ;;
+  excludes|exclude) cmd_excludes ;;
+  -h|--help|help) usage ;;
+  *) err "Unknown command: $1"; echo; usage; exit 2 ;;
+esac

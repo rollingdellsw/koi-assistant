@@ -5,8 +5,8 @@ description: Slack co-pilot. Auto-loads on app.slack.com — reads the active co
 url-patterns:
   - "https://app.slack.com/client/*"
 allowed-tools:
-  - run_browser_script
-  - run_subtask
+  - runBrowserScript
+  - runSubtask
   - listPages
   - navigatePage
   - slack_parse_channel_url
@@ -52,7 +52,7 @@ reminders:
       The slack skill is active. The user is viewing a Slack conversation
       in their browser. On every user turn, your first action is to call:
 
-        run_browser_script({
+        runBrowserScript({
           script_path: "slack:scripts/analyze.js",
           args: []
         })
@@ -73,7 +73,7 @@ reminders:
       and the user asks about it, use `slack_conversations_replies` to fetch the thread.
 
       Images are lazy-loaded. If you need to know what an image contains, call:
-        run_browser_script({
+        runBrowserScript({
           script_path: "slack:scripts/analyze_image.js",
           args: ["<fileId>"]
         })
@@ -86,7 +86,7 @@ reminders:
         { success: false, error: "..." } — Tell the user what went wrong.
 
       Posting: When the user asks you to send a reply, do NOT preview the draft in chat. Instead, call:
-        run_browser_script({
+        runBrowserScript({
           script_path: "slack:scripts/post.js",
           args: ["<channelId>", "<draft text>", "<optional thread_ts>"]
         })
@@ -116,7 +116,7 @@ helps the user discuss it, draft replies, and post messages.
 
 On every user message, your first action is to refresh context:
 
-    run_browser_script({
+    runBrowserScript({
       script_path: "slack:scripts/analyze.js",
       args: []
     })
@@ -133,7 +133,7 @@ The result includes a `me` field identifying the signed-in user.
 ## Sending replies
 
 When the user asks to reply, do NOT preview the draft. Call the wrapper script:
-run_browser_script({
+runBrowserScript({
 script_path: "slack:scripts/post.js",
 args: ["<channelId>", "<draft text>", "<optional thread_ts>"]
 })

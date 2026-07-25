@@ -6,10 +6,10 @@ allowed-tools:
   - click
   - fill
   - hover
-  - press_key
-  - evaluate_script
-  - set_trap
-  - remove_trap
+  - pressKey
+  - evaluateScript
+  - setTrap
+  - removeTrap
 mcp-servers:
   - name: devtools
     type: local
@@ -22,12 +22,12 @@ This skill restores the full power of Chrome DevTools capabilities which are dis
 
 ## Capabilities
 
-- **Direct Interaction**: `click`, `fill`, `hover`, `press_key` (executed via JavaScript).
-- **Script Execution**: `evaluate_script` for running arbitrary code in the page context.
-- **Monitoring**: `set_trap` to listen for console errors or network failures.
+- **Direct Interaction**: `click`, `fill`, `hover`, `pressKey` (executed via JavaScript).
+- **Script Execution**: `evaluateScript` for running arbitrary code in the page context.
+- **Monitoring**: `setTrap` to listen for console errors or network failures.
 
 ## Usage
 
 Load this skill when you need to perform actions automatically without stopping for user confirmation, or when you need to debug page state using scripts.
 
-**Note**: `scroll_viewport` is available in the default Assistant mode for safe navigation. This skill focuses on direct manipulation tools that require explicit opt-in.
+**Note**: `scrollViewport` is available in the default Assistant mode for safe navigation. This skill focuses on direct manipulation tools that require explicit opt-in.

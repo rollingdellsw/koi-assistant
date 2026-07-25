@@ -79,7 +79,7 @@ Read tools work on any file the user has access to — no restrictions.
 
 ## Visual Tools & Screenshots
 
-Never use `take_screenshot` or visual subtasks (like `run_subtask`) to read the contents of documents, spreadsheets, or emails. You MUST rely exclusively on the API tools (e.g., `word_read_content`, `excel_read_range`) for data extraction. Vision models often hallucinate dense text from screenshots. If the API fails, report the error directly rather than falling back to visual reading.
+Never use `takeScreenshot` or visual subtasks (like `runSubtask`) to read the contents of documents, spreadsheets, or emails. You MUST rely exclusively on the API tools (e.g., `word_read_content`, `excel_read_range`) for data extraction. Vision models often hallucinate dense text from screenshots. If the API fails, report the error directly rather than falling back to visual reading.
 
 To fully summarize a document with images: call word_read_content for text, call word_get_images to list embedded images, then selectively call word_download_image for relevant ones.
 

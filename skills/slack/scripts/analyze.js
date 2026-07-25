@@ -11,7 +11,7 @@ async function run() {
 
   // Incremental-fetch state lives in the MCP server's module scope
   // (slack_mcp.js _fetchState), NOT here. The skill-script sandbox is
-  // recreated per run_browser_script call (script-runner.ts:429), so
+  // recreated per runBrowserScript call (script-runner.ts:429), so
   // anything we put in this file's module scope dies with the iframe.
   // The MCP sandbox is long-lived and is the right place for state.
   //
@@ -293,7 +293,7 @@ const rawMessages = Array.isArray(histData.messages) ? histData.messages : [];
     if (!Array.isArray(m.files) || m.files.length === 0) continue;
     for (const f of m.files) {
       totalImages++;
-      f._note = `(Image unanalyzed. Call run_browser_script with slack:scripts/analyze_image.js and args: ["${f.id}"] to read it)`;
+      f._note = `(Image unanalyzed. Call runBrowserScript with slack:scripts/analyze_image.js and args: ["${f.id}"] to read it)`;
     }
   }
   console.log(`   ✓ Found ${totalImages} images (lazy-loaded).`);

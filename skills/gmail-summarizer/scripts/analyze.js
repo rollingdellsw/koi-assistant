@@ -12,7 +12,11 @@ async function run() {
   let messageId = input;
 
   // Extract ID if a full URL was passed
-  if (input.includes("inbox/") === true || input.includes("#inbox/") === true) {
+  if (input.includes("mail.google.com") && input.includes("#")) {
+    const parts = input.split("/");
+    messageId = String(parts[parts.length - 1].split("?")[0]);
+    console.log(`Extracted ID from URL: ${messageId}`);
+  } else if (input.includes("inbox/") === true || input.includes("#inbox/") === true) {
     const parts = input.split(/inbox\//);
     const lastPart = String(parts[parts.length - 1]);
     messageId = String(lastPart.split("?")[0]);
@@ -44,27 +48,66 @@ async function run() {
     console.log(`URL hash detected (not a Gmail API ID): ${messageId}. Resolving...`);
     let resolved = false;
 
-    // Primary: Extract from Gmail DOM attribute
-    if (typeof tools.searchDom === "function") {
-      console.log("Searching DOM for data-legacy-message-id attribute...");
+    // Helper to search DOM for legacy ID
+    const findLegacyId = async () => {
+      if (typeof tools.searchDom === "function") {
+        try {
+          const domSearch = await tools.searchDom('[data-legacy-message-id]');
+          if (domSearch && domSearch.count > 0) {
+            const selector = domSearch.matches[0].selector;
+            const details = await tools.inspectElement(selector);
+            const legacyId = details.attributes?.['data-legacy-message-id'];
+            if (legacyId) {
+              return String(legacyId);
+            }
+          }
+        } catch (e) {
+          console.log(`DOM search failed: ${String(e)}`);
+        }
+      }
+      return null;
+    };
+
+    // 1. Try on current active tab
+    console.log("Searching DOM for data-legacy-message-id attribute on active tab...");
+    const legacyId1 = await findLegacyId();
+    if (legacyId1) {
+      messageId = legacyId1;
+      console.log(`Resolved via DOM data-legacy-message-id: ${messageId}`);
+      resolved = true;
+    }
+
+    // 2. If not found, look for a tab whose URL contains the hash and switch to it
+    if (resolved === false && typeof tools.listPages === "function") {
+      console.log("Not found in current tab. Searching other tabs...");
       try {
-        const domSearch = await tools.searchDom('[data-legacy-message-id]');
-        if (domSearch && domSearch.count > 0) {
-          const selector = domSearch.matches[0].selector;
-          const details = await tools.inspectElement(selector);
-          const legacyId = details.attributes?.['data-legacy-message-id'];
-          if (legacyId) {
-            messageId = String(legacyId);
-            console.log(`Resolved via DOM data-legacy-message-id: ${messageId}`);
-            resolved = true;
+        const pagesRes = await tools.listPages({});
+        if (pagesRes !== null && pagesRes !== undefined && pagesRes.isError === false) {
+          const pagesData = JSON.parse(String(pagesRes.content[0].text));
+          const targetTab = pagesData.find(p => typeof p.url === "string" && p.url.includes(messageId));
+          
+          if (targetTab !== undefined && targetTab.id) {
+            console.log(`Found tab ${targetTab.id} with URL containing hash. Switching to it...`);
+            const selectRes = await tools.selectPage({ pageId: targetTab.id });
+            
+            if (selectRes && !selectRes.isError) {
+              await tools.sleep(500); // Wait for context to settle
+              console.log("Searching DOM again on the newly selected tab...");
+              const legacyId2 = await findLegacyId();
+              if (legacyId2) {
+                messageId = legacyId2;
+                console.log(`Resolved via DOM data-legacy-message-id after tab switch: ${messageId}`);
+                resolved = true;
+              }
+            }
           }
         }
       } catch (e) {
-        console.log(`DOM search failed: ${String(e)}`);
+        console.log(`Tab search/switch failed: ${String(e)}`);
       }
     }
 
-    // Fallback: Extract subject from tab title, search Gmail API
+    // 3. Fallback: Extract subject from tab title, search Gmail API
     if (resolved === false && typeof tools.listPages === "function") {
       console.log("DOM attribute not found. Falling back to tab title search...");
       try {
@@ -145,7 +188,7 @@ async function run() {
         const handle = String(handleData.handle);
 
         console.log(`PDF Loaded (${handle}). Delegating summary to subtask...`);
-        const subtaskRes = await tools.run_subtask({
+        const subtaskRes = await tools.runSubtask({
           goal: `Read the PDF document with handle '${handle}' using the pdf_read tool. After reading, you MUST generate a final text response containing a comprehensive summary. Do NOT finish the task without writing the summary.`,
           verification_command: `pdf_read with handle '${handle}' returns content`,
           timeoutMs: 240000,
@@ -192,7 +235,7 @@ async function run() {
         instructions = `First use 'drive_get_file_metadata' on fileId '${attachmentId}' to find its exact mimeType, then use the corresponding tool (docs_read_content, sheets_read_as_csv, or slides_read_content).`;
       }
 
-      const subtaskRes = await tools.run_subtask({
+      const subtaskRes = await tools.runSubtask({
         goal: `${instructions} After reading, you MUST generate a final text response containing a comprehensive summary. Do NOT finish the task without writing the summary.`,
         verification_command: "Document content is returned and summarized",
         timeoutMs: 240000,
@@ -233,7 +276,7 @@ async function run() {
           const base64 = String(rawData.base64);
 
           console.log(`Delegating image "${filename}" to subtask for visual analysis (using vision)...`);
-          const subtaskRes = await tools.run_subtask({
+          const subtaskRes = await tools.runSubtask({
             goal: `Describe the image "${filename}" in detail. The image is provided inline for your visual analysis.`,
             verification_command: "Image is described",
             image_data: [

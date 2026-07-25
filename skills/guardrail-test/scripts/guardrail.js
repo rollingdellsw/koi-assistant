@@ -4,7 +4,7 @@ let navCount = 0;
 
 module.exports = {
   input: async (ctx) => {
-    if (ctx.tool.name === 'navigate_page') {
+    if (ctx.tool.name === 'navigatePage') {
       const currentUrl = ctx.tool.args.url;
 
       // 1. The existing security block

@@ -12,17 +12,17 @@ Read properties and call methods on DOM elements or JavaScript globals.
 
 ## Tools
 
-| Tool               | Purpose                                           |
-| ------------------ | ------------------------------------------------- |
-| `dom_get_property` | Read a property from an element or global object. |
-| `dom_call_method`  | Call a method on an element or global object.     |
+| Tool             | Purpose                                           |
+| ---------------- | ------------------------------------------------- |
+| `domGetProperty` | Read a property from an element or global object. |
+| `domCallMethod`  | Call a method on an element or global object.     |
 
 ## Usage
 
 Target by CSS selector or dotted global path:
 
 ```
-dom_get_property({ selector: "[data-testid='email']", property: "value" })
-dom_get_property({ global: "document", property: "title" })
-dom_call_method({ selector: "#my-form", method: "scrollIntoView" })
+domGetProperty({ selector: "[data-testid='email']", property: "value" })
+domGetProperty({ global: "document", property: "title" })
+domCallMethod({ selector: "#my-form", method: "scrollIntoView" })
 ```

@@ -10,13 +10,26 @@
  */
 
 import { WebSocketServer } from 'ws';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 // =============================================================================
 // Configuration
 // =============================================================================
+
+// Only these browser origins may open a WebSocket to the Gateway. The Gateway
+// fronts arbitrary code execution (sandbox-shell), and although it binds to
+// loopback, any web page in the user's own browser can still reach
+// ws://127.0.0.1 — WebSocket upgrades are not subject to CORS. Browsers DO send
+// an Origin header on the upgrade, so we reject any request whose Origin is not
+// the Koi extension. Non-browser clients (the test harness, curl) send no
+// Origin and are allowed through; tighten this with an auth token if the host
+// is shared. Override via `allowedOrigins` in the config file.
+const DEFAULT_ALLOWED_ORIGINS = [
+  'chrome-extension://aedfofodkbfgnjknkjpockkgajemkbng', // Koi (official)
+  'chrome-extension://ckcmgcddobmmbcneegigkkdfljiademi', // Koi (dev/unpacked)
+];
 
 const DEFAULT_CONFIG = {
   port: 8080,
@@ -70,6 +83,69 @@ function loadConfig() {
 }
 
 // =============================================================================
+// Auto-build — servers can declare an "autoBuild" block in the config:
+//   "autoBuild": {
+//     "dir": "./lsp_search",                  // package dir (relative to cwd)
+//     "check": "dist/index.js",               // build output to test for
+//     "srcDir": "src",                        // rebuilt if sources are newer
+//     "commands": ["npm install", "npm run build"]
+//   }
+// Runs at gateway startup, before listening. Skipped when the check file
+// exists and is newer than every file under srcDir. KOI_REBUILD=1 forces.
+// =============================================================================
+
+function newestMtime(dir) {
+  let newest = 0;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+  for (const ent of entries) {
+    if (ent.name === 'node_modules' || ent.name === 'dist' || ent.name.startsWith('.')) continue;
+    const p = path.join(dir, ent.name);
+    if (ent.isDirectory()) {
+      newest = Math.max(newest, newestMtime(p));
+    } else if (ent.isFile()) {
+      try { newest = Math.max(newest, fs.statSync(p).mtimeMs); } catch { /* ignore */ }
+    }
+  }
+  return newest;
+}
+
+function autoBuildServers(config) {
+  for (const [name, srv] of Object.entries(config.servers)) {
+    const ab = srv.autoBuild;
+    if (!ab || !ab.dir) continue;
+    const dir = path.resolve(ab.dir);
+    if (!fs.existsSync(dir)) {
+      console.error(`[Gateway] ${name}: autoBuild dir not found: ${dir} — skipping (server will not start)`);
+      continue;
+    }
+    const checkPath = ab.check ? path.join(dir, ab.check) : null;
+    const force = process.env.KOI_REBUILD === '1';
+    if (!force && checkPath && fs.existsSync(checkPath)) {
+      const built = fs.statSync(checkPath).mtimeMs;
+      const src = newestMtime(path.join(dir, ab.srcDir || 'src'));
+      if (built >= src) {
+        console.log(`[Gateway] ${name}: build up to date (${ab.check}; KOI_REBUILD=1 to force)`);
+        continue;
+      }
+      console.log(`[Gateway] ${name}: sources newer than ${ab.check} — rebuilding`);
+    }
+    const commands = ab.commands || ['npm install', 'npm run build'];
+    let ok = true;
+    for (const cmd of commands) {
+      console.log(`[Gateway] ${name}: running '${cmd}' in ${dir} ...`);
+      const r = spawnSync(cmd, { cwd: dir, shell: true, stdio: 'inherit' });
+      if (r.status !== 0) {
+        console.error(`[Gateway] ${name}: '${cmd}' failed (exit ${r.status}); this server will likely fail to start.`);
+        ok = false;
+        break;
+      }
+    }
+    if (ok) console.log(`[Gateway] ${name}: build complete`);
+  }
+}
+
+// =============================================================================
 // MCP Process Manager
 // =============================================================================
 
@@ -88,6 +164,8 @@ class MCPProcess {
       console.log(`[MCP:${this.name}] Starting: ${this.config.command} ${this.config.args.join(' ')}`);
 
       const env = { ...process.env, ...this.config.env };
+      let settled = false;
+      const settle = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
 
       this.process = spawn(this.config.command, this.config.args, {
         env,
@@ -104,19 +182,23 @@ class MCPProcess {
 
       this.process.on('error', (error) => {
         console.error(`[MCP:${this.name}] Process error:`, error.message);
-        reject(error);
+        settle(reject, error);
       });
 
       this.process.on('close', (code) => {
         console.log(`[MCP:${this.name}] Process exited with code ${code}`);
         this.ready = false;
+        // If it dies before the startup grace period, the client must NOT be
+        // told the server is ready (previously this raced and "authenticated"
+        // clients against a dead process).
+        settle(reject, new Error(`MCP server '${this.name}' exited with code ${code} during startup`));
       });
 
       // Give it a moment to start
       setTimeout(() => {
-        if (this.process && !this.process.killed) {
+        if (this.process && !this.process.killed && this.process.exitCode === null) {
           this.ready = true;
-          resolve();
+          settle(resolve);
         }
       }, 500);
     });
@@ -179,7 +261,9 @@ class Gateway {
   }
 
   start() {
-    this.wss = new WebSocketServer({ port: this.config.port });
+    // Loopback only: the gateway now fronts arbitrary code execution
+    // (sandbox-shell), so it must never be reachable from the LAN.
+    this.wss = new WebSocketServer({ host: '127.0.0.1', port: this.config.port });
 
     console.log(`[Gateway] Listening on ws://localhost:${this.config.port}`);
     console.log(`[Gateway] Available MCP servers: ${Object.keys(this.config.servers).join(', ')}`);
@@ -195,6 +279,16 @@ class Gateway {
   }
 
   async handleConnection(ws, req) {
+    // Origin allowlist: block drive-by connections from arbitrary web pages in
+    // the user's browser. A browser always sends Origin on the WS upgrade; a
+    // missing Origin means a non-browser client (test harness / curl).
+    const origin = req.headers.origin;
+    if (origin && !this.isAllowedOrigin(origin)) {
+      console.log(`[Gateway] Rejected connection from disallowed origin: ${origin}`);
+      ws.close(1008, 'Origin not allowed');
+      return;
+    }
+
     const url = new URL(req.url, `http://localhost:${this.config.port}`);
     const pathParts = url.pathname.split('/').filter(Boolean);
 
@@ -236,7 +330,13 @@ class Gateway {
               authenticated = true;
 
               // Get or create MCP process
-              mcpProcess = await this.getOrCreateMCPProcess(serverName, serverConfig);
+              try {
+                mcpProcess = await this.getOrCreateMCPProcess(serverName, serverConfig);
+              } catch (spawnError) {
+                console.error(`[Gateway] Failed to start MCP '${serverName}':`, spawnError.message);
+                ws.close(1011, `MCP server failed to start: ${spawnError.message}`.slice(0, 120));
+                return;
+              }
               mcpProcess.addMessageHandler(messageHandler);
 
               // Send ready
@@ -287,6 +387,11 @@ class Gateway {
     return mcp;
   }
 
+  isAllowedOrigin(origin) {
+    const allow = this.config.allowedOrigins || DEFAULT_ALLOWED_ORIGINS;
+    return allow.includes(origin);
+  }
+
   validateAuth(token) {
     // SSO validation architecture (see enterprise-data-security.md):
     // The Gateway validates the user's SSO token against the corporate IdP
@@ -319,6 +424,7 @@ class Gateway {
 // =============================================================================
 
 const config = loadConfig();
+autoBuildServers(config);
 const gateway = new Gateway(config);
 
 // Handle graceful shutdown

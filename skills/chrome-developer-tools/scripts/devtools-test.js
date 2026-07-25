@@ -1,7 +1,7 @@
 
 // ============================================================================
 // Chrome Developer Tools MCP - Integration Test
-// Tests: click, fill, hover, press_key, set_trap, remove_trap
+// Tests: click, fill, hover, pressKey, setTrap, removeTrap
 // via the devtools MCP server (runtime.evaluateScript path)
 //
 // Uses: interaction_test.html and cdp_trap_test.html at localhost:8000
@@ -22,7 +22,7 @@ const dom = {
     const params = isSelector
       ? { selector: selectorOrGlobal, property: prop }
       : { global: selectorOrGlobal, property: prop };
-    const res = await tools.dom_get_property(params);
+    const res = await tools.domGetProperty(params);
     if (res.isError) throw new Error(res.content[0].text);
     return JSON.parse(res.content[0].text);
   }
@@ -115,7 +115,7 @@ assertEqual(afterShadow, "SHADOW CLICKED", "shadow button text changed");
 await tools.resetContext();
 
 // ────────────────────────────────────────────────────────────────────────────
-// PART B: cdp_trap_test.html — fill, press_key, set_trap, remove_trap
+// PART B: cdp_trap_test.html — fill, pressKey, setTrap, removeTrap
 // ────────────────────────────────────────────────────────────────────────────
 await tools.navigatePage('http://localhost:8000/cdp_trap_test.html');
 await tools.waitFor({ event: "load", timeout: 5000 });
@@ -137,8 +137,8 @@ assert(!fillRes.isError, "fill returned success");
 const readBack = await dom.get(input, 'value');
 assertEqual(readBack, fillValue, "fill value persisted in DOM");
 
-// --- press_key ---
-console.log("\n📋 PHASE 5: press_key");
+// --- pressKey ---
+console.log("\n📋 PHASE 5: pressKey");
 console.log("─".repeat(60));
 
 // Focus the input first
@@ -159,8 +159,8 @@ assert(!comboRes.isError, "pressKey('Control+a') returned success");
 const escRes = await tools.pressKey('Escape');
 assert(!escRes.isError, "pressKey('Escape') returned success");
 
-// --- set_trap / remove_trap ---
-console.log("\n📋 PHASE 6: set_trap / remove_trap");
+// --- setTrap / removeTrap ---
+console.log("\n📋 PHASE 6: setTrap / removeTrap");
 console.log("─".repeat(60));
 
 const trapRes = await tools.setTrap('test-error-trap', 'error', {});

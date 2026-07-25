@@ -430,7 +430,7 @@ return {
       },
       {
         name: "gmail_get_attachment",
-        description: "Fetch the content of a Gmail attachment. By default, returns metadata to prevent context overflow. WARNING: If you are an LLM agent, NEVER set returnRawBase64 to true. It will crash your context window. This parameter is STRICTLY for internal JavaScript execution via run_browser_script (e.g., when piping to pdf_load).",
+        description: "Fetch the content of a Gmail attachment. By default, returns metadata to prevent context overflow. WARNING: If you are an LLM agent, NEVER set returnRawBase64 to true. It will crash your context window. This parameter is STRICTLY for internal JavaScript execution via runBrowserScript (e.g., when piping to pdf_load).",
         displayMessage: "📎 Fetching attachment {{attachmentId}}",
         inputSchema: {
           type: "object",
@@ -1028,7 +1028,7 @@ return {
     // That 400 currently triggers the OAuth account-mismatch circuit breaker
     // in browser-mcp-manager.ts and produces a spurious account picker
     // followed by tool failure, after which the model falls back to
-    // take_snapshot/take_screenshot — bad UX for a common case.
+    // takeSnapshot/takeScreenshot — bad UX for a common case.
     //
     // Real fix is at the routing layer, not here: either (a) the autoloader
     // does a Drive metadata pre-check before binding /document/d/ URLs to

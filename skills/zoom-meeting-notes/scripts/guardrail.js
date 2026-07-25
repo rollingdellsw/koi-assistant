@@ -6,7 +6,7 @@ module.exports = {
     // Block the LLM from manually inspecting the obfuscated Zoom DOM.
     // Note: capture.js calls these internally via tools.* — guardrails only
     // intercept direct LLM tool calls, not calls from within a running script.
-    const forbiddenTools = ["take_screenshot", "search_dom", "take_snapshot"];
+    const forbiddenTools = ["takeScreenshot", "searchDom", "takeSnapshot"];
     if (forbiddenTools.includes(ctx.tool.name)) {
       return {
         allowed: false,

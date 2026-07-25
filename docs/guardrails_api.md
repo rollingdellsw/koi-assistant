@@ -10,23 +10,23 @@ Guardrails come in two scopes: **global** (applies to every tool call in every s
 
 Guardrails apply to **all tool executions**, including:
 
-| Context                        | Guardrails Applied | Notes                   |
-| ------------------------------ | ------------------ | ----------------------- |
-| Main conversation              | ✅ Yes             | Primary use case        |
-| Sub-task agent (`run_subtask`) | ✅ Yes             | Uses same tool executor |
-| Executor/agentic_search        | ✅ Yes             | Uses same tool executor |
+| Context                       | Guardrails Applied | Notes                   |
+| ----------------------------- | ------------------ | ----------------------- |
+| Main conversation             | ✅ Yes             | Primary use case        |
+| Sub-task agent (`runSubtask`) | ✅ Yes             | Uses same tool executor |
+| Executor/agenticSearch        | ✅ Yes             | Uses same tool executor |
 
 This means security rules (like protecting `.env` files) are enforced consistently across all agent loops.
 
-> **Exempt tools:** `read_skill` and `run_subtask` are hardcoded to bypass all guardrail hooks. They are orchestration primitives, not mutations, and blocking them would break skill loading and subtask delegation. Do not write guardrails that expect to intercept these two tools — the hooks will never fire for them.
+> **Exempt tools:** `readSkill` and `runSubtask` are hardcoded to bypass all guardrail hooks. They are orchestration primitives, not mutations, and blocking them would break skill loading and subtask delegation. Do not write guardrails that expect to intercept these two tools — the hooks will never fire for them.
 
 ### Comparison with Other Features
 
-| Feature        | Main Loop | Sub-task | agentic_search/Executor |
-| -------------- | --------- | -------- | ----------------------- |
-| **Guardrails** | ✅        | ✅       | ✅                      |
-| **Reminders**  | ✅        | ✅       | ✅                      |
-| **Scratchpad** | ✅        | ❌       | ❌                      |
+| Feature        | Main Loop | Sub-task | agenticSearch/Executor |
+| -------------- | --------- | -------- | ---------------------- |
+| **Guardrails** | ✅        | ✅       | ✅                     |
+| **Reminders**  | ✅        | ✅       | ✅                     |
+| **Scratchpad** | ✅        | ❌       | ❌                     |
 
 **Why the difference?**
 

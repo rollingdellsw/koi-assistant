@@ -1,10 +1,10 @@
 module.exports = {
   input: async (ctx) => {
-    // Rule 1: Disallow take_screenshot in favor of create_workspace
-    if (ctx.tool.name === "take_screenshot" || ctx.tool.name === "take_snapshot") {
+    // Rule 1: Disallow takeScreenshot in favor of createWorkspace
+    if (ctx.tool.name === "takeScreenshot" || ctx.tool.name === "takeSnapshot") {
       return {
         allowed: false,
-        message: 'Do NOT use take_screenshot. Use create_workspace instead to initialize the visual analysis environment for OSD.'
+        message: 'Do NOT use takeScreenshot. Use createWorkspace instead to initialize the visual analysis environment for OSD.'
       };
     }
 

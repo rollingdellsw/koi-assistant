@@ -3,7 +3,7 @@ name: guardrail-test
 description: Validates skill guardrail interception and global loop detection logic
 runnable: true
 allowed-tools:
-  - navigate_page
+  - navigatePage
   - click
 guardrails: scripts/guardrail.js
 ---
@@ -12,5 +12,5 @@ guardrails: scripts/guardrail.js
 
 This skill validates two guardrail mechanisms:
 
-1. First, call `navigate_page` to `https://forbidden.com` — expect block
-2. Then, call `navigate_page` to `https://example.com` three times — expect the 3rd to be blocked by loop detection
+1. First, call `navigatePage` to `https://forbidden.com` — expect block
+2. Then, call `navigatePage` to `https://example.com` three times — expect the 3rd to be blocked by loop detection

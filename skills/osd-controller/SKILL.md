@@ -7,7 +7,7 @@ url-patterns:
   - "https://portal.gdc.cancer.gov/*"
   - "*/context_stress_test.html"
 allowed-tools:
-  - run_browser_script
+  - runBrowserScript
   - "visual-workspace:*"
   - "openseadragon:*"
 mcp-servers:
@@ -27,7 +27,7 @@ reminders:
   - id: "osd:saccadic-memory"
     trigger:
       type: "tool_result"
-      toolName: "create_workspace"
+      toolName: "createWorkspace"
     content: |
       Focus Shifted: You have created a new active Visual Workspace.
       Remember that your previous workspaces are now demoted to low-res thumbnails to save context window space.
@@ -43,12 +43,12 @@ Specialized agent for high-resolution pathology image analysis.
 
 ### Capabilities
 
-1. **Workspace Management**: Initialize an analysis session using `create_workspace`.
+1. **Workspace Management**: Initialize an analysis session using `createWorkspace`.
 2. **Direct Operation**: Navigate via `osd_pan` and `osd_zoom` through the `openseadragon` MCP server.
 3. **Visual Feedback**: Use `visual-workspace` tools to annotate specific cells or regions of interest.
 
 ### Workflow
 
-1. Call `read_skill("osd-controller")`.
-2. Locate the viewer and call `create_workspace({"selector":".openseadragon-canvas"})`.
+1. Call `readSkill("osd-controller")`.
+2. Locate the viewer and call `createWorkspace({"selector":".openseadragon-canvas"})`.
 3. Use OSD tools to find regions of interest and annotations to document findings.

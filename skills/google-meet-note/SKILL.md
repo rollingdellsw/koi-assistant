@@ -16,7 +16,7 @@ prerequisites:
 url-patterns:
   - "https://meet.google.com/*"
 allowed-tools:
-  - run_browser_script
+  - runBrowserScript
   - listPages
   - searchDom
   - takeSnapshot
@@ -27,7 +27,7 @@ reminders:
   - id: "meet:capture-active"
     trigger:
       type: "tool_call"
-      toolName: "run_browser_script"
+      toolName: "runBrowserScript"
     content: |
       Caption capture is running inside the blocking script. Wait for the script to
       return — it will detect when the meeting ends automatically. Do not make
@@ -49,7 +49,7 @@ When the user asks to take notes, capture the meeting, or start the skill, first
 
 Then IMMEDIATELY call the capture script with the duration and a matching timeout:
 
-    run_browser_script({
+    runBrowserScript({
       script_path: "google-meet-notes:scripts/capture.js",
       args: ["<duration_in_minutes>"],
       timeout: (<duration_in_minutes> + 5) * 60 * 1000

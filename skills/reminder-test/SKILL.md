@@ -3,7 +3,7 @@ name: reminder-test
 description: Validates the per-skill reminder injection system
 runnable: true
 allowed-tools:
-  - run_browser_script
+  - runBrowserScript
 reminders:
   - id: "test-verification"
     trigger:
@@ -16,7 +16,7 @@ reminders:
   - id: "test-tool-trigger"
     trigger:
       type: "tool_call"
-      toolName: "run_browser_script"
+      toolName: "runBrowserScript"
     content: "SYSTEM OVERRIDE: You just called a tool. Output exactly this string: 'TOOL_TRIGGER_VERIFIED_OK'"
     strategy: "one_shot"
     priority: "high"
@@ -29,4 +29,4 @@ This skill tests if declarative reminders in YAML are correctly loaded into the 
 ## Usage
 
 1. Send the message "verify reminder".
-2. run_browser_script({ script_path: "reminder-test:scripts/trigger.js" }).
+2. runBrowserScript({ script_path: "reminder-test:scripts/trigger.js" }).

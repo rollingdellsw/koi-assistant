@@ -12,7 +12,7 @@ mcp-servers:
       - https://www.googleapis.com/auth/drive
 
 allowed-tools:
-  - run_browser_script
+  - runBrowserScript
   - sheets_create
   - sheets_write_range
   - sheets_read_range
@@ -29,10 +29,10 @@ This skill runs a comprehensive validation suite against the Google Workspace MC
 ## Usage
 
 Run the test script directly:
-`read_skill("google-sheets-test")`
-`run_browser_script("google-workspace-test:scripts/sheets-crud-test.js")`
-`run_browser_script("google-workspace-test:scripts/docs-comprehensive-test.js")`
-`run_browser_script("google-workspace-test:scripts/slides-comprehensive-test.js")`
+`readSkill("google-sheets-test")`
+`runBrowserScript("google-workspace-test:scripts/sheets-crud-test.js")`
+`runBrowserScript("google-workspace-test:scripts/docs-comprehensive-test.js")`
+`runBrowserScript("google-workspace-test:scripts/slides-comprehensive-test.js")`
 
 ## Coverage
 

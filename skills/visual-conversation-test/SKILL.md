@@ -10,18 +10,18 @@ parameters:
     description: Number of selection rounds to perform
     default: "3"
 allowed-tools:
-  - navigate_page
-  - scroll_viewport
-  - take_screenshot
-  - run_browser_script
-  - prompt_user_selection
-  - show_workspace_overlay
-  - hide_workspace_overlay
-  - add_workspace_annotation
-  - get_image_stack
-  - get_workspace_state
-  - highlight_element
-  - clear_highlight
+  - navigatePage
+  - scrollViewport
+  - takeScreenshot
+  - runBrowserScript
+  - promptUserSelection
+  - showWorkspaceOverlay
+  - hideWorkspaceOverlay
+  - addWorkspaceAnnotation
+  - getImageStack
+  - getWorkspaceState
+  - highlightElement
+  - clearHighlight
 ---
 
 # Visual Conversation Test Skill

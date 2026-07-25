@@ -24,12 +24,12 @@ const dom = {
       ? { selector: selectorOrGlobal, property: prop }
       : { global: selectorOrGlobal, property: prop };
 
-    const res = await tools.dom_get_property(args);
+    const res = await tools.domGetProperty(args);
     if (res.isError) throw new Error(res.content[0].text);
     return JSON.parse(res.content[0].text);
   },
   call: async (selector, method, args=[]) => {
-    const res = await tools.dom_call_method({ selector, method, args });
+    const res = await tools.domCallMethod({ selector, method, args });
     if (res.isError) throw new Error(res.content[0].text);
     return JSON.parse(res.content[0].text);
   }
@@ -79,20 +79,20 @@ console.log(`  Full mode: ${fullResult.totalLength} chars, mode=${fullResult.mod
 // ────────────────────────────────────────────────────────────────────────────
 console.log("\n📋 PHASE 0: Request Action (Highlight + Tooltip)");
 
-// Use search_dom to find the Click Me button
+// Use searchDom to find the Click Me button
 console.log("  Searching for 'Click Me' button...");
 const searchResult = await tools.searchDom("Click Me");
 // Core tools return parsed objects directly (not MCP { content: [{text}] } format)
 const searchData = searchResult;
 
 if (!searchData.matches || searchData.matches.length === 0) {
-  console.log("❌ FAIL: Could not find 'Click Me' button via search_dom");
+  console.log("❌ FAIL: Could not find 'Click Me' button via searchDom");
 } else {
   const match = searchData.matches[0];
   console.log(`  Found button: selector="${match.selector}", text="${match.text}"`);
 
-  // Call request_action to highlight and prompt the user
-  console.log("  Calling request_action to highlight the button...");
+  // Call requestAction to highlight and prompt the user
+  console.log("  Calling requestAction to highlight the button...");
   try {
     const raResult = await tools.requestAction({
       selector: match.selector,
@@ -104,14 +104,14 @@ if (!searchData.matches || searchData.matches.length === 0) {
     const raData = (typeof raResult === 'string') ? JSON.parse(raResult) : raResult;
 
     if (raData.success) {
-      console.log("✅ PASS: request_action highlighted the element");
+      console.log("✅ PASS: requestAction highlighted the element");
       console.log("   Status: " + (raData.status || "ok"));
       console.log("   Message: " + (raData.message || ""));
     } else {
-      console.log("❌ FAIL: request_action returned error: " + (raData.error || JSON.stringify(raData)));
+      console.log("❌ FAIL: requestAction returned error: " + (raData.error || JSON.stringify(raData)));
     }
   } catch (e) {
-    console.log("❌ FAIL: request_action threw: " + e.message);
+    console.log("❌ FAIL: requestAction threw: " + e.message);
   }
 
   // Wait a moment so user can see the highlight, then proceed

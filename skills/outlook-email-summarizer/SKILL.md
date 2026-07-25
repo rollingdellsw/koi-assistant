@@ -5,9 +5,9 @@ description: Orchestrates fetching Outlook emails and safely reading large attac
 runnable: true
 
 allowed-tools:
-  - run_browser_script
-  - run_subtask
-  - new_page
+  - runBrowserScript
+  - runSubtask
+  - newPage
 ---
 
 # Outlook Email Summarizer Skill
@@ -15,7 +15,7 @@ allowed-tools:
 This skill provides an isolated browser script to safely process Outlook emails and delegate attachment summarization.
 
 Instead of calling `outlook_get_message` and `outlook_get_attachment` manually, simply call:
-`run_browser_script({ script_path: "outlook-email-summarizer:scripts/analyze.js", args: [url_or_messageId] })`
+`runBrowserScript({ script_path: "outlook-email-summarizer:scripts/analyze.js", args: [url_or_messageId] })`
 
 The script will automatically:
 

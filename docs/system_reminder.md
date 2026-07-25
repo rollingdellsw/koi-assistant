@@ -17,19 +17,19 @@ Both scopes use the same rule format, trigger system, and engine.
 
 Reminders apply to **all agent loops**:
 
-| Context                        | Reminders Applied | Notes                                    |
-| ------------------------------ | ----------------- | ---------------------------------------- |
-| Main conversation              | ✅ Yes            | Primary use case                         |
-| Sub-task agent (`run_subtask`) | ✅ Yes            | Inherits reminder engine from main       |
-| Executor/agentic_search        | ✅ Yes            | Uses shared tool executor with reminders |
+| Context                       | Reminders Applied | Notes                                    |
+| ----------------------------- | ----------------- | ---------------------------------------- |
+| Main conversation             | ✅ Yes            | Primary use case                         |
+| Sub-task agent (`runSubtask`) | ✅ Yes            | Inherits reminder engine from main       |
+| Executor/agenticSearch        | ✅ Yes            | Uses shared tool executor with reminders |
 
 ### Comparison with Other Features
 
-| Feature        | Main Loop | Sub-task | agentic_search/Executor |
-| -------------- | --------- | -------- | ----------------------- |
-| **Reminders**  | ✅        | ✅       | ✅                      |
-| **Guardrails** | ✅        | ✅       | ✅                      |
-| **Scratchpad** | ✅        | ❌       | ❌                      |
+| Feature        | Main Loop | Sub-task | agenticSearch/Executor |
+| -------------- | --------- | -------- | ---------------------- |
+| **Reminders**  | ✅        | ✅       | ✅                     |
+| **Guardrails** | ✅        | ✅       | ✅                     |
+| **Scratchpad** | ✅        | ❌       | ❌                     |
 
 **Key insight**: Reminders and Guardrails are applied consistently across all agent loops via the shared tool executor. Scratchpad is for multi-turn memory in the main conversation only.
 
@@ -68,7 +68,7 @@ Reminders apply to **all agent loops**:
 Include them directly in the sub-task goal:
 
 ```
-Use run_subtask with goal: "Fix TypeScript errors in src/api/.
+Use runSubtask with goal: "Fix TypeScript errors in src/api/.
 Rules: No 'any' types, use Zod for validation."
 ```
 
@@ -135,7 +135,7 @@ That's it. Next time you work with TypeScript files, the reminder activates auto
 
 ## Skill-Scoped Reminders
 
-Declare reminders inline in `SKILL.md` frontmatter. They are registered when the skill is loaded via `read_skill` and merged into the same engine as global reminders.
+Declare reminders inline in `SKILL.md` frontmatter. They are registered when the skill is loaded via `readSkill` and merged into the same engine as global reminders.
 
 ```yaml
 ---
@@ -144,7 +144,7 @@ reminders:
   - id: "osd:saccadic-memory"
     trigger:
       type: "tool_result"
-      toolName: "create_workspace"
+      toolName: "createWorkspace"
     content: |
       Focus Shifted: You have created a new active Visual Workspace.
       Previous workspaces are now low-res thumbnails.
@@ -246,7 +246,7 @@ Fires when a tool is about to execute (pre-execution). The reminder is **queued*
   "id": "prefer-lsp-tools",
   "trigger": {
     "type": "tool_call",
-    "toolName": "^(read_file|search|agentic_search)$"
+    "toolName": "^(read_file|search|agenticSearch)$"
   },
   "content": "PREFER LSP TOOLS: Unless LSP is unavailable, prefer get_references, get_file_structure for code navigation.",
   "strategy": "one_shot"
@@ -292,7 +292,7 @@ Fires after a tool completes. Can filter by output pattern or success status.
   "id": "build-failure-hint",
   "trigger": {
     "type": "tool_result",
-    "toolName": "run_cmd",
+    "toolName": "runCmd",
     "success": false
   },
   "content": "Build failed. Use get_lsp_diagnostics for precise error locations.",
@@ -443,7 +443,7 @@ Activate with `/tag database` command, deactivate with `/untag database`.
 
 > **Note:** `low_context_window` requires `contextWindow` to be configured in your LLM settings. The `threshold` defaults to 10000 tokens if not specified.
 
-**`session_needs_title`** only fires for the main assistant role — sub-agents (subtask, agentic_search) never trigger it.
+**`session_needs_title`** only fires for the main assistant role — sub-agents (subtask, agenticSearch) never trigger it.
 
 **Session needs title:**
 
@@ -478,7 +478,7 @@ Not all trigger types are equally useful in browser mode since there is no files
 | ------------------------ | ------------------------------------------------------------------------- |
 | `always`                 | ✅ Works                                                                  |
 | `user_message`           | ✅ Works                                                                  |
-| `tool_call`              | ✅ Works (browser tool names like `navigate_page`, `take_screenshot`)     |
+| `tool_call`              | ✅ Works (browser tool names like `navigatePage`, `takeScreenshot`)       |
 | `tool_result`            | ✅ Works                                                                  |
 | `tool_error`             | ✅ Works                                                                  |
 | `iteration`              | ✅ Works                                                                  |
@@ -617,7 +617,7 @@ interface ReminderRule {
     "id": "prefer-lsp-tools",
     "trigger": {
       "type": "tool_call",
-      "toolName": "^(read_file|search|agentic_search)$"
+      "toolName": "^(read_file|search|agenticSearch)$"
     },
     "content": "PREFER LSP TOOLS: Unless LSP is unavailable, prefer get_references, get_file_structure for code navigation.",
     "strategy": "one_shot",

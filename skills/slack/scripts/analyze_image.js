@@ -33,7 +33,7 @@ async function run() {
 
   // 3. Run vision subtask
   console.log("🧠 Running vision subtask...");
-  const subtaskRes = await tools.run_subtask({
+  const subtaskRes = await tools.runSubtask({
     goal: `Describe the image "${fileInfo.name}" in 2-4 concise sentences. Focus on visible text and main subject.`,
     verification_command: "Image is described",
     image_data: [{ base64, mimeType: fileInfo.mimetype, filename: fileInfo.name }],

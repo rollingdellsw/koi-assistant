@@ -1,0 +1,54 @@
+{
+  "name": "search",
+  "version": "1.0.0",
+  "description": "MCP server for code search with LSP, ripgrep, and grep backends",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js"
+    },
+    "./inlay-hints": {
+      "types": "./dist/inlay-hints.d.ts",
+      "require": "./dist/inlay-hints.js",
+      "import": "./dist/inlay-hints.js"
+    }
+  },
+  "bin": {
+    "search": "./dist/index.js"
+  },
+  "scripts": {
+    "lint": "eslint src --ext .ts --cache",
+    "lint:fix": "eslint src --ext .ts --cache --fix",
+    "type-check": "tsc --noEmit",
+    "build:types": "tsc --emitDeclarationOnly",
+    "build": "tsc --emitDeclarationOnly && node build.js",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "search",
+    "code",
+    "lsp",
+    "ripgrep"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "esbuild": "^0.27.1",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {
+    "@vscode/tree-sitter-wasm": "^0.0.5-php.2",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-typescript": "^0.23.2"
+  }
+}

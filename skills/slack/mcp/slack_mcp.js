@@ -12,7 +12,7 @@ return {
   _userCache: {},
 
   // Module-scoped fetch state. The skill-script sandbox is recreated
-  // per run_browser_script call (see script-runner.ts:429), so the
+  // per runBrowserScript call (see script-runner.ts:429), so the
   // analyze.js script cannot keep state between turns in its own
   // module scope. The MCP sandbox (sandbox-mcp.html) IS long-lived,
   // so we keep the incremental-fetch cursor here instead.
@@ -548,7 +548,7 @@ return {
           text: JSON.stringify({
             status: "File downloaded. Raw base64 omitted to prevent context overflow.",
             size,
-            hint: "Call again with returnRawBase64: true and pipe the base64 into a vision subtask via run_subtask({ image_data: [...] }).",
+            hint: "Call again with returnRawBase64: true and pipe the base64 into a vision subtask via runSubtask({ image_data: [...] }).",
           }, null, 2),
         }],
       };

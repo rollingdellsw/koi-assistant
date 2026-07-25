@@ -6,7 +6,7 @@
 //   tool-executor.ts browser tool path (line 463-512) returns EARLY,
 //   bypassing the onToolResult callback (line 680). This means
 //   WorkspaceImageManager.handleToolResult() is NEVER called for browser tools
-//   like create_workspace. Images are never registered, so the preprocessor
+//   like createWorkspace. Images are never registered, so the preprocessor
 //   is a no-op (this.images.size === 0 → early return).
 //
 // This test:
@@ -63,7 +63,7 @@ class WorkspaceImageManager {
   }
 
   registerFromToolResult(toolName, resultContent, thumbnailDataUrl) {
-    if (toolName === "set_active_workspace") {
+    if (toolName === "setActiveWorkspace") {
       try {
         const parsed = JSON.parse(resultContent);
         if (parsed.success === true && typeof parsed.imageId === "string") {
@@ -124,7 +124,7 @@ class WorkspaceImageManager {
         _contextNote:
           `Workspace ${imageId} shown as thumbnail. ` +
           (entry.description ? `Previous analysis: ${entry.description}. ` : "No analysis yet. ") +
-          `Call set_active_workspace to view full resolution.`,
+          `Call setActiveWorkspace to view full resolution.`,
       };
       return { ...msg, content: JSON.stringify(replaced) };
     } catch {
@@ -149,11 +149,11 @@ class WorkspaceImageManager {
             text:
               `[Workspace ${entry.imageId} thumbnail. ` +
               (entry.description ? `Previous analysis: ${entry.description}. ` : "No previous analysis. ") +
-              `Call set_active_workspace("${entry.imageId}") for full resolution.]`,
+              `Call setActiveWorkspace("${entry.imageId}") for full resolution.]`,
           });
         } else if (!entry && dataUrl.length > 50000) {
           changed = true;
-          result.push({ type: "text", text: "[Large image removed. Use set_active_workspace to view workspace.]" });
+          result.push({ type: "text", text: "[Large image removed. Use setActiveWorkspace to view workspace.]" });
         } else {
           result.push(part);
         }
@@ -240,10 +240,10 @@ async function runTest() {
 
   let containerWidth, containerHeight;
   try {
-    const dom = await tools.dom_get_property({ selector: ".openseadragon-canvas", property: "offsetWidth" });
+    const dom = await tools.domGetProperty({ selector: ".openseadragon-canvas", property: "offsetWidth" });
     if (dom.isError) throw new Error(dom.content[0]?.text);
     containerWidth = JSON.parse(dom.content[0].text);
-    const domH = await tools.dom_get_property({ selector: ".openseadragon-canvas", property: "offsetHeight" });
+    const domH = await tools.domGetProperty({ selector: ".openseadragon-canvas", property: "offsetHeight" });
     containerHeight = JSON.parse(domH.content[0].text);
   } catch (e) {
     console.error("❌ OSD container not found:", e.message);
@@ -396,7 +396,7 @@ async function runTest() {
       imageData: fullRes,
       image: { id: imageId, dimensions: { width: 1600, height: 1200 } },
     });
-    swapMgr.registerFromToolResult("create_workspace", toolResultContent, thumb);
+    swapMgr.registerFromToolResult("createWorkspace", toolResultContent, thumb);
   }
 
   assert(swapMgr.activeImageId === "img_005", "Swap: initial active = img_005 (last created)");
@@ -447,32 +447,32 @@ async function runTest() {
   console.log("\n--- A2.1: Initial state (img_005 active) ---");
   verifyActiveSwap(swapMgr, swapMessages, "img_005", "Initial");
 
-  console.log("\n--- A2.2: Swap to img_001 via set_active_workspace tool result ---");
+  console.log("\n--- A2.2: Swap to img_001 via setActiveWorkspace tool result ---");
   const setActiveResult1 = JSON.stringify({ success: true, imageId: "img_001" });
-  swapMgr.registerFromToolResult("set_active_workspace", setActiveResult1);
+  swapMgr.registerFromToolResult("setActiveWorkspace", setActiveResult1);
   assert(swapMgr.activeImageId === "img_001", "After set_active: active = img_001");
   verifyActiveSwap(swapMgr, swapMessages, "img_001", "Swap→001");
 
-  console.log("\n--- A2.3: Swap to img_003 via set_active_workspace ---");
+  console.log("\n--- A2.3: Swap to img_003 via setActiveWorkspace ---");
   const setActiveResult3 = JSON.stringify({ success: true, imageId: "img_003" });
-  swapMgr.registerFromToolResult("set_active_workspace", setActiveResult3);
+  swapMgr.registerFromToolResult("setActiveWorkspace", setActiveResult3);
   assert(swapMgr.activeImageId === "img_003", "After set_active: active = img_003");
   verifyActiveSwap(swapMgr, swapMessages, "img_003", "Swap→003");
 
   console.log("\n--- A2.4: Swap back to img_005 ---");
   const setActiveResult5 = JSON.stringify({ success: true, imageId: "img_005" });
-  swapMgr.registerFromToolResult("set_active_workspace", setActiveResult5);
+  swapMgr.registerFromToolResult("setActiveWorkspace", setActiveResult5);
   assert(swapMgr.activeImageId === "img_005", "After set_active: active = img_005");
   verifyActiveSwap(swapMgr, swapMessages, "img_005", "Swap→005");
 
-  console.log("\n--- A2.5: set_active_workspace with unknown ID is no-op ---");
-  swapMgr.registerFromToolResult("set_active_workspace", JSON.stringify({ success: false, error: "not found" }));
+  console.log("\n--- A2.5: setActiveWorkspace with unknown ID is no-op ---");
+  swapMgr.registerFromToolResult("setActiveWorkspace", JSON.stringify({ success: false, error: "not found" }));
   assert(swapMgr.activeImageId === "img_005", "Failed set_active: still img_005");
 
   console.log("\n--- A2.6: Round-trip all images ---");
   const swapOrder = ["img_002", "img_004", "img_001", "img_005", "img_003"];
   for (const targetId of swapOrder) {
-    swapMgr.registerFromToolResult("set_active_workspace", JSON.stringify({ success: true, imageId: targetId }));
+    swapMgr.registerFromToolResult("setActiveWorkspace", JSON.stringify({ success: true, imageId: targetId }));
     verifyActiveSwap(swapMgr, swapMessages, targetId, `Round-trip→${targetId}`);
   }
 
@@ -520,7 +520,7 @@ async function runTest() {
       imageData: ws.imageData,
       image: { id: imageId, dimensions: ws.image.dimensions },
     });
-    manager2.registerFromToolResult("create_workspace", toolResultContent, thumb);
+    manager2.registerFromToolResult("createWorkspace", toolResultContent, thumb);
 
     realImages.push({ imageId, fullRes: ws.imageData, thumb, dimensions: ws.image.dimensions });
 

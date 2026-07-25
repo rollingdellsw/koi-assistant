@@ -6,7 +6,7 @@ This guide provides technical instructions for developing Skills for the Koi™ 
 
 ## 1. The Sandbox Interface
 
-When a skill script is executed via `run_browser_script`, it runs inside an isolated, secure iframe sandbox. The runtime injects three global variables into your script: `tools`, `args`, and `console`.
+When a skill script is executed via `runBrowserScript`, it runs inside an isolated, secure iframe sandbox. The runtime injects three global variables into your script: `tools`, `args`, and `console`.
 
 > **Skill folder structure:** A skill is a directory with the following layout:
 >
@@ -15,7 +15,7 @@ When a skill script is executed via `run_browser_script`, it runs inside an isol
 >   SKILL.md          # Required — frontmatter + documentation
 >                     # Frontmatter: machine-readable config (YAML between --- delimiters)
 >                     # Body (below frontmatter): LLM-facing instructions injected into the system prompt
->   scripts/           # Skill scripts executed via run_browser_script
+>   scripts/           # Skill scripts executed via runBrowserScript
 >     main.js
 >     helper.js
 >   mcp/               # MCP server scripts (Local MCP)
@@ -30,10 +30,10 @@ When a skill script is executed via `run_browser_script`, it runs inside an isol
 
 An array of string arguments passed to the script by the LLM. Inside the sandbox, `args` is always a `string[]`. Arguments are populated differently depending on how the script is invoked:
 
-- **LLM invocation** (`run_browser_script`): The LLM provides `args` as a string array via `run_browser_script({ script_path: "skill:scripts/main.js", args: ["val1", "val2"] })`. Access as `args[0]`, `args[1]`, etc.
-- **LLM invocation** (`run_browser_script`): The LLM provides `args` as a string array via `run_browser_script({ script_path: "skill:scripts/main.js", args: ["val1", "val2"], timeout: 120000 })`. Access as `args[0]`, `args[1]`, etc.
+- **LLM invocation** (`runBrowserScript`): The LLM provides `args` as a string array via `runBrowserScript({ script_path: "skill:scripts/main.js", args: ["val1", "val2"] })`. Access as `args[0]`, `args[1]`, etc.
+- **LLM invocation** (`runBrowserScript`): The LLM provides `args` as a string array via `runBrowserScript({ script_path: "skill:scripts/main.js", args: ["val1", "val2"], timeout: 120000 })`. Access as `args[0]`, `args[1]`, etc.
 - **Direct invocation** (`/skill` command): Skill parameter values (from the UI prompt or `--param` flags) are passed as positional strings via `Object.values(params)`. Parameter order follows the order of the `parameters` list in `SKILL.md`.
-- **Delegation from background**: When the background service worker delegates `execute_isolated_script` to the sidepanel, args come from the caller (usually the LLM's `run_browser_script` call).
+- **Delegation from background**: When the background service worker delegates `executeIsolatedScript` to the sidepanel, args come from the caller (usually the LLM's `runBrowserScript` call).
 
 Scripts that need named access to parameters should destructure from the positional array (e.g., `const [url, timeout] = args;`) rather than using property access on the array object.
 
@@ -45,7 +45,7 @@ A proxy that forwards `log`, `warn`, `error`, and `info` directly to the Deft/Ko
 
 The `tools` object exposes asynchronous methods to interact with the browser.
 
-> **Calling convention:** Built-in browser tools use **positional arguments** with camelCase names (e.g., `tools.click(selector)`, `tools.fill(selector, value)`). MCP tools (loaded via `readSkill`) use a **single object argument** (e.g., `tools.dom_get_property({ selector, property })`). While the LLM uses `snake_case` (e.g., `search_dom`), the script API uses standard JavaScript `camelCase` (e.g., `tools.searchDom`).
+> **Calling convention:** Built-in browser tools use **positional arguments** with camelCase names (e.g., `tools.click(selector)`, `tools.fill(selector, value)`). MCP tools (loaded via `readSkill`) use a **single object argument** (e.g., `tools.domGetProperty({ selector, property })`). While the LLM uses `snake_case` (e.g., `searchDom`), the script API uses standard JavaScript `camelCase` (e.g., `tools.searchDom`).
 
 The signatures below show the actual script API. For tools that accept a single object, parameters are shown as `{ key: type }`. For tools that accept positional arguments, parameters are shown as `(arg1, arg2)`.
 
@@ -61,11 +61,11 @@ These methods are built into the script runtime. No skill needs to be loaded fir
 >
 > This means:
 >
-> - If a skill script loads `google-workspace` to call `calendar_get_events` internally, the LLM can call `docs_create` in a later turn **without** needing a separate `read_skill("google-workspace")` call — the tools are already registered from the script's `readSkill`.
+> - If a skill script loads `google-workspace` to call `calendar_get_events` internally, the LLM can call `docs_create` in a later turn **without** needing a separate `readSkill("google-workspace")` call — the tools are already registered from the script's `readSkill`.
 > - This is by design: it enables the two-step pattern where a script does deterministic work (loading dependencies, querying data) and the LLM follows up with reasoning-dependent tool calls using the same loaded tools.
 > - The tools persist for the remainder of the session. They are not unloaded when the script completes.
 
-- `await tools.run_subtask({ goal: string, verification_command: string, timeoutMs?: number, context_files?: string[], image_data?: Array<{base64: string, mimeType: string, filename?: string}> })` — Spawn an independent LLM agent with its own context window. Returns an MCP-style result object `{ content: [{ type: "text", text: string }], isError: boolean }`. Parse the text field as JSON to access `.content` (the agent's final response) or `.history` (full message log, fallback if content is empty). See Section 4.
+- `await tools.runSubtask({ goal: string, verification_command: string, timeoutMs?: number, context_files?: string[], image_data?: Array<{base64: string, mimeType: string, filename?: string}> })` — Spawn an independent LLM agent with its own context window. Returns an MCP-style result object `{ content: [{ type: "text", text: string }], isError: boolean }`. Parse the text field as JSON to access `.content` (the agent's final response) or `.history` (full message log, fallback if content is empty). See Section 4.
 - `await tools.sleep(ms: number)` — Wait for `ms` milliseconds.
 
 #### Inspection & Context (Safe)
@@ -78,7 +78,71 @@ These tools are always available without loading any skill:
 - `await tools.inspectElement(selector)` — returns computed styles, attributes, and event listeners
 - `await tools.getContext()`
 - `await tools.listPages()`
+- `await tools.getPageContext({ selector?: string, maxReadable?: number, offset?: number, maxLinks?: number, linkOffset?: number })` — Extract readable content, links, and resource URLs from the current page. See below.
 - `await tools.listConsoleMessages({ types?: string[], limit?: number })`
+
+##### `getPageContext` — Page Content Extraction for Semantic Analysis
+
+`getPageContext` is the primary tool for reading page content. It extracts structured data that an LLM can reason over directly, eliminating the need for CSS selectors to extract text data.
+
+**When to use:** Any time a script or the LLM needs to understand what's on a page — product details, search results, article content, table data, available links. Use `getPageContext` instead of writing `querySelector` chains to scrape text.
+
+**When NOT to use:** When you need to interact with the page (click, fill, hover) — use the interaction tools with CSS selectors for that. Selectors are for actions; `getPageContext` is for reading.
+
+```javascript
+const ctx = await tools.getPageContext();
+
+// ctx.readable — clean text with structure markers (# headings, - lists)
+// ctx.links    — all <a> elements with { text, href, selector }
+// ctx.resources — all media with { type, src, alt? }
+// ctx.meta     — { title, url, totalLength, offset, hasMore }
+```
+
+**Response shape:**
+
+```typescript
+interface PageContext {
+  readable: string;
+  links: Array<{
+    text: string; // Link text, truncated to 100 chars
+    href: string; // Full resolved URL
+    selector: string; // CSS selector (for clicking, not extraction)
+  }>;
+  resources: Array<{
+    type: "image" | "video" | "audio" | "iframe";
+    src: string; // Full resolved URL
+    alt?: string; // Alt text for images
+  }>;
+  meta: {
+    title: string;
+    url: string;
+    totalLength: number;
+    offset: number;
+    hasMore: boolean;
+  };
+}
+```
+
+**Pagination.** For large pages, `readable` is capped at `maxReadable` (default: 20,000 chars). If more content exists, `meta.hasMore` is `true`. Call again with `offset` to continue:
+
+```javascript
+let ctx = await tools.getPageContext();
+let fullText = ctx.readable;
+while (ctx.meta.hasMore) {
+  ctx = await tools.getPageContext({
+    offset: ctx.meta.offset + ctx.readable.length,
+  });
+  fullText += ctx.readable;
+}
+```
+
+**Scoping.** Pass `selector` to extract from a subtree only:
+
+```javascript
+const results = await tools.getPageContext({ selector: "#search-results" });
+```
+
+**Auto-traversal.** Same-origin iframes are automatically walked — their content, links, and resources are included in the response. Cross-origin iframes appear in `resources` with `type: "iframe"` and their `src` URL. Open shadow DOM content is included; closed shadow DOM is inaccessible (browser security).
 
 #### Navigation & Tab Management
 
@@ -103,11 +167,13 @@ The following tools require the **chrome-developer-tools** skill to be loaded. T
 
 Load first: `await tools.readSkill({ name: "chrome-developer-tools" });`
 
-- `await tools.click(selector)`
-- `await tools.fill(selector, value)`
-- `await tools.hover(selector)`
+- `await tools.click(selector, delayMs?)`
+- `await tools.fill(selector, value, delayMs?)`
+- `await tools.hover(selector, delayMs?)`
 
-> **Note:** `pressKey` has a built-in CDP implementation (`tool-executor.ts` routes `press_key` to `CDPManager.pressKey`) that is always available. The `chrome-developer-tools` skill also provides a `press_key` MCP tool via JS event dispatch. When the skill is loaded, the MCP version is used. Without the skill, the built-in CDP version still works. This is different from `click`, `fill`, and `hover`, which have **no** built-in fallback and require the skill.
+> **Note on delayMs:** Modern JavaScript frameworks (React, Angular) often need time to hydrate elements or attach event listeners after a UI transition (like a modal opening). If you interact with an element too quickly, the site may ignore the event. Pass an optional delay in milliseconds (e.g., `await tools.fill('#origin', 'JFK', 800)`) to pause briefly before the action executes, giving the site time to ready its event listeners.
+
+> **Note:** `pressKey` has a built-in CDP implementation (`tool-executor.ts` routes `pressKey` to `CDPManager.pressKey`) that is always available. The `chrome-developer-tools` skill also provides a `pressKey` MCP tool via JS event dispatch. When the skill is loaded, the MCP version is used. Without the skill, the built-in CDP version still works. This is different from `click`, `fill`, and `hover`, which have **no** built-in fallback and require the skill.
 
 - `await tools.pressKey(key)` — e.g., `tools.pressKey('Enter')`, `tools.pressKey('Control+a')`. Works with or without `chrome-developer-tools` loaded (see note above).
 
@@ -134,8 +200,8 @@ These tools are built into the extension and use Chrome's DevTools Protocol (CDP
 
 #### Traps (requires chrome-developer-tools skill)
 
-- `await tools.setTrap(name, trigger, filter?)` — e.g., `tools.setTrap('my-trap', 'error', {})`. The `set_trap` tool in `devtools.js` registers the trap both in `window.__deftTraps` on the page (for in-page detection) and via the extension's background trap infrastructure (for network monitoring).
-  Note: The `set_trap` and `remove_trap` tools are provided by the `chrome-developer-tools` MCP server, not as built-in browser tools.
+- `await tools.setTrap(name, trigger, filter?)` — e.g., `tools.setTrap('my-trap', 'error', {})`. The `setTrap` tool in `devtools.js` registers the trap both in `window.__deftTraps` on the page (for in-page detection) and via the extension's background trap infrastructure (for network monitoring).
+  Note: The `setTrap` and `removeTrap` tools are provided by the `chrome-developer-tools` MCP server, not as built-in browser tools.
 - `await tools.removeTrap(name)` — e.g., `tools.removeTrap('my-trap')`
 
 ---
@@ -145,42 +211,42 @@ These tools are built into the extension and use Chrome's DevTools Protocol (CDP
 For reading DOM properties and calling methods on page elements or JavaScript globals, use the **`dom-interactor`** shared skill. This is the standard pattern used across all skills — do not re-implement handle discovery yourself.
 
 ```javascript
-// Load the shared skill — this registers dom_get_property and dom_call_method
+// Load the shared skill — this registers domGetProperty and domCallMethod
 await tools.readSkill({ name: "dom-interactor" });
 
 // Read a property from an element
-const value = await tools.dom_get_property({
+const value = await tools.domGetProperty({
   selector: "#email-input",
   property: "value",
 });
 
 // Read a property from a global object
-const title = await tools.dom_get_property({
+const title = await tools.domGetProperty({
   global: "document",
   property: "title",
 });
 
 // Call a method on an element
-await tools.dom_call_method({ selector: "#my-form", method: "scrollIntoView" });
+await tools.domCallMethod({ selector: "#my-form", method: "scrollIntoView" });
 
 // Call a method with arguments
-await tools.dom_call_method({
+await tools.domCallMethod({
   selector: "#my-form",
   method: "setAttribute",
   args: ["data-ready", "true"],
 });
 ```
 
-Both tools work transparently inside shadow DOMs and iframes — use `tools.enterShadow` / `tools.enterIframe` first to set the context, then call `dom_get_property` / `dom_call_method` as normal.
+Both tools work transparently inside shadow DOMs and iframes — use `tools.enterShadow` / `tools.enterIframe` first to set the context, then call `domGetProperty` / `domCallMethod` as normal.
 
 ---
 
-## 3. `run_browser_script`: Combining Determinism with AI
+## 3. `runBrowserScript`: Combining Determinism with AI
 
-`run_browser_script` bridges the LLM's reasoning and traditional browser automation.
+`runBrowserScript` bridges the LLM's reasoning and traditional browser automation.
 
 **Why use it?**
-If a process is strictly deterministic (e.g., clicking 5 specific buttons to export a report), forcing the LLM to do it step-by-step wastes tokens, takes minutes, and risks hallucination. By bundling a script, the LLM simply calls `run_browser_script({ script_path: "my-skill:scripts/export.js" })` to execute the macro instantly.
+If a process is strictly deterministic (e.g., clicking 5 specific buttons to export a report), forcing the LLM to do it step-by-step wastes tokens, takes minutes, and risks hallucination. By bundling a script, the LLM simply calls `runBrowserScript({ script_path: "my-skill:scripts/export.js" })` to execute the macro instantly.
 
 ### 3.0. Parameters
 
@@ -193,7 +259,7 @@ If a process is strictly deterministic (e.g., clicking 5 specific buttons to exp
 **Example — long-running script with custom timeout:**
 
 ```
-run_browser_script({
+runBrowserScript({
   script_path: "meet-notes:scripts/capture.js",
   args: ["30"],
   timeout: 2100000
@@ -289,7 +355,7 @@ await runtime.releaseHandle(handleId);
 
 > **Design principle — "Smart Skill, Dumb Pipe":** The extension core is a generic transport layer. All domain-specific logic (React Fiber traversal, OpenSeadragon detection, etc.) lives inside the skill's MCP script, not in the extension. This keeps the extension CWS-reviewable and makes skills independently evolvable.
 
-> **Security note:** Both `findHandle` and `evaluateScript` are only available to signature-verified MCP server scripts running inside the MCP sandbox (`sandbox-mcp.html`). The LLM cannot call them directly — they are deliberately omitted from the browser tool set exposed to the agent. The handle acquisition primitives (`acquire_handle`) are likewise gated to the sandbox-runtime path and never appear in `BROWSER_TOOL_NAMES`. This two-layer isolation — LLM → signed sandbox → page — prevents prompt-injection from acquiring handles to arbitrary page state.
+> **Security note:** Both `findHandle` and `evaluateScript` are only available to signature-verified MCP server scripts running inside the MCP sandbox (`sandbox-mcp.html`). The LLM cannot call them directly — they are deliberately omitted from the browser tool set exposed to the agent. The handle acquisition primitives (`acquireHandle`) are likewise gated to the sandbox-runtime path and never appear in `BROWSER_TOOL_NAMES`. This two-layer isolation — LLM → signed sandbox → page — prevents prompt-injection from acquiring handles to arbitrary page state.
 
 ### 3.2 MCP Runtime API Reference
 
@@ -391,7 +457,7 @@ the same `allowed-tools` list.
 
 ---
 
-## 4. Orchestrating Sub-Agents with `run_subtask`
+## 4. Orchestrating Sub-Agents with `runSubtask`
 
 For long-running, repetitive tasks (like iterating over 100s of URLs), doing it in the main conversation thread will quickly overflow the LLM's context window.
 
@@ -409,14 +475,14 @@ for (const url of urlsToCheck) {
   await tools.sleep(2000);
 
   // Spawn an independent LLM agent with its own fresh context window
-  const subtaskRes = await tools.run_subtask({
+  const subtaskRes = await tools.runSubtask({
     goal: `Analyze the current page at ${url}. Find the pricing table and summarize the tiers.`,
     verification_command: "Pricing summary is generated",
     timeoutMs: 120000,
   });
 
   if (subtaskRes && !subtaskRes.isError && subtaskRes.content) {
-    // run_subtask returns an MCP-style result: { content: [{ type: "text", text: "..." }], isError: false }
+    // runSubtask returns an MCP-style result: { content: [{ type: "text", text: "..." }], isError: false }
     // The text field is a JSON string — always parse it
     let summary = "";
     try {
@@ -484,14 +550,14 @@ if (typeof tools.gmail_get_message !== "function") {
 
 1. **Frontmatter (YAML between `---` delimiters)** — Machine-readable configuration consumed by the extension runtime. This declares metadata (`name`, `description`), infrastructure (`mcp-servers`, `allowed-tools`, `url-patterns`), behavior modifiers (`reminders`, `guardrails`), and the skill's callable interface (`runnable`, `parameters`). The extension parser reads this; the LLM does not see raw YAML.
 
-2. **Body (Markdown below the closing `---`)** — LLM-facing instructions injected into the system prompt when the skill is loaded via `read_skill`. This is where you tell the LLM _how_ to use the skill: when to call which scripts, what arguments to pass, what workflow to follow, and what the expected outputs are.
+2. **Body (Markdown below the closing `---`)** — LLM-facing instructions injected into the system prompt when the skill is loaded via `readSkill`. This is where you tell the LLM _how_ to use the skill: when to call which scripts, what arguments to pass, what workflow to follow, and what the expected outputs are.
 
 **The body is written FOR the LLM, not for human developers.** Treat it like a system prompt fragment. Common mistakes:
 
 - ❌ Writing human-oriented documentation (installation steps, prerequisites, architecture diagrams)
 - ❌ Explaining how the MCP server works internally — the LLM doesn't need to know implementation details
 - ❌ Assuming the LLM will remember to call back after a long-running operation — if a workflow takes minutes (e.g., monitoring a live meeting), the script itself must block/poll and handle the full lifecycle
-- ✅ Telling the LLM which scripts to call via `run_browser_script` and with what `args`
+- ✅ Telling the LLM which scripts to call via `runBrowserScript` and with what `args`
 - ✅ Describing the expected return values so the LLM can interpret results
 - ✅ Providing workflow sequences ("first call X, then use the result to call Y")
 - ✅ Noting edge cases the LLM should handle ("if the result has `found: false`, retry with different parameters")
@@ -501,7 +567,7 @@ if (typeof tools.gmail_get_message !== "function") {
 ```markdown
 When the user wants to capture meeting notes, call:
 
-run_browser_script({ script_path: "meet-notes:scripts/capture.js", args: [] })
+runBrowserScript({ script_path: "meet-notes:scripts/capture.js", args: [] })
 
 The script handles the entire lifecycle: starts capture, polls until the meeting
 ends, enriches with calendar data, generates notes via subtask, and creates a
@@ -515,14 +581,14 @@ If it returns `{ success: false }`, report the error to the user.
 
 A Skill is more than a collection of MCP tools and scripts — `runnable` and `parameters` elevate it into a **callable unit** with a named interface. This is what distinguishes a Skill from a raw MCP server:
 
-- **`parameters`** define the skill's input contract — named, typed arguments with descriptions and defaults. When the LLM invokes the skill via `run_browser_script`, it fills these parameters as `args`. When a human invokes via `/skill`, the same parameters are prompted in the UI or passed as `--param` flags. Both paths feed into the same `args[]` array in the script.
+- **`parameters`** define the skill's input contract — named, typed arguments with descriptions and defaults. When the LLM invokes the skill via `runBrowserScript`, it fills these parameters as `args`. When a human invokes via `/skill`, the same parameters are prompted in the UI or passed as `--param` flags. Both paths feed into the same `args[]` array in the script.
 - **`runnable: true`** marks the skill as directly executable. This enables two invocation paths:
-  1. **LLM path**: The LLM reads the SKILL.md body, decides to call `run_browser_script({ script_path: "my-skill:scripts/main.js", args: [...] })`, and passes parameter values as args.
+  1. **LLM path**: The LLM reads the SKILL.md body, decides to call `runBrowserScript({ script_path: "my-skill:scripts/main.js", args: [...] })`, and passes parameter values as args.
   2. **Human path**: The user types `/skill my-skill/scripts/main.js --full-auto` in Koi's input box, bypassing the LLM entirely. Parameter values come from the UI prompt or `--param` flags.
 
 The key insight: **MCP servers expose generic tools (the "hands"). Skills compose those tools into purposeful workflows with a named interface (the "brain").** A `postgres_query` MCP tool is generic; a `db-to-gsheet-report` skill with `parameters: [query, sheetTitle]` is a reusable action.
 
-**Do not** put `/skill` command examples in the SKILL.md body — the LLM will see them and attempt to use `/skill` syntax instead of `run_browser_script`. Document `/skill` usage for human developers in a separate `README.md` or in code comments.
+**Do not** put `/skill` command examples in the SKILL.md body — the LLM will see them and attempt to use `/skill` syntax instead of `runBrowserScript`. Document `/skill` usage for human developers in a separate `README.md` or in code comments.
 
 ---
 
@@ -655,6 +721,29 @@ Koi supports two transport types for MCP servers, declared via `type: "local" | 
 - **Auth:** Uses Chrome's built-in `chrome.identity` (OAuth2).
 - **Best For:** HTTP/REST APIs, SaaS integrations (Google Workspace, Notion, Salesforce).
 
+### 7.2 Remote MCP (`type: "remote"`)
+
+Browsers cannot establish direct TCP/UDP connections (required for databases like PostgreSQL, Redis, or native Git) and cannot run native binaries. Remote MCP solves this by routing requests through the **Koi Gateway**, a WebSocket-to-stdio bridge running on the user's workstation or a backend server.
+
+- **Execution:** The Gateway spawns each MCP server as a child process (stdio transport) and bridges it to the extension over WebSocket (`ws://localhost:<port>/mcp/{serverName}`).
+- **Auth:** Configurable per Gateway via `auth.mode`:
+  - `none` (default) — for **local, single-user development**. The Gateway binds to `127.0.0.1` only and is never reachable from the network. Do not use `none` on a shared or multi-user host.
+  - `sso` — intended for managed deployments (token validated against the corporate IdP). **Token verification is not yet implemented; do not deploy `sso` mode in production.**
+- **Best For:** Databases, sandboxed shell access, LSP code intelligence, local file systems, native binaries.
+
+**SKILL.md Declaration for Remote MCP:**
+
+```yaml
+mcp-servers:
+  - name: postgres-prod
+    type: remote
+    gateway: default # Points to user's configured ws(s):// URL
+    server: postgres # The name of the server configured on the Gateway
+    database: analytics_db
+```
+
+The `database` field is an opaque parameter forwarded to the gateway-side MCP server process. Its interpretation depends on the server implementation (e.g., the PostgreSQL MCP server uses it to select the database to connect to).
+
 ### 7.3 Reusing MCP Servers Across Skills (`skill-ref`)
 
 If multiple skills need the same MCP server (e.g., `google-workspace`), a skill can reference another skill's MCP server instead of bundling its own script:
@@ -667,26 +756,284 @@ mcp-servers:
 
 When `skill-ref` is present, the router looks up the referenced skill and uses its MCP server script. The `script` field is ignored. This avoids duplicating MCP code across skills.
 
-### 7.2 Remote MCP (`type: "remote"`)
+### 7.4 The Koi Gateway
 
-Browsers cannot establish direct TCP/UDP connections (required for databases like PostgreSQL, Redis, or native Git). Remote MCP solves this by routing requests through a WebSocket Gateway.
+The Gateway lives at `tools/gateway/koi-gateway.js` and is configured with a JSON file:
 
-- **Execution:** Runs on a backend server/workstation via a Gateway.
-- **Auth:** The browser sends the user's SSO token to the Gateway. The Gateway validates the identity, loads the actual database credentials from its environment, and spawns the MCP process.
-- **Best For:** Databases, local file systems, native binaries.
+```bash
+cd tools/gateway
+node koi-gateway.js --config gateway-config.json   # [--port 8080]
+```
 
-**SKILL.md Declaration for Remote MCP:**
+```json
+{
+  "port": 8080,
+  "auth": { "mode": "none" },
+  "allowedOrigins": ["chrome-extension://aedfofodkbfgnjknkjpockkgajemkbng"],
+  "servers": {
+    "postgres": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "postgresql://..."
+      ]
+    },
+    "sandbox": {
+      "command": "node",
+      "args": ["./sandbox-shell-mcp.mjs", "--net", "host", "--allow-creds"],
+      "autoBuild": {
+        "dir": "./lsp_search",
+        "check": "dist/index.js",
+        "srcDir": "src",
+        "commands": ["npm install", "npm run build"]
+      }
+    }
+  }
+}
+```
+
+Note that the `sandbox` server **embeds code intelligence**: it spawns the compiled `lsp_search` bundle as its own child and re-exports the navigation tools through the single `/mcp/sandbox` endpoint (see 7.6). That is why the `autoBuild` block for `lsp_search` lives under the `sandbox` entry — the Gateway builds the bundle at startup so the sandbox server can find `lsp_search/dist/index.js` next to itself. You do **not** declare a separate `lsp_search` server for the `sandbox-shell` skill.
+
+Gateway behavior to be aware of:
+
+- **Loopback only.** The Gateway listens on `127.0.0.1` exclusively. Because it fronts arbitrary code execution (the sandbox server), it must never be exposed to the LAN. If you need remote access, tunnel it (e.g., SSH port forwarding) rather than changing the bind address.
+- **Loopback is not "only my browser".** With `auth.mode: "none"`, _any_ process that can reach `127.0.0.1:<port>` can drive the Gateway. Browser pages are filtered by the `allowedOrigins` allowlist (WebSocket upgrades carry an `Origin` header), but non-browser clients send no `Origin` and are accepted — this is what lets the test harness connect. On WSL2 this includes **Windows-side processes**, since Windows forwards `localhost` into the WSL2 VM. Run the Gateway with `auth.mode: "none"` only on a machine where every local process is trusted; on shared hosts, do not run it until token auth is available.
+- **`auth.mode: "sso"` is not implemented.** Token verification is currently a stub; do not deploy `sso` mode in production.
+- **Process reuse (per server).** MCP child processes are kept alive after the extension disconnects and are reattached on reconnect. For the `sandbox` server this does **not** leak overlay state between LLM sessions — the sandbox rotates its overlay per client connection (see 7.5) — but it _does_ mean **background services started by a previous session keep running** (and keep their ports). Check `sandbox_info.services` at the start of a session and stop or restart anything stale. Restart the Gateway for a guaranteed clean slate.
+- **One client at a time per stateful server.** The Gateway multiplexes all WebSocket clients of a server onto one child process and broadcasts its responses to every connected client. The `sandbox` server holds global session state (current project, overlay, session id), so two concurrent clients on `/mcp/sandbox` will corrupt each other's view. Do not open the sandbox skill from two extension windows at once.
+- **`autoBuild`.** A server may declare an `autoBuild` block; the Gateway runs the listed commands at startup when the build output is missing or older than the sources. Set `KOI_REBUILD=1` to force a rebuild. Commands run with your shell and your privileges — only use config files you trust.
+- **Secrets in config.** Avoid inlining credentials (e.g., PostgreSQL passwords) in `gateway-config.json`; prefer environment variables via the per-server `env` block. Remember that the whole host filesystem — including this config file — is _readable inside the sandbox_, so any secret written here is visible to the LLM session.
+
+**Running the Gateway as a service (systemd).** Instead of launching `koi-gateway.js` by hand, install it as a systemd **user** service with the bundled installer — no file editing required. A user service (not a system one) is required: the Gateway spawns the sandbox server as _you_, using your `$HOME`, your overlays under `~/.koi/sandbox`, and your fnm/nvm Node; a root/system unit would use the wrong home and toolchain.
+
+```bash
+cd tools/gateway
+KOI_ALLOW_CREDS=1 ./koi-gateway-installer  # resolve paths + Node, write the unit, enable + start
+```
+
+The installer resolves the gateway directory and a stable Node path (fnm/nvm/system) itself, writes `~/.config/systemd/user/koi-gateway.service` with absolute paths, reloads the user daemon, and enables lingering so the service runs without an active login. After that the standard commands work unchanged:
+
+```bash
+systemctl --user status koi-gateway
+systemctl --user restart koi-gateway    # guaranteed clean slate (kills the sandbox child + its services)
+journalctl --user -u koi-gateway -f
+./koi-gateway-installer uninstall        # stop, disable, remove the unit
+./koi-gateway-installer render           # print the unit without installing (dry run)
+```
+
+The unit runs `run-gateway.sh`, which re-resolves Node at start time (systemd's PATH omits fnm/nvm), so a Node upgrade won't break it. If Node isn't auto-detected, re-run with `KOI_NODE_BIN=/abs/path/to/node ./koi-gateway-installer`. **WSL2:** enable systemd once via `/etc/wsl.conf` (`[boot]` → `systemd=true`) then `wsl --shutdown`; the installer detects a missing systemd user instance and prints this reminder.
+
+### 7.5 Bundled Gateway Server: `sandbox` (Sandboxed Shell + Code Intelligence)
+
+`sandbox-shell-mcp.mjs` gives the LLM session a **shell on the host inside a sandbox**, plus LSP-backed code navigation re-exported from an embedded `lsp_search` child (7.6). It is the backend of the `sandbox-shell` skill.
+
+**Guarantees (Linux `bwrap-overlay` backend):**
+
+| Property         | Behavior                                                                                                                                                                                                                                                                                           |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host filesystem  | Visible **read-only** throughout the sandbox                                                                                                                                                                                                                                                       |
+| Writes           | Land in a per-project, **per-session overlay** (`~/.koi/sandbox/<project-hash>/sessions/<session-id>/`); the real project tree is never mutated                                                                                                                                                    |
+| Session base     | Every new client connection starts each project from a **fresh overlay over the host tree** — the code exactly as the user sees it on disk. A previous session's unshipped edits are never silently inherited                                                                                      |
+| Shipping changes | `git format-patch -o "$KOI_OUTBOX"` exports patches to a host-visible **outbox** at `~/.koi/sandbox/<project-hash>/outbox/` — **project-level, shared by all sessions** of that project, so the patch series survives pruning individual session overlays; you review and apply them with `git am` |
+| Credentials      | Masked paths come **entirely from `--exclude`** — the server has no built-in list (see "Credential masking is configuration" below). The unit written by `koi-gateway-installer` carries the standard set; with no `--exclude`, nothing is masked. The environment is cleared regardless           |
+| `git push`       | Blocked by a git wrapper (a guidance guard — the real protection is credential masking)                                                                                                                                                                                                            |
+| Network          | `--net host` (default): full host network, so dev servers started inside are reachable from the browser at `http://localhost:<port>`. `--net loopback`: fully offline, loopback only inside the sandbox                                                                                            |
+| Services         | Long-running processes (dev servers) are owned by the server via `sandbox_start_service` / `_restart_` / `_stop_` / `_logs`                                                                                                                                                                        |
+| Reset            | `sandbox_reset` wipes the **current session's** overlay back to host state (a host-side operation; exported patches survive; other sessions' overlays are untouched)                                                                                                                               |
+
+**Credential masking is configuration, not code (`--exclude`).** The server ships with **no built-in credential list**. What counts as a secret varies per host and per user, so the entire mask set is passed in with `--exclude` and the server applies exactly what it is given:
+
+```bash
+node sandbox-shell-mcp.mjs --exclude "~/.ssh, ~/.aws, ~/vault/keys.txt"
+node sandbox-shell-mcp.mjs --exclude "~/.ssh" --exclude "~/.aws"   # repeatable
+```
+
+The value is a comma-separated list; `~` and `$HOME` are expanded and bare names resolve against `$HOME`. Each path is classified by what it actually is on disk — directories are masked with a tmpfs, files with a `/dev/null` bind — so you pass paths without caring which mechanism applies. Paths that don't exist on the host are skipped, which is expected for a shared list naming tools that aren't installed everywhere; startup logs a one-line summary (`masking 12 path(s) (34 configured, 22 not present on this host)`). The effective list is always visible at runtime in `sandbox_info.maskedCredentials`.
+
+> ⚠️ **With no `--exclude`, nothing is masked** — host secrets are readable inside the sandbox. The server prints a loud warning at startup in that case. The list is not optional in a real deployment; it just lives in the unit rather than in the source.
+
+The standard set ships as **`tools/gateway/sandbox-exclude.default`** — one path per line, `#` comments allowed. This is the list that used to be hardcoded in the server; edit it to match your host. `koi-gateway-installer` flattens it into the generated unit:
+
+```ini
+[Service]
+Environment=KOI_SANDBOX_EXCLUDE=~/.ssh,~/.aws,~/.config/gh,~/.gnupg,…
+```
+
+`KOI_SANDBOX_EXCLUDE` is the env equivalent of `--exclude`, and the Gateway spawns MCP children with its own environment inherited, so a unit-level `Environment=` reaches the sandbox server. To change the list on a running host, edit `sandbox-exclude.default` and re-run `./koi-gateway-installer` (or override per-server by adding `--exclude` to the `sandbox` entry's `args` in `gateway-config.json`, which takes effect alongside the env value). Either way, restart the service:
+
+```bash
+systemctl --user restart koi-gateway
+```
+
+**Backends by platform:**
+
+- `linux` → bubblewrap (`bwrap`) + overlayfs. Requires `sudo apt install bubblewrap`; on Ubuntu 24.04, the AppArmor unprivileged-userns restriction may need the bwrap profile or `kernel.apparmor_restrict_unprivileged_userns=0`.
+- `darwin` → `sandbox-exec` (seatbelt) + APFS copy-on-write clone of the project. **Weaker isolation than Linux:** host writes are denied, but credential-directory masking is not enforced by the seatbelt profile — a session can read host dotfiles, so "network writes are prevented" holds only as policy, not as a hard guarantee. Prefer the Linux/WSL2 backend for untrusted work.
+- `exec` → **no isolation whatsoever**; dev/test only, opt-in via `KOI_SANDBOX_BACKEND=exec`.
+
+**Project scoping.** The server boots **projectless** and the session opens a project at runtime with `sandbox_open_project({ path })`. The project path only chooses the overlay location and working directory — the whole host stays readable. In particular, **secrets inside the project tree (e.g., `.env` files) are visible to the session**; don't point it at projects containing production credentials. Opening a project also points the embedded code intelligence at it, which starts host-side language servers that may execute the project's build scripts (see the trust note in 7.6) — treat `sandbox_open_project` as "trust this repository".
+
+**Session model (fresh-per-session).** The unit of isolation is the **client connection**: each MCP `initialize` handshake rotates the session id, so every LLM session starts every project from the host tree — the concrete base the user sees — never from a previous session's invisible overlay. Within one session, switching projects and back reuses the same overlay, so in-progress work is not lost. A sandbox session exists to _produce patches_, not to accumulate persistent state: work leaves the sandbox only through the outbox, and the host tree changes only when the user applies those patches.
+
+- `sandbox_open_project({ path })` — fresh overlay for this session (reports `base: FRESH` the first time, `CONTINUING` on re-open within the session).
+- `sandbox_open_project({ path, resume: "<session-id-or-label>" })` (or `resume: true` for the most recent) — deliberately reattach a _previous_ session's overlay; prior sessions (with labels) are listed in `sandbox_info.priorSessions`. A label resolves to the most recently used overlay tagged with it.
+- `sandbox_open_project({ path, label: "<tag>" })` — pin a human-readable tag on the session's overlay, resumable later by that tag. Long-running integrations use this: the autonomous coding runner (`code-topic` skill) labels its overlay with the topic id so any later worker session — or you, via the `review` CLI (7.7) — can find it without carrying raw timestamp session ids around.
+- `sandbox_open_project({ path, fresh: true })` — force a brand-new overlay mid-session.
+- `KOI_SANDBOX_PERSIST=1` on the server restores the legacy always-resume behavior.
+
+**Disk retention.** Prior-session overlays are kept on disk (that is what makes `resume` possible) and are **never garbage-collected automatically**. Overlays that contain build artifacts (`node_modules/`, `target/`) can be large. Prune old sessions periodically by deleting `~/.koi/sandbox/<project-hash>/sessions/<session-id>/` — since the outbox is project-level, pruning a session overlay **does not** destroy its exported patch series (an autonomous topic can even rebuild a pruned overlay by `git am`-ing the outbox into a new one). Deleting the whole `<project-hash>` directory forgets the project **including its outbox** — export or apply any patches you care about first. The state base also holds a tiny `current.json` pointer (which project/session the live server is attached to, consumed by the `review` CLI, 7.7); it is rewritten on every `sandbox_open_project` and safe to delete.
+
+**Network caveat (`--net host`).** Host networking is what lets the browser open dev servers started inside the sandbox — but it also means the session can reach **every service listening on your machine** (databases, Docker APIs, internal dashboards) using any credentials it can read from the host tree. If you don't need browser verification, run with `--net loopback`.
+
+**Applying results.** Exported patches in the outbox are the _only_ channel from the sandbox to your host tree, and they are inert until you apply them. **Review patches before running `git am`** — treat them as untrusted input, exactly like a pull request.
+
+### 7.6 Code Intelligence (embedded `lsp_search`)
+
+The `lsp_search` component provides code navigation over **three tiers**, all re-exported through the same `/mcp/sandbox` endpoint. It is **spawned and owned by the sandbox server** — there is no separate server to configure and the session never calls `set_workspace`; `sandbox_open_project` points the workspace automatically.
+
+| Tier           | Backed by                    | Knows                                        | Costs                                             |
+| -------------- | ---------------------------- | -------------------------------------------- | ------------------------------------------------- |
+| **semantic**   | real language servers        | `User` here is the same type as `User` there | a language server, a resolvable project, indexing |
+| **structural** | tree-sitter (`ast-grep` CLI) | where the `User` declaration starts and ends | a parse — milliseconds, no index                  |
+| **text**       | ripgrep (`rg`)               | nothing; every occurrence of a string        | a walk of the tree                                |
+
+The tiers are complementary, not ranked: LSP is the brain, tree-sitter is the eyes. `search` walks them in order and hides which one answered, so a cold rust-analyzer or an unbuildable project degrades to a parsed answer instead of no answer. The structural tools are also exposed directly, because "give me exactly this function and nothing else" is a question only tree-sitter can answer — and it is how a session inspects a symbol in a 3,000-line file without spending the context window on the file.
+
+| Tool                  | Purpose                                                   |
+| --------------------- | --------------------------------------------------------- |
+| `search`              | Symbol, structure, or text search — walks all three tiers |
+| `get_references`      | All usages of a symbol at a position                      |
+| `get_hover`           | Type/signature/docs at a position                         |
+| `get_implementation`  | Interface/trait implementations                           |
+| `get_file_structure`  | File outline                                              |
+| `get_lsp_diagnostics` | Compiler errors for a file                                |
+| `search_ast`          | Structural pattern search (tree-sitter)                   |
+| `read_ast_node`       | Read one declaration with exact boundaries (tree-sitter)  |
+
+**Structural tools.** `search_ast` matches a code _shape_ rather than a name — `console.log($$$ARGS)`, `fn $N($$$) -> Result<$OK, $ERR> { $$$ }` — where `$VAR` captures one node and `$$$ARGS` captures a run of them; inline ast-grep rule YAML covers relational queries (`inside`, `has`). `read_ast_node({ file_path, name, node_type? })` returns one declaration's exact `start_line`/`end_line` and source, which is also how a session gets trustworthy patch context: read the node, then hand it to `sandbox_apply_patch` instead of hand-counting context lines. Both read through the overlay, so they see the session's unshipped edits, including files that exist only in the overlay. Both are read-only: `ast-grep --update-all` would rewrite the host tree behind the language servers' backs, so it is exposed nowhere and the `sandbox-shell` guardrail blocks it in the shell too.
+
+**Edit visibility (editor-style document sync).** The sandbox mirrors every `sandbox_write_file` / `sandbox_apply_patch` into the language servers as in-session buffers (`didOpen`/`didChange`), and text search reads through the same buffers. Code-intelligence results therefore **reflect the session's unshipped overlay edits**, not just the on-disk host tree. Known limits:
+
+- Files changed by **shell commands inside the sandbox** (`sed -i`, codegen steps, `git checkout` / `git stash` restoring tracked files) are _not_ mirrored — only the write/patch tools sync. After such operations, the compiler (`cargo check`, `tsc --noEmit`, `npm test` via `sandbox_exec`) is ground truth.
+- Buffers are cleared when the workspace switches. After switching to another project and back within one session, code intelligence reflects the host tree again even though the overlay still holds your edits — re-verify with the compiler or re-apply edits through the write/patch tools if precise navigation over them matters.
+- `sync_document` / `close_document` / `sync_reset` appear in the tool list but are internal plumbing called by the sandbox server; LLM sessions should not call them directly (they can desynchronize code intelligence from the overlay).
+
+Notes:
+
+- Every backend is **optional and degrades independently**: no language server means the semantic tier is skipped, no `ast-grep` means the structural tier and its two tools are skipped, no `rg` means the text tier is skipped. The server logs install hints for what it cannot find at startup, `sandbox_open_project`'s response reports `codeIntelligence.available`, and the structural tools return install instructions rather than a bare failure.
+
+**Host prerequisites — you install these yourself.**
+
+None of the tools below are installed for you. `koi-gateway-installer` writes a systemd unit and nothing else: it does not add packages, touch your global npm/pip/cargo prefixes, or run `apt`. These are your OS and toolchain, and which ones you want depends on what you work on, so the choice stays yours.
+
+```bash
+# Text tier
+sudo apt install ripgrep                 # or: brew install ripgrep / cargo install ripgrep
+
+# Structural tier (tree-sitter)
+npm install -g @ast-grep/cli             # or: brew install ast-grep / cargo install ast-grep --locked
+
+# Semantic tier — install only the languages you use
+pip install python-lsp-server[all]                    # Python
+npm install -g typescript-language-server typescript  # JS/TS
+rustup component add rust-analyzer                    # Rust
+go install golang.org/x/tools/gopls@latest            # Go
+sudo apt install clangd                               # C/C++  (or: brew install llvm)
+```
+
+Restart the Gateway after installing anything (`systemctl --user restart koi-gateway`) — capability detection runs at startup. Prefer the `ast-grep` binary name over its `sg` alias: on Linux `sg` is also shadow-utils' setgid shell.
+
+**Where the Gateway looks for them.** A systemd _user service_ does not read your shell profile; it inherits the user manager's PATH, which on a stock Ubuntu is:
+
+```
+/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+```
+
+Every per-user toolchain directory is missing from that list — `rustup` installs to `~/.cargo/bin`, `go install` to `~/go/bin`, `pip --user` to `~/.local/bin`, and nvm/fnm/volta put npm's global binaries beside the versioned node binary. So a language server that works perfectly in your terminal can be completely invisible to the service, which surfaces as `Could not start LSP for <language>` with no other explanation.
+
+`lsp_search` therefore does not trust the inherited PATH. It also searches the standard per-user toolchain directories, and passes the widened PATH to the servers it spawns — necessary because rust-analyzer shells out to `cargo` and gopls to `go`, which live in those same directories. Startup logs list every tool it resolved and the absolute path it found:
+
+```
+[Search MCP] Host tools:
+[Search MCP]   ✓ rg: /usr/bin/rg
+[Search MCP]   ✓ rust-analyzer: /home/you/.cargo/bin/rust-analyzer
+[Search MCP]   ✗ gopls
+```
+
+Two overrides, both opt-in:
+
+| Variable                   | Effect                                                        |
+| -------------------------- | ------------------------------------------------------------- |
+| `KOI_TOOL_PATH=/opt/x/bin` | Prepended to the search path; wins over everything else       |
+| `KOI_TOOL_PATH_AUGMENT=0`  | Disable augmentation entirely and use only the inherited PATH |
+
+This widens where the Gateway looks. It does not modify your environment, install anything, or affect other services.
+
+- The child runs with `SEARCH_MCP_READONLY=1`, which removes the `search_and_replace` tool so no code-intelligence tool can write to the real host tree; all mutations flow through the sandbox overlay and leave only as patches.
+- **Trust note:** language servers run _unsandboxed on the host_ and some execute project-provided code while indexing (e.g., rust-analyzer runs Cargo build scripts and proc macros). Because `sandbox_open_project` drives the workspace, opening a project implies trusting that repository's build scripts on the host.
+- `lsp_search` can also be deployed as a standalone Gateway server (its own `/mcp/lsp_search` endpoint with an LLM-visible `set_workspace` tool) for skills that want navigation without the sandbox; keep `SEARCH_MCP_READONLY=1` set in that configuration too. The bundled `sandbox-shell` skill does **not** use this mode.
+
+### 7.7 Watching It Work: Host-Side Live Review (the `review` CLI)
+
+Everything an LLM session writes lands in its overlay — invisible in your real
+tree until you apply exported patches. The `review` CLI opens a **read-only
+window onto that overlay while the session is still running**: `git log` /
+`show` / `diff` / `status` over the merged view (host tree + the session's
+unshipped edits), from any host terminal. Use it to watch an interactive
+sandbox session or an autonomous coding run (the `code-topic` skill) commit
+by commit, instead of waiting for the outbox.
+
+```bash
+cd tools/gateway
+
+node sandbox-shell-mcp.mjs review              # snapshot: log --oneline, status -sb, diff --stat
+node sandbox-shell-mcp.mjs review --watch      # live view; -n <sec> to change the 3s refresh
+node sandbox-shell-mcp.mjs review log -p -1    # any git args pass through to the merged view
+node sandbox-shell-mcp.mjs review show HEAD
+node sandbox-shell-mcp.mjs review diff HEAD~1
+node sandbox-shell-mcp.mjs review outbox       # exported patch series so far + ready `git am` line
+node sandbox-shell-mcp.mjs review --help
+```
+
+**Target selection.** By default it follows the live server's current
+project/session via the `current.json` pointer (see _Disk retention_, 7.5),
+re-resolving on every `--watch` tick so it tracks a mid-run session rotation.
+To pin a specific overlay, pass `--session <session-id-or-label>` — coding
+topics label their overlay with the topic id (7.5). The server is not
+required: `--project <dir>` inspects any project's leftover overlays cold
+(most recent session wins), which is also how you audit an old session before
+pruning it. Add `--state <dir>` if the sandbox runs with a non-default state
+base. `sandbox_info` and `sandbox_open_project` responses include the exact
+command as `reviewCommand`, and coding topics carry it in their continuity
+ledger, so it reaches you with the run's findings.
+
+**Why it is safe while a worker is mid-command.** The CLI never touches the
+running server or its writable mounts. Each invocation (and each watch tick)
+builds its own **read-only** overlay via `bwrap --ro-overlay`, using the
+session's upperdir purely as a lower layer, and runs git with
+`--no-optional-locks` so even `status`/`diff` write nothing. It structurally
+cannot dirty the overlay; the worst race against a mid-write worker is a
+momentarily inconsistent view that corrects itself on the next refresh.
+
+Requirements match the sandbox itself: Linux needs bwrap with overlay support
+(the same preflight as 7.5); on macOS the CLI simply runs git in the
+session's copy-on-write workspace clone. It runs as your user, host-side —
+it is a convenience window for you, not a channel available to the session.
+
+### 7.8 Using the Gateway from a Skill: `sandbox-shell`
+
+The bundled `sandbox-shell` skill declares the single merged server:
 
 ```yaml
 mcp-servers:
-  - name: postgres-prod
+  - name: sandbox
     type: remote
-    gateway: default # Points to user's configured wss:// URL
-    server: postgres # The name of the server configured on the Gateway
-    database: analytics_db
+    gateway: default
+    server: sandbox
 ```
 
-The `database` field is an opaque parameter forwarded to the gateway-side MCP server process. Its interpretation depends on the server implementation (e.g., the PostgreSQL MCP server uses it to select the database to connect to).
+The workflow the skill teaches the LLM: `sandbox_info` → `sandbox_open_project` (one call — sets the shell/overlay scope _and_ the code-intelligence workspace) → navigate with `search` / `get_references` / `get_hover`, reading individual declarations with `read_ast_node` rather than whole files → edit with `sandbox_apply_patch` / `sandbox_write_file` (mirrored into code intelligence) → build/test with `sandbox_exec` → checkpoint with in-overlay `git commit` → ship with `git format-patch -o "$KOI_OUTBOX"` → **you review** the patches in the outbox and apply them with `git am`. The host tree is only ever changed by **you**, applying exported patches; every new session starts again from that host tree. At any point during the session you can watch the overlay's commits and diffs live from a host terminal with the `review` CLI (7.7).
 
 ## → [Full LLM Configuration guide](./configuration.md)
 
@@ -708,7 +1055,7 @@ tool's tier (see §3.2 for declaring tiers on MCP tools):
   the legacy whitelist behaviour: `allowed-tools` membership grants
   pass-through, otherwise the user is prompted.
 
-### 8.2 Skill Script Execution (`run_browser_script`)
+### 8.2 Skill Script Execution (`runBrowserScript`)
 
 When a script runs, prompting the user 100 times in a `for` loop is bad UX. Instead, Koi uses an **Approval State** tied to the specific script run.
 
@@ -745,7 +1092,7 @@ reminders:
   - id: "test-tool-trigger"
     trigger:
       type: "tool_call"
-      toolName: "run_browser_script"
+      toolName: "runBrowserScript"
     content: "SYSTEM OVERRIDE: You just called a tool. Output exactly this string: 'TOOL_TRIGGER_VERIFIED_OK'"
     strategy: "one_shot"
     priority: "high"
@@ -799,7 +1146,7 @@ A pre-send hook is a deterministic, agent-side check that runs **before** the us
 pre-send-hook: scripts/pre_send.js
 ```
 
-**Hook signature.** The hook is a sandboxed script — same execution environment as `analyze.js` and other `run_browser_script` scripts. It receives the user's draft text as `args[0]` and can call any tool the skill has access to (including its own MCP tools, so it can read module-scope state set by other scripts).
+**Hook signature.** The hook is a sandboxed script — same execution environment as `analyze.js` and other `runBrowserScript` scripts. It receives the user's draft text as `args[0]` and can call any tool the skill has access to (including its own MCP tools, so it can read module-scope state set by other scripts).
 
 It returns either:
 
@@ -866,22 +1213,22 @@ For corporate and enterprise usage, Koi enforces strict cryptographic and isolat
 
 1. **Signature Verification:** In managed environments, Skills (the entire folder contents) must be signed. The Extension verifies the SHA-256 content hashes against an IT-provisioned public key before loading the skill.
 2. **Execution Isolation:** Skill scripts (`scripts/*.js`) run in `sandbox-impl.html` and local MCP servers (`mcp/*.js`) run in `sandbox-mcp.html` — two separate sandboxed iframes. Both have a `sandbox allow-scripts allow-forms allow-popups allow-modals` CSP policy. Neither has access to `chrome.*` extension APIs or the background DOM. MCP scripts receive the `runtime.*` API; skill scripts receive the `tools.*` API.
-3. **Privilege Separation:** The LLM cannot call `evaluate_script` directly. Only signed MCP server scripts (running in `sandbox-mcp.html`) can call `runtime.evaluateScript()` to execute JavaScript on target webpages. This two-layer isolation — LLM → sandbox → page — prevents prompt-injection XSS attacks.
+3. **Privilege Separation:** The LLM cannot call `evaluateScript` directly. Only signed MCP server scripts (running in `sandbox-mcp.html`) can call `runtime.evaluateScript()` to execute JavaScript on target webpages. This two-layer isolation — LLM → sandbox → page — prevents prompt-injection XSS attacks.
 
 ## Appendix: SKILL.md Frontmatter Reference
 
-| Field           | Type    | Required | Description                                                                                                                                           |
-| --------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string  | ✅       | Skill identifier. Lowercase alphanumeric and hyphens only (e.g. `my-skill`).                                                                          |
-| `description`   | string  | ✅       | One-line description shown in the Skills UI and injected into the LLM system prompt.                                                                  |
-| `runnable`      | boolean |          | If `true`, the skill is directly executable — both by the LLM via `run_browser_script` and by humans via `/skill` in the input box. Default: `false`. |
-| `parameters`    | list    |          | Parameters the LLM should fill when invoking the skill. Each entry: `name`, `description`, `required`, `default`.                                     |
-| `allowed-tools` | list    |          | Tools the LLM may call when this skill is active. Also controls which tools are available to skill scripts.                                           |
-| `url-patterns`  | list    |          | Glob patterns (e.g. `https://mail.google.com/*`). If the active tab matches, the skill is auto-loaded.                                                |
-| `mcp-servers`   | list    |          | MCP server declarations. See Sections 5–6 for full syntax.                                                                                            |
-| `reminders`     | list    |          | System prompt reminder rules. See [reminder guide](./system_reminder.md).                                                                             |
-| `guardrails`    | string  |          | Path to a guardrail script (e.g. `scripts/guardrail.js`) or inline JS. See [guardrails guide](./guardrails_api.md).                                   |
-| `pre-send-hook` | string  |          | Path to a script (e.g. `scripts/pre_send.js`) that runs before each user-message send. Can block the send with a user-facing message. See §9.3.       |
-| `prerequisites` | list    |          | User-facing checklist shown in the Run dialog before skill execution. Each entry is a plain-text instruction (e.g. `"Enable Closed Captions (CC)"`).  |
+| Field           | Type    | Required | Description                                                                                                                                          |
+| --------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`          | string  | ✅       | Skill identifier. Lowercase alphanumeric and hyphens only (e.g. `my-skill`).                                                                         |
+| `description`   | string  | ✅       | One-line description shown in the Skills UI and injected into the LLM system prompt.                                                                 |
+| `runnable`      | boolean |          | If `true`, the skill is directly executable — both by the LLM via `runBrowserScript` and by humans via `/skill` in the input box. Default: `false`.  |
+| `parameters`    | list    |          | Parameters the LLM should fill when invoking the skill. Each entry: `name`, `description`, `required`, `default`.                                    |
+| `allowed-tools` | list    |          | Tools the LLM may call when this skill is active. Also controls which tools are available to skill scripts.                                          |
+| `url-patterns`  | list    |          | Glob patterns (e.g. `https://mail.google.com/*`). If the active tab matches, the skill is auto-loaded.                                               |
+| `mcp-servers`   | list    |          | MCP server declarations. See Sections 5–6 for full syntax.                                                                                           |
+| `reminders`     | list    |          | System prompt reminder rules. See [reminder guide](./system_reminder.md).                                                                            |
+| `guardrails`    | string  |          | Path to a guardrail script (e.g. `scripts/guardrail.js`) or inline JS. See [guardrails guide](./guardrails_api.md).                                  |
+| `pre-send-hook` | string  |          | Path to a script (e.g. `scripts/pre_send.js`) that runs before each user-message send. Can block the send with a user-facing message. See §9.3.      |
+| `prerequisites` | list    |          | User-facing checklist shown in the Run dialog before skill execution. Each entry is a plain-text instruction (e.g. `"Enable Closed Captions (CC)"`). |
 
 > **Note:** `version` and `license` fields can appear in frontmatter (see the `postgresql` skill example) and are stored in the skill data, but they are not extracted or validated by the YAML parser (`skill-parser.ts`). They are passed through only when the install pipeline stores them (e.g., bundled install in `background/index.ts`).

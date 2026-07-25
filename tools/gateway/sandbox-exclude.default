@@ -1,0 +1,66 @@
+# sandbox-exclude.default — credential/secret paths masked inside the sandbox.
+#
+# This is the list that used to be hardcoded in sandbox-shell-mcp.mjs. The server
+# no longer has any built-in list: it masks exactly what --exclude gives it, so
+# the policy lives here, in the deployment layer, where you can edit it without
+# touching code.
+#
+# Consumed by koi-gateway-installer, which flattens it into the systemd unit as
+#   Environment=KOI_SANDBOX_EXCLUDE=<comma-separated list>
+#
+# Format: one path per line. `#` comments and blank lines ignored. `~` and $HOME
+# are expanded; bare names resolve against $HOME. Paths that don't exist on this
+# host are skipped at startup. Directories are masked with a tmpfs, files with a
+# /dev/null bind — the server classifies each path by what it is on disk.
+#
+# NOTE: directories are masked wholesale only where that cannot break a build
+# toolchain. ~/.cargo is deliberately NOT listed as a directory (it holds rustup
+# shims and the registry cache); only its credential files are listed.
+
+# --- SSH / cloud / infra ---
+~/.ssh
+~/.aws
+~/.config/gh
+~/.docker
+~/.kube
+~/.gnupg
+~/.config/gcloud
+~/.azure
+~/.terraform.d
+
+# --- password / keyring stores ---
+~/.password-store              # pass(1) store
+~/.local/share/keyrings        # gnome-keyring / libsecret
+
+# --- browser profiles (cookies / sessions) ---
+~/.mozilla
+~/.config/google-chrome
+~/.config/chromium
+
+# --- ML API tokens ---
+~/.kaggle
+~/.huggingface
+~/.config/huggingface
+
+# --- package registry / VCS credential files ---
+~/.netrc
+~/.npmrc
+~/.git-credentials
+~/.pypirc
+~/.cargo/credentials           # crates.io tokens
+~/.cargo/credentials.toml
+~/.gem/credentials             # rubygems API key
+~/.m2/settings.xml             # maven repo creds
+~/.gradle/gradle.properties    # gradle repo creds
+~/.config/pip/pip.conf         # may embed index-url creds
+~/.pip/pip.conf
+~/.config/hub                  # github hub
+~/.composer/auth.json          # packagist
+
+# --- database passwords ---
+~/.pgpass
+~/.my.cnf
+
+# --- shell history (often holds pasted secrets) ---
+~/.bash_history
+~/.zsh_history
