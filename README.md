@@ -1,134 +1,148 @@
-# Koi™ Assistant - The Enterprise Browser AI Agent
+# Koi™ Assistant — works in your browser, the way you do
 
 _Koi™ brings peace to your mind_
 
----
-
-## What is Koi™?
-
-**Koi™** is a privacy-first, provider-agnostic, [enterprise-grade](./docs/enterprise-data-security.md) browser AI agent designed to bridge the gap between static LLM chat and real-world browser automation. Unlike autonomous bots that operate unsupervised, Koi™ acts as a sophisticated **Co-Pilot**, treating the web page as a collaborative workspace where the AI observes, suggests, and executes through a secure, sandboxed skill system.
-
-### 'Out of Box' Use Cases
-
-- **Personal Office Assistant**: Read Docs, Email, Slides, Sheets, and Calendars from Google Workspace & Microsoft 365.
-- **Meeting Notes**: Capture notes on lengthy Google Meets with zero LLM token consumption; the AI then summarizes them automatically for your review.
-- **Thousand-Page PDFs**: Intelligently load and search-read any PDF document, whether it is a local file or an online doc.
-- **Visual Discussion & Annotation:** Capture any on-screen region using `CTRL + Mouse Select` to start a grounded, bi-directional conversation where both you and the AI can draw rectangles, arrows, and text directly over the UI.
-
-### Extensibility with 'Skills and MCPs in a Sandbox'
-
-- **Smart Dashboards:** Query enterprise PostgreSQL databases, let the AI analyze results, and automatically export reports into formatted Google Sheets.
-- **Per-Page Browser Automation with JS:** Write your own JavaScript skills to control web pages and automate workflows with **deterministic** precision, low cost, and maximum security.
-- **Event Triggered Automation:** Program your skill to [watch for](./skills/wait-for-demo/) asynchronous events, then launch sub-agents in a [for loop](./skills/gmail-summarizer/scripts/analyze.js) to handle workflows automatically.
-
-[![Summarize an Outlook email with PDF, Word, and PNG attachments](https://img.youtube.com/vi/WOCZ1AfRJ5E/0.jpg)](https://youtu.be/WOCZ1AfRJ5E)
+[Add to Chrome](https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng) · [rollingdell.com](https://rollingdell.com)
 
 ---
 
-## The Philosophy: The Browser as the Enterprise OS
+Koi works alongside you, on the page you are looking at. You watch every step as it happens, point at what you mean, and take over whenever you want. It acts through your own browser session — the accounts you are already signed into — so it can reach everything you can reach, and nothing you cannot.
 
-To realize the true ROI of AI in the enterprise, we must shift our perspective on where automation lives. Most organizations attempt to bolt AI onto their operations using detached cloud bots or developer-centric command-line tools. These approaches consistently fail to scale across business units because they fundamentally misunderstand how enterprise work gets done, how data is secured, and who holds liability.
+Show it a task once and it can repeat that task on its own, forever. No coding required.
 
-**Koi™ is built on a different strategic vision:**
+- **Works on what you see.** Point at a chart, a slide, a scan — you and the AI look at the same screen.
+- **Uses your own credentials.** No service accounts, no shared passwords, no new access to grant.
+- **No data upload.** Documents and pages stay in your browser.
 
-1. **The Accountability Mandate (Human-in-the-Loop):**
-   Machines cannot be held accountable. When an automated workflow modifies a financial record or executes a database write, enterprises require human supervision. Koi™ inherently provides the visual context for a human to review proposed actions. Because execution happens in the browser, final approval is tied to the user's SSO credential, maintaining a perfect, auditable trail of liability.
+---
 
-2. **The Cloud Bot Problem (Identity & Access):**
-   Cloud-based batch automation (like Playwright grids) struggles with granular, role-based access control (RBAC). A detached bot operates blindly, creating massive compliance vulnerabilities. Koi™ operates on the edge as a browser extension, natively inheriting the user's existing, authenticated SSO state. The AI only accesses what the human is explicitly authorized to see.
+## You and the AI, on the same screen
 
-3. **The CLI Disconnect (Workflow Integration):**
-   Command-line tools isolate automation to engineering teams. For Sales, Finance, HR, and Operations, the browser's UI layer is where workflows already exist. By placing the AI agent directly in the browser, Koi™ democratizes automation, bridging the gap between underlying API data and the visual interface business users require.
+Most AI agents run somewhere else. They log into a copy of your accounts with credentials you had to hand over, do the work out of sight, and hand you a result you have no way to check. Koi does the opposite.
 
-4. **Zero Data Exfiltration (Enterprise Security):**
-   Koi™ operates as a standalone edge orchestrator. Sessions persist locally in IndexedDB, and configuration lives in `chrome.storage.local`. Data moves directly from your internal APIs to your local browser sandbox, and then to your destination apps. Nothing leaves your machine except the necessary LLM prompts. If you utilize an on-premise LLM server, you control the entire data path.
-
-► [Air-Gapped Enterprise AI](https://www.youtube.com/watch?v=oyxBI8R7hWk) — Watch Koi orchestrate a 14-page document analysis using an on-premise LLM server, keeping 100% of the data behind the firewall.
-
-- [Full product definition doc](./PRODUCT.md)
-
-### Gentle, Non-Intrusive Guidance
-
-Koi™ is designed to be a Co-Pilot, not a runaway bot. When navigating complex web applications, Koi™ doesn't just hijack your mouse; it gently highlights elements on the page with clear, context-aware tooltips, ensuring you remain in control of the workflow.
+**Visual, and interactive.** Hold `Ctrl` and drag to circle anything on the page — a region of a scan, a column of a dashboard, a corner of a diagram — and ask about it. The captured region stays pinned over the page at its original position, and the AI draws back: boxes, arrows, notes, directly on the image. You can interrupt, correct, or take the keyboard at any point.
 
 <div align="center">
   <img src="./docs/visual-help-1.png" width="48%" alt="User asking for help in Model Studio">
-  <img src="./docs/visual-help-2.png" width="48%" alt="Koi Assistant gently highlighting the exact button to click">
+  <img src="./docs/visual-help-2.png" width="48%" alt="Koi Assistant highlighting the exact button to click">
   <br>
-  <em>The agent analyzes the page and provides a non-intrusive visual overlay to guide your next action.</em>
+  <em>Koi does not hijack your mouse. It highlights the next step and lets you take it.</em>
 </div>
 
-#### Watch Koi™ Be a Simple Browser AI Assistant
-
-Ask questions on multiple open tabs:
-
-[![multiple tabs demo](https://img.youtube.com/vi/P_UsVpNwpXA/0.jpg)](https://youtu.be/P_UsVpNwpXA)
-
-Breeze through 1,299-page tech spec pdf with ease:
-
-[![1000 page pdf demo](https://img.youtube.com/vi/TIox-X4Tw4g/0.jpg)](https://youtu.be/TIox-X4Tw4g)
-
-Take your personal meeting note:
-
-[![Google Meet note demo](https://img.youtube.com/vi/O2-2u8NG9_Q/0.jpg)](https://youtu.be/O2-2u8NG9_Q)
+**Your credentials, never copied.** Koi acts inside browser sessions you have already opened. There is no password to share, no service account to provision, no API token sitting in someone's cloud. It inherits exactly your access — including SSO and two-factor — and every action traces back to you, not a bot.
 
 ---
 
-## Quick Start
+## It already knows the tools you live in
 
-1. Install the Koi™ extension from [Chrome Web Store](https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng)
-2. Click the Koi icon → open the side panel → enter your LLM API key (in enterprise setup, this is [managed](./docs/enterprise-deployment.md) by IT)
-3. Open any web page, press `CTRL + Mouse Select` to capture a region, ask your question
+Google Workspace and Microsoft 365 out of the box — read and write mail, documents, calendars and spreadsheets. Chat and meetings. Diagrams. Nothing to configure, nothing to connect: if you can see it in your browser, it can work with it.
 
-**Supported LLM providers:** Google Gemini, Anthropic (Claude), OpenAI, OpenRouter (access to Claude, DeepSeek, Kimi, Grok, and more), or connect to a local model via Llama.cpp / vLLM / MLX.
+|                                                       |                                                                                                                                                                            |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [**Gmail**](./skills/gmail-summarizer)                | Summarize a crowded inbox, draft replies, pull the action items out of a long thread. → [video](https://youtu.be/StrJt2bpy8o)                                              |
+| [**Outlook & Microsoft 365**](./skills/microsoft-365) | Read an email together with its PDF, Word and image attachments, then answer questions about all of it. → [video](https://youtu.be/WOCZ1AfRJ5E)                            |
+| [**Diagrams**](./skills/drawio-live)                  | Edit a diagram side by side with the AI on a shared draw.io canvas — it moves the boxes, you steer. → [video](https://youtu.be/s1iDvgQNNjo)                                |
+| [**Slack**](./skills/slack)                           | Catch up on a channel you have been ignoring for a week and get a summary you can paste back. → [video](https://youtu.be/9kGmSzSxzDw)                                      |
+| [**Meeting notes**](./skills/google-meet-note)        | Live notes from a [Google Meet](https://youtu.be/O2-2u8NG9_Q) or [Zoom](./skills/zoom-meeting-notes) call, taken from the captions — no recording bot, no per-minute cost. |
+| [**Reports in Sheets**](./skills/db-to-gsheet-report) | Query an internal database and write the formatted result straight into a spreadsheet. → [video](https://youtu.be/u_jCS6eENaQ)                                             |
 
-> **Getting Your API Key:**
-> Koi™ requires an LLM API key to function. If you choose to use Google Gemini, you will need to generate a key via Google Cloud.
->
-> _Tip: If you are new to Google Cloud, Google currently offers a $300 free credit for new accounts to explore their APIs. You can check your eligibility and sign up from their website._
-
-→ [Full Configuration Guide](./docs/configuration.md)
+You can also just ask questions across every tab you have open. → [video](https://youtu.be/P_UsVpNwpXA)
 
 ---
 
-## Key Capabilities
+## Show it once. It writes the automation itself.
 
-### 1. Visual Discussion Mode — Point, Capture, Discuss
+Turn on recording and do the task the way you normally would. Koi watches, then writes the code to do it again — and, crucially, tests that code against the real website, watches it fail, and fixes it until it passes. What you get back is a button you can press, not a script you have to babysit. It keeps improving each time you use it.
 
-`CTRL + Mouse Select` anywhere on any page:
+Small automations combine into bigger ones. Once you have a few, you can chain them into a single workflow without rebuilding anything.
 
-```
-┌───────────────────────────────────────┐
-│ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-│ ░░┌────────────────────┐░░░░░░░░░░░░░ │
-│ ░░│ CAPTURED REGION    │░░░░░░░░░░░░░ │  "What's wrong with this form?"
-│ ░░│  [LLM annotations] │░░░░░░░░░░░░░ │
-│ ░░└────────────────────┘░░░░░░░░░░░░░ │
-│ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-└───────────────────────────────────────┘
-```
+- **[Flight search, taught in one sitting](https://youtu.be/IRM9zQT2aVQ)** — search Delta once by hand; the AI writes the automation, tests it live, fixes what breaks, and hands back a reusable flight-search tool.
+- **[Product research, taught in one sitting](https://youtu.be/0JCELK4EjrI)** — the same recording-to-automation flow on Amazon, including pulling structured details out of every result.
 
-The captured region is displayed as an overlay on the page at its original position. Both you and the LLM can annotate it with rectangles, arrows, and text. The overlay persists until you dismiss it, keeping the conversation grounded in what you're looking at. An image stack in the side panel preserves visual history across turns.
+---
 
-#### Watch Koi™ Working on a 7.5 Billion-pixel Pathology Image
+## Give it a goal and walk away
 
-[![Watch OpenSeadragon demo](https://img.youtube.com/vi/UlqHjMf5eUc/0.jpg)](https://youtu.be/UlqHjMf5eUc)
+Most assistants forget everything once the conversation gets too long. Koi starts a fresh session, carries its notes forward, and keeps working — for hours if needed. You set a spending limit up front; it stops when the job is done or the budget runs out, and tells you which.
 
-### 2. Skills System — Extend What the Agent Can Do
+- **[One goal, many sessions](https://youtu.be/DOsQnwdI1F4)** — hand over an open-ended task in plain English and let it run. ([topic-runner](./skills/topic-runner))
+- **[Building a working web app](https://youtu.be/NjI4QV28FhM)** — pointed at a folder on your own machine, it reads the code, writes changes, runs the tests and iterates, unattended. ([code-topic](./skills/code-topic))
 
-Skills are self-contained capability packages. Drop a folder, load it, and the AI gains new tools:
+Under the hood this is `runSubtask`: an independent sub-agent with its own fresh context window does the heavy lifting and returns only the result. A `for` loop in an automation can spawn hundreds of them — one per URL, one per row — without ever overflowing the main conversation.
+
+---
+
+## Documents and images too big to read
+
+Thousand-page PDFs. Hundred-megabyte log files. Medical and satellite imagery measured in billions of pixels. Koi works through them in the browser and shows you where the answer came from, so you can check it.
+
+- **[A 1,000-page specification](https://youtu.be/olRSIcH5c1w)** — ask a question against the whole document, get the answer with the page it came from.
+- **[A 1,299-page hardware spec](https://youtu.be/TIox-X4Tw4g)** — the kind of document an engineer loses a day to, answered without uploading it anywhere.
+- **[A 7.5-billion-pixel image](https://youtu.be/UlqHjMf5eUc)** — pan and zoom a pathology slide with the AI looking at exactly the same pixels you are. ([osd-controller](./skills/osd-controller))
+
+---
+
+## A whole computer, safely handed to the AI
+
+Install one small [gateway service](./docs/skill_api.md#74-the-koi-gateway) on your machine and Koi gets a real computer to work on: a shell, your file system, your editor tooling, your build and test commands, your internal databases. Not a toy terminal — the same environment you work in. It can install packages, start a dev server, read a stack trace, fix the code and run the tests again, on its own, for as long as the job takes.
+
+What makes that safe is the sandbox. Every write lands in a scratch layer on top of your real project, so your actual files are never touched until you say so. You review the finished work as an ordinary patch and apply it — or throw the session away and lose nothing. Access to your credentials is blocked unless you opt in, and database passwords stay on the server, never reaching the browser.
+
+- **Build and ship software.** Point it at a project and let it write the feature, run the suite, and hand back a reviewable patch.
+- **Understand a codebase.** It reads structure the way an editor does — definitions, references, types — instead of guessing from text.
+- **Query internal systems.** Pull from your own databases ([postgresql](./skills/postgresql)) and write the results into a spreadsheet or document.
+- **Nothing changes without you.** Work is staged for review; discarding a session restores everything exactly as it was.
+
+→ [sandbox-shell](./skills/sandbox-shell)
+
+---
+
+## Use the AI subscription you already pay for
+
+You do not need to buy API credits. If you already subscribe to Claude, ChatGPT, Gemini or Grok, Koi can run on that subscription through a small local proxy — the setup most people choose, and the reason running Koi usually costs nothing extra.
+
+- **Your existing subscription** — point Koi at a local proxy and it uses the plan you already have. No API key, no per-token bill, no new account. → [how to set it up](./docs/cliproxyapi-howto.md)
+- **Direct API keys** — Anthropic, OpenAI, Google, xAI and OpenRouter are supported directly if you prefer to pay per use.
+- **Your own hardware** — run a model locally or on an internal server via Llama.cpp, vLLM or MLX. Nothing leaves the network; it works on machines with no internet access at all. → [video](https://www.youtube.com/watch?v=oyxBI8R7hWk)
+
+Koi follows each provider's official API for interleaved thinking and multimodal input, so the full reasoning chain is preserved across turns instead of being flattened between models.
+
+---
+
+## Nothing is sent anywhere you did not choose
+
+There is no Koi cloud. Your conversations, documents and automations are stored in your own browser — sessions in IndexedDB, settings and skills in `chrome.storage.local`. The only thing that ever leaves your machine is what you send to the AI provider you picked — and if you pick a model on your own hardware, not even that.
+
+- **Your own logins.** Koi works inside sessions you have already opened, so it can never see more than you can.
+- **You approve the risky steps.** Anything that sends, deletes or changes something asks you first.
+- **You can watch it work.** Every action happens on a visible page, not hidden in a datacentre.
+- **No telemetry.** No usage statistics, no crash reports, no page content sent to us.
+
+---
+
+## Quick start
+
+1. Install from the [Chrome Web Store](https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng).
+2. Click the Koi icon, open the side panel, and connect your AI — an existing subscription through a [local proxy](./docs/cliproxyapi-howto.md), an API key, or your own server. In a managed company setup, IT [does this for you](./docs/enterprise-deployment.md).
+3. Open any page, press `Ctrl` and drag to capture a region, and ask your question.
+
+→ [Full configuration guide](./docs/configuration.md)
+
+---
+
+## For builders
+
+Everything above is built on one extension mechanism. A skill is a folder you drop in:
 
 ```
 my-skill/
-├── SKILL.md              # Metadata, allowed tools, MCP servers
+├── SKILL.md              # what it does, which tools and servers it may use
 ├── mcp/
-│   └── my_api_mcp.js     # MCP server (runs in sandbox)
-|── scripts/
-    ├── automate.js       # Browser automation scripts
-    └── guardrail.js      # Policy enforcement (optional)
+│   └── my_api_mcp.js     # an MCP server, running in a sandbox
+└── scripts/
+    ├── automate.js       # browser automation
+    └── guardrail.js      # policy enforcement (optional)
 ```
-
-**Example: [Google Workspace](./skills/google-workspace) Skill**
 
 ```yaml
 # SKILL.md
@@ -145,156 +159,49 @@ guardrails: scripts/guardrail.js
 ---
 ```
 
-Once you [grant](./docs/GoogleWorkspaceConsentScreen.png) your Google Workspace access to this extension, the AI can read your Gmail, query Sheets, create Docs — all through OAuth with domain-locked fetch validation. The guardrail enforces own-file-only writes: the agent can only modify files it created.
+Skills compose. A [single skill](./skills/db-to-gsheet-report) can query PostgreSQL through a gateway, format the rows, create a Google Sheet, and open it — and the bulk data and the loop logic never reach the LLM, which is what keeps cost low and success rates high.
 
-[![Watch Gmail demo](https://img.youtube.com/vi/StrJt2bpy8o/0.jpg)](https://youtu.be/StrJt2bpy8o)
+**Two ways to reach a service.** Local MCP servers run entirely in the browser (sandboxed iframe, `MessageChannel` JSON-RPC, OAuth via `chrome.identity`) with no backend at all. Remote MCP connects over a WebSocket to a gateway for protocols a browser cannot speak — PostgreSQL, MySQL, Redis, Git, RAG — with credentials held server-side.
 
-**Example: Cross-Source Orchestration**
-
-A single [skill](./skills/db-to-gsheet-report) can chain multiple data sources:
-
-```
-User: "Export last 50 sessions from our database to a Google Sheet"
-      ↓
-Skill loads: postgresql (remote MCP via gateway) + google-workspace (local MCP)
-      ↓
-Script: Query PostgreSQL → Format data → Create Sheet → Write rows → Open in browser
-```
-
-This is the real power — skills compose, connecting your private data sources into your workflows.
-
-The massive dataflow, the complicated logic inside the JavaScript script itself, never go to the LLM server -- you automate your workflow with the lowest LLM token cost, and maximum success rate.
-
-[![Watch PostgreSQL to Google Sheets demo](https://img.youtube.com/vi/u_jCS6eENaQ/0.jpg)](https://youtu.be/u_jCS6eENaQ)
-
-### 3. Sub-Task Delegation — Save Your Context Window
-
-Browser DOMs and large documents eat LLM context windows alive. Koi solves this with `run_subtask`: an independent sub-agent with its own fresh context window handles the heavy lifting and returns only the result.
-
-A concrete example — the [Gmail Summarizer skill script](./skills/gmail-summarizer/scripts/analyze.js) fetches an email via the Gmail API, then for each PDF attachment, spawns a sub-agent that loads the PDF, reads it, and produces a summary. Image attachments get their own vision sub-agent. The main conversation receives a consolidated report without ever seeing the raw document content.
-
-This pattern also enables mass operations: a `for` loop in a skill script can spawn hundreds of sub-agents (one per URL, one per row) without overflowing the main context.
-
-### 4. MCP Architecture — Two Transport Modes
-
-```
-┌─ Local MCP (Browser Sandbox) ────────────────────────────┐
-│  Sandboxed iframe → MessageChannel → JSON-RPC            │
-│  OAuth via chrome.identity                               │
-│  Examples: Google Workspace, PDF reader, REST APIs       │
-└──────────────────────────────────────────────────────────┘
-
-┌─ Remote MCP (Gateway) ───────────────────────────────────┐
-│  WebSocket → Gateway server → Native protocol            │
-│  SSO token authentication                                │
-│  Examples: PostgreSQL, MySQL, Redis, Git, RAG            │
-└──────────────────────────────────────────────────────────┘
-```
-
-Local MCP servers run entirely in the browser — no backend required. Remote MCP connects through a gateway for protocols that browsers can't speak natively.
-
-### 5. Programmable Guardrails — Hard Rules for Agent Behavior
-
-Guardrails are JavaScript hooks (global or skill-scoped) that run **before** (input) and **after** (output) every tool call — including inside sub-tasks and executor loops:
+**Guardrails** are JavaScript hooks, global or per skill, that run before and after every tool call, including inside sub-tasks. They hold state across a session, and the LLM cannot bypass them:
 
 ```javascript
-// scripts/guardrail.js — own-file-only write policy
-const createdFileIds = new Set();
-
+// scripts/guardrail.js — only touch files this session created
 module.exports = {
   input: async (ctx) => {
-    if (MUTATE_TOOLS.has(ctx.tool.name)) {
-      if (!createdFileIds.has(ctx.tool.args.spreadsheetId)) {
-        return {
-          allowed: false,
-          message: "Write denied: not created by this session",
-        };
-      }
+    if (
+      MUTATE_TOOLS.has(ctx.tool.name) &&
+      !createdFileIds.has(ctx.tool.args.spreadsheetId)
+    ) {
+      return {
+        allowed: false,
+        message: "Write denied: not created by this session",
+      };
     }
     return { allowed: true };
   },
   output: async (ctx) => {
-    if (CREATE_TOOLS.has(ctx.tool.name)) {
-      // Track file IDs from create responses
+    if (CREATE_TOOLS.has(ctx.tool.name))
       createdFileIds.add(extractId(ctx.tool.result));
-    }
     return { override: false };
   },
 };
 ```
 
-State persists across calls within a session. The guardrail sandbox is cached and isolated — it cannot be bypassed by the LLM.
+**System reminders** inject rules only when they apply — when a `.ts` file is touched, after a particular tool runs, when context is running low, after repeated failures — instead of bloating the system prompt with instructions that are usually irrelevant.
 
-→ [Full Guardrails API Guide](./docs/guardrails_api.md)
+- [Skill API](./docs/skill_api.md) · [Guardrails API](./docs/guardrails_api.md) · [Reminder system](./docs/system_reminder.md)
 
-### 6. System Reminders — Dynamic Context Injection
+### Security model
 
-Instead of bloating your system prompt with rules that may not apply, reminders fire only when relevant — keeping context focused and improving model adherence.
+All script execution — skill scripts, MCP servers, guardrails — happens in sandboxed iframes with `allow-scripts` only: no DOM access, no same-origin privileges, no `chrome.*` APIs. Messages are validated against the parent extension origin. OAuth tokens are scoped to the domains a skill declares, so they cannot be sent elsewhere. The LLM cannot invent and run arbitrary browser control code; only installed, deterministic scripts execute, and no code is ever loaded remotely.
 
-Reminders trigger on file patterns (inject TypeScript rules when `.ts` files are touched), tool events (suggest LSP tools after a raw `search`), iteration counts (warn when context is running low), error patterns (switch strategy after repeated patch failures), and more. Each reminder has a strategy: `one_shot` (fire once), `sticky` (persist after first trigger), or `persistent` (always active).
+### Enterprise
 
-→ [Full Reminder System Guide](./docs/system_reminder.md)
+For managed deployments: signed skills and configuration (ECDSA P-256, SHA-256 content hashes verified against an IT-provisioned key), extension whitelisting through Chrome policy, and a layered trust model spanning device (MDM), user (SSO/MFA), extension (signatures) and gateway (credentials never reach the browser). Managed deployment is the only difference between the paid and free versions.
 
-### 7. Provider Agnostic
-
-This agent strictly follows providers' ([Gemini](https://ai.google.dev/gemini-api/docs/thought-signatures), [OpenRouter](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning-blocks), [Claude](https://platform.claude.com/docs/en/build-with-claude/extended-thinking#interleaved-thinking), [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses)) official API documentation for [fully interleaved thinking](./docs/sample_session_interaction.json) behaviors, to preserve the complete "Reasoning Chain" across turns.
-
-It also strictly follows provider's API definition for multimedia input format, thus building a powerful, yet generic LLM agent base for users to build their own AI applications (skills).
+- [Enterprise security architecture](./docs/enterprise-data-security.md) · [Deployment guide](./docs/enterprise-deployment.md) · [Licensing](./docs/enterprise-licensing.md)
 
 ---
 
-## Security Model
-
-### Sandbox Isolation
-
-All script execution (skill scripts, MCP servers, guardrails) runs in sandboxed iframes:
-
-The sandbox enforces `allow-scripts` only — no DOM access, no same-origin privileges. Communication happens exclusively via `postMessage` with cryptographic origin validation (the sandbox rejects messages from any origin other than its parent extension ID). OAuth tokens are scoped to declared domains per skill, preventing token exfiltration. No sandboxed code can access `chrome.*` extension APIs.
-
-### What's Always Blocked
-
-The LLM cannot generate and execute arbitrary browser control code — only pre-installed, deterministic skill scripts can run. OAuth tokens cannot reach undeclared domains. All scripts must be locally installed; no remote code loading is permitted.
-
-### Enterprise Deployment
-
-For managed environments, Koi supports signature verification for all installations (configuration, skills, SHA-256 content hashes validated against an IT-provisioned public key), extension whitelisting via Chrome policy, and a layered trust model spanning device trust (MDM), user identity (SSO/MFA via `chrome.identity`), extension trust (signed skills), and gateway trust (credentials never sent to browser).
-
-This support for managed deployment is the only feature difference between paid version and free version.
-
-- [Enterprise Security Architecture](./docs/enterprise-data-security.md)
-- [Full Enterprise Deployment Guide](./docs/enterprise-deployment.md)
-
----
-
-## Sample Use Cases
-
-**[Email triage with attachments](./skills/gmail-summarizer)** — "Summarize my latest email with attachments" → Agent fetches via Gmail API → PDF attachments parsed in-browser via the PDF skill → Sub-agent summarizes each document → Consolidated report returned to the main conversation.
-
-**[Database-to-spreadsheet reports](./skills/db-to-gsheet-report)** — Skill queries PostgreSQL via remote MCP gateway → Creates Google Sheet via local MCP → Writes formatted data → Opens the result in a new tab.
-
-**Web application testing** — Load the [Chrome Developer Tools](./skills/chrome-developer-tools) skill → Agent navigates forms, fills fields, clicks buttons → Traps catch console errors and network failures → Agent reports issues with screenshots.
-
-**Domain-specific visual review** — Load the [OpenSeadragon skill](./skills/osd-controller) → AI controls zoom/pan on a 100M-pixel image via MCP server → CTRL+Select a region → Both you and the AI annotate areas of interest → Navigate to specific coordinates for a full diagnostic session.
-
----
-
-## Writing Skills
-
-Skills are installed via the UI (folder picker) or imported as JSON.
-
-- [Skills System Guide](./docs/skill_api.md)
-- [Guardrails API Reference](./docs/guardrails_api.md)
-- [Reminder System Guide](./docs/system_reminder.md)
-
----
-
-## Privacy & Data Ownership
-
-**We do not collect any data.**
-
-- Zero telemetry — no usage statistics, no crash reports, no page content sent to us.
-- Sessions live in IndexedDB, config and skills in `chrome.storage.local`.
-- Your prompts go directly to your configured LLM provider with no proxy or middleman.
-- You can connect to a local server (Llama.cpp, vLLM, MLX) for complete end-to-end data control.
-- API keys are stored locally in extension storage;
-- OAuth tokens are managed by Chrome's identity API.
+Ready when you are. Install it, open the side panel, and ask it to do something you would normally do yourself.
