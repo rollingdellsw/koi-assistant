@@ -66,13 +66,16 @@ stable_node() {
 have_systemd_user() { systemctl --user show-environment >/dev/null 2>&1; }
 
 # Can the gateway's one external import (`ws`) be resolved from GATEWAY_DIR?
-# Uses Node's own resolver instead of testing for node_modules/ws, so a
-# workspace-hoisted install counts as present.
+# Probes through the ESM resolver — the same path koi-gateway.js takes at
+# runtime — instead of testing for node_modules/ws, so a workspace-hoisted
+# install counts as present. A CommonJS createRequire probe answers a
+# different question and fails outright wherever `node -e` input is
+# evaluated as ESM, where `require` is not defined.
 deps_ok() {
   local node_bin="${1:-node}"
   ( cd "$GATEWAY_DIR" \
-    && "$node_bin" -e \
-       "require('node:module').createRequire(process.cwd()+'/x.js').resolve('ws')" \
+    && "$node_bin" --input-type=module -e \
+       "import('ws').then(()=>process.exit(0)).catch(()=>process.exit(1))" \
        >/dev/null 2>&1 )
 }
 
