@@ -66,7 +66,10 @@ const HISTORY_MAX = 10;
 // Layout doctrine, enforced in code rather than left to the model's arithmetic.
 // SKILL.md states these numbers; opAddNode/align/distribute/grid_layout and the
 // layout lint are the things that actually hold the diagram to them.
-const LAYOUT_TIMEOUT = 20000; // ELK runs async with a morph animation
+// Both of these are the *default*; `layout-timeout-ms` / `layout-settle-ms` on
+// the drawio_bridge server in SKILL.md raise them for a slow deployment or a
+// very large diagram, where 5s can expire while the morph is still running.
+const LAYOUT_TIMEOUT = 5000; // ELK runs async with a morph animation
 const LAYOUT_SETTLE = 600; // let the morph finish before reading coordinates
 
 const GRID = 10; // snap unit
@@ -75,8 +78,15 @@ const DEFAULT_H = 60;
 const MIN_GAP = 40; // minimum clear space between vertices
 const CHAR_W = 7.2; // px per char at the default 12px font — width estimator
 const LABEL_PAD = 20; // 10px each side
-const POLL_INTERVAL = 300; // ms
-const POLL_TIMEOUT = 8000; // ms
+// 50ms means ~20 evaluateScript round trips per second while waiting on an
+// event. That is deliberate: the events land in single-digit milliseconds and
+// the old 300ms floor was most of the latency in every tool call.
+const POLL_INTERVAL = 50; // ms
+const POLL_TIMEOUT = 5000; // ms
+// Page switching is driven by {action:"invokeAction", actionName:"nextPage"},
+// which draw.io answers with no event at all — the pause is what lets the
+// SelectPage change land before the next one is sent.
+const PAGE_STEP_DELAY = 120; // ms
 const LOAD_TIMEOUT = 20000; // ms — iframe boot + document load
 const EXPORT_TIMEOUT = 15000; // ms — png render on large diagrams
 const SVG_CHAR_LIMIT = 60000; // ~15k tokens; past this, look instead of read
@@ -98,6 +108,7 @@ let state = {
   hostUrl: null, // document that frames the canvas; same origin by default
   canvasHosts: null, // hostnames ensureBridge will attach to
   layoutEngine: null, // "elk" | "mx"; null = whatever SKILL.md configured
+  activePage: null, // { index, id, name } — the page the USER is looking at
 };
 
 // --- Deployment configuration --------------------------------
@@ -333,14 +344,23 @@ const BRIDGE_POLL = `(document, __ctx, args) => {
     if (m.error && !m.event) return { response: m };
     if (m.event !== args.expect) continue;
     if (args.format && m.format !== args.format) {
-      // Not an error — draw.io emits export events for other formats too. It is
-      // logged because a silent skip here looks exactly like a dead protocol
-      // channel from the MCP side, which cost a long debugging session once.
-      console.log(
-        "[koi-drawio] skipping " + m.event + " event: expected format " +
-          args.format + ", got " + m.format
-      );
-      continue;
+      // Fallback: if we asked for XML and the event carries an XML payload,
+      // take it even though the deployment omitted the format property. Some
+      // draw.io builds answer an export with the payload but no echo of the
+      // format, and skipping those events strands every pull until timeout.
+      var isXmlFallback = args.format === "xml" &&
+        (m.xml || (typeof m.data === "string" && m.data.trim().charAt(0) === "<"));
+      if (!isXmlFallback) {
+        // Not an error — draw.io emits export events for other formats too. It
+        // is logged because a silent skip here looks exactly like a dead
+        // protocol channel from the MCP side, which cost a long debugging
+        // session once.
+        console.log(
+          "[koi-drawio] skipping " + m.event + " event: expected format " +
+            args.format + ", got " + m.format
+        );
+        continue;
+      }
     }
     return { response: m };
   }
@@ -524,7 +544,175 @@ async function bridgePullXml() {
   );
   const st = await bridgeStatus();
   const xml = await inflateDiagrams(r.xml || r.data);
-  return { xml, rev: st ? st.rev : -1 };
+  // Every export event is built by draw.io's createLoadMessage, which carries
+  // `currentPage` — the index of the page the user is actually looking at.
+  // It is the only read of the visible page the protocol offers, and it comes
+  // free with a pull we were making anyway. Older builds omit it; null then.
+  const currentPage = typeof r.currentPage === "number" ? r.currentPage : null;
+  if (currentPage !== null) noteActivePage(xml, currentPage);
+  return { xml, rev: st ? st.rev : -1, currentPage };
+}
+
+// --- Pages ---------------------------------------------------
+//
+// A .drawio file is a list of <diagram> elements; draw.io shows one of them at
+// a time and the user picks which with the tabs at the bottom. Two separate
+// things follow, and conflating them is what made multi-page editing not work:
+//
+//   THE DOCUMENT — which pages exist, in what order, under what names. Pure
+//   XML, so it is edited by ops (add_page, rename_page, ...) and travels
+//   through the same push/verify/history pipeline as any other edit.
+//
+//   THE VIEW — which page is on screen. Not in the document at all. It is read
+//   from the export event's `currentPage` and changed with drawio_pages
+//   ({select}), which steps the editor's own nextPage/previousPage actions.
+//
+// Ops target a page independently of the view: `drawio_ops({page})`, or
+// `page` on an individual op. The default is the page the user is looking at,
+// which is what "add a box" means when they are staring at page 3.
+
+function pagesOfDoc(doc) {
+  const out = [];
+  const diagrams = doc.querySelectorAll("diagram");
+  for (let i = 0; i < diagrams.length; i++) {
+    const d = diagrams[i];
+    let cells = 0;
+    d.querySelectorAll("mxCell").forEach((c) => {
+      const id = c.getAttribute("id");
+      if (id !== "0" && id !== "1") cells++;
+    });
+    out.push({
+      index: i,
+      id: d.getAttribute("id") || String(i),
+      name: d.getAttribute("name") || "",
+      cells,
+    });
+  }
+  return out;
+}
+
+function pagesOf(xmlStr) {
+  try {
+    return pagesOfDoc(parseXml(xmlStr));
+  } catch (_) {
+    return [];
+  }
+}
+
+function noteActivePage(xmlStr, index) {
+  const pages = pagesOf(xmlStr);
+  state.activePage = pages[index] || null;
+}
+
+/**
+ * Resolve a page reference to an index. Accepts an index (number or numeric
+ * string), a page id, a page name, or "active".
+ *
+ * Throws with the full page list rather than a bare "not found": the model
+ * usually guessed a name, and one message containing the real names is the
+ * difference between a fix this turn and a fix three turns from now.
+ */
+function resolvePage(pages, ref) {
+  if (!pages.length) throw new Error("The document has no pages.");
+  if (ref === undefined || ref === null || ref === "") return 0;
+
+  const known = () =>
+    " Pages: " +
+    pages.map((p) => "[" + p.index + "] " + (p.name || "(unnamed)") + " id=" + p.id).join(", ");
+
+  if (typeof ref === "number") {
+    if (!Number.isInteger(ref) || ref < 0 || ref >= pages.length) {
+      throw new Error("No page at index " + ref + "." + known());
+    }
+    return ref;
+  }
+
+  const s = String(ref).trim();
+  if (s === "active" || s === "current") {
+    if (!state.activePage) return 0;
+    const byId = pages.find((p) => p.id === state.activePage.id);
+    return byId ? byId.index : Math.min(state.activePage.index, pages.length - 1);
+  }
+  // id before name: ids are unique, names are not.
+  const byId = pages.find((p) => p.id === s);
+  if (byId) return byId.index;
+  const byName = pages.find((p) => p.name === s);
+  if (byName) return byName.index;
+  const byNameCi = pages.find((p) => p.name.toLowerCase() === s.toLowerCase());
+  if (byNameCi) return byNameCi.index;
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    if (n >= 0 && n < pages.length) return n;
+  }
+  throw new Error("No page matching '" + s + "'." + known());
+}
+
+/** The page ops target when the caller does not say. */
+function defaultPageRef() {
+  return state.activePage ? state.activePage.id : 0;
+}
+
+async function bridgeInvokeAction(actionName) {
+  // invokeAction produces no response event of any kind — draw.io returns
+  // immediately after calling action.funct(). Nothing to wait on, so callers
+  // verify by reading currentPage back.
+  const req = await evalBridge(BRIDGE_SEND, {
+    msg: { action: "invokeAction", actionName },
+  });
+  if (!req || req.error) {
+    throw new Error("bridge send failed: " + ((req && req.error) || "no bridge"));
+  }
+}
+
+/**
+ * Bring a page on screen.
+ *
+ * The embed protocol has no "select page N". What it has is the editor's own
+ * `nextPage` / `previousPage` actions, which wrap around, so any page is
+ * reachable by stepping in the cheaper direction. Each step is unverifiable on
+ * its own; the whole walk is verified once at the end, and retried once, since
+ * an editor busy with a morph can drop a step.
+ */
+async function bridgeSelectPage(targetIndex) {
+  const first = await bridgePullXml();
+  const total = pagesOf(first.xml).length;
+  if (targetIndex < 0 || targetIndex >= total) {
+    return { ok: false, error: "No page at index " + targetIndex };
+  }
+  if (first.currentPage === null) {
+    return {
+      ok: false,
+      error:
+        "This draw.io build does not report the selected page (no currentPage " +
+        "in its export event), so page switching cannot be verified. Ask the " +
+        "user to click the page tab at the bottom of the canvas.",
+    };
+  }
+
+  let current = first.currentPage;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (current === targetIndex) return { ok: true, index: current, attempts: attempt };
+    const forward = (targetIndex - current + total) % total;
+    const backward = total - forward;
+    const action = forward <= backward ? "nextPage" : "previousPage";
+    const steps = Math.min(forward, backward);
+    for (let i = 0; i < steps; i++) {
+      await bridgeInvokeAction(action);
+      await sleep(PAGE_STEP_DELAY);
+    }
+    const after = await bridgePullXml();
+    current = after.currentPage === null ? current : after.currentPage;
+  }
+
+  if (current === targetIndex) return { ok: true, index: current, attempts: 2 };
+  return {
+    ok: false,
+    index: current,
+    error:
+      "Asked for page " + targetIndex + " but the canvas is showing " + current +
+      ". The deployment may not support invokeAction; the user can click the " +
+      "page tab directly.",
+  };
 }
 
 async function bridgePushLoad(xml) {
@@ -557,7 +745,7 @@ async function pushDocument(xml, newCanonical) {
   lastPushVerify = null;
   const pageCount = (t) => ((t || "").match(/^P /gm) || []).length;
   if (pageCount(state.base) !== pageCount(newCanonical)) {
-    await bridgePushLoad(xml);
+    await loadPreservingPage(xml);
     return "load";
   }
   try {
@@ -569,7 +757,7 @@ async function pushDocument(xml, newCanonical) {
       runtime.console.warn(
         "merge resulted in canvas mismatch (e.g. deleted or renamed cells); falling back to load"
       );
-      await bridgePushLoad(xml);
+      await loadPreservingPage(xml);
       return "load";
     }
     return "merge";
@@ -577,8 +765,38 @@ async function pushDocument(xml, newCanonical) {
     runtime.console.warn(
       "merge failed (" + e.message + "); falling back to load"
     );
-    await bridgePushLoad(xml);
+    await loadPreservingPage(xml);
     return "load";
+  }
+}
+
+/**
+ * `load` with the user's page kept on screen.
+ *
+ * setFileData selects `urlParams["page"] || 0` on every load, so a bare load
+ * yanks a user working on page 3 back to page 1 — for an edit they made to
+ * page 3. The page is followed by id, not index, so it survives pages being
+ * inserted or reordered in the same push. Best effort throughout: a failed
+ * re-select is a wrong tab, not a lost edit, and must never fail the push.
+ */
+async function loadPreservingPage(xml) {
+  const keep = state.activePage;
+  await bridgePushLoad(xml);
+  if (!keep || !keep.id) return;
+
+  const pages = pagesOf(xml);
+  const target = pages.find((p) => p.id === keep.id);
+  if (!target || target.index === 0) return;
+
+  try {
+    const res = await bridgeSelectPage(target.index);
+    if (!res.ok) {
+      runtime.console.warn(
+        "could not restore the visible page after load: " + (res.error || "unknown")
+      );
+    }
+  } catch (e) {
+    runtime.console.warn("could not restore the visible page after load: " + e.message);
   }
 }
 
@@ -801,8 +1019,15 @@ function serializeXml(doc) {
 
 /**
  * Canonicalize: extract all mxCell elements, emit one line per cell
- * sorted by id. Format: KIND ID PARENT "LABEL" STYLE GEOMETRY
+ * sorted by (page, id). Format: KIND ID PAGE PARENT "LABEL" STYLE GEOMETRY
  * This is for diffing — not for push (we push real XML).
+ *
+ * `pg=` is not decoration. Cells were previously collected with one flat
+ * querySelectorAll across the whole file, so two pages holding a cell with the
+ * same id produced two lines the differ keyed identically and collapsed into
+ * one — the second page's cell was invisible to every diff, every drift check
+ * and every verify. Page-scoped ids are common the moment anyone duplicates a
+ * page or hand-writes a second one.
  */
 function canonicalize(xmlStr) {
   const doc = parseXml(xmlStr);
@@ -810,24 +1035,42 @@ function canonicalize(xmlStr) {
 
   // Pages
   const diagrams = doc.querySelectorAll("diagram");
-  diagrams.forEach((d) => {
-    const id = d.getAttribute("id") || d.getAttribute("name") || "page";
+  const pageIds = [];
+  diagrams.forEach((d, i) => {
+    const id = d.getAttribute("id") || d.getAttribute("name") || "page-" + (i + 1);
     const name = d.getAttribute("name") || "";
+    pageIds.push(id);
     lines.push("P " + id + ' "' + escLabel(name) + '"');
   });
 
-  // Cells
-  const cells = doc.querySelectorAll("mxCell");
+  // Cells, page by page: document order for pages, id order within a page.
   const cellArr = [];
-  cells.forEach((c) => cellArr.push(c));
-
-  cellArr.sort((a, b) => {
-    const ai = a.getAttribute("id") || "";
-    const bi = b.getAttribute("id") || "";
-    return ai < bi ? -1 : ai > bi ? 1 : 0;
+  diagrams.forEach((d, i) => {
+    const own = [];
+    d.querySelectorAll("mxCell").forEach((c) => own.push(c));
+    own.sort((a, b) => {
+      const ai = a.getAttribute("id") || "";
+      const bi = b.getAttribute("id") || "";
+      return ai < bi ? -1 : ai > bi ? 1 : 0;
+    });
+    own.forEach((c) => cellArr.push({ cell: c, page: pageIds[i] }));
   });
+  // A document with no <diagram> wrapper at all (a bare mxGraphModel) still
+  // has to canonicalize — drawio_validate is called on hand-written XML.
+  if (!diagrams.length) {
+    const own = [];
+    doc.querySelectorAll("mxCell").forEach((c) => own.push(c));
+    own.sort((a, b) => {
+      const ai = a.getAttribute("id") || "";
+      const bi = b.getAttribute("id") || "";
+      return ai < bi ? -1 : ai > bi ? 1 : 0;
+    });
+    own.forEach((c) => cellArr.push({ cell: c, page: "" }));
+  }
 
-  for (const c of cellArr) {
+  for (const entry of cellArr) {
+    const c = entry.cell;
+    const pg = entry.page ? " pg=" + entry.page : "";
     const id = c.getAttribute("id") || "";
     // Skip root cells
     if (id === "0" || id === "1") continue;
@@ -871,12 +1114,12 @@ function canonicalize(xmlStr) {
         }
       }
       lines.push(
-        'E ' + id + ' p=' + parent + ' ' + source + '->' + target +
+        'E ' + id + pg + ' p=' + parent + ' ' + source + '->' + target +
         ' "' + escLabel(value) + '" s=' + style + ' g=[' + geo + ']' + pts
       );
     } else if (vertex) {
       lines.push(
-        'V ' + id + ' p=' + parent +
+        'V ' + id + pg + ' p=' + parent +
         ' "' + escLabel(value) + '" s=' + style + ' g=[' + geo + ']'
       );
     }
@@ -902,35 +1145,39 @@ function diffCanonical(oldText, newText) {
   const oldLines = (oldText || "").split("\n").filter(Boolean);
   const newLines = (newText || "").split("\n").filter(Boolean);
 
+  // Keyed by page+id, reported by id. Two pages may hold the same cell id, and
+  // keying on id alone silently dropped one of them from every diff.
   const oldMap = {};
   oldLines.forEach((l) => {
-    const id = extractId(l);
-    if (id) oldMap[id] = l;
+    const k = extractKey(l);
+    if (k) oldMap[k] = l;
   });
 
   const newMap = {};
   newLines.forEach((l) => {
-    const id = extractId(l);
-    if (id) newMap[id] = l;
+    const k = extractKey(l);
+    if (k) newMap[k] = l;
   });
 
   const added = [];
   const removed = [];
   const changed = [];
+  const entry = (key, line, rest) =>
+    Object.assign({ id: extractId(line), key }, extractPage(line) ? { page: extractPage(line) } : {}, rest);
 
   // Find removed and changed
-  for (const id in oldMap) {
-    if (!(id in newMap)) {
-      removed.push({ id, line: oldMap[id] });
-    } else if (oldMap[id] !== newMap[id]) {
-      changed.push({ id, from: oldMap[id], to: newMap[id] });
+  for (const key in oldMap) {
+    if (!(key in newMap)) {
+      removed.push(entry(key, oldMap[key], { line: oldMap[key] }));
+    } else if (oldMap[key] !== newMap[key]) {
+      changed.push(entry(key, newMap[key], { from: oldMap[key], to: newMap[key] }));
     }
   }
 
   // Find added
-  for (const id in newMap) {
-    if (!(id in oldMap)) {
-      added.push({ id, line: newMap[id] });
+  for (const key in newMap) {
+    if (!(key in oldMap)) {
+      added.push(entry(key, newMap[key], { line: newMap[key] }));
     }
   }
 
@@ -938,9 +1185,22 @@ function diffCanonical(oldText, newText) {
 }
 
 function extractId(line) {
-  // Lines: "V id p=..." or "E id p=..." or "P id ..."
+  // Lines: "V id pg=... p=..." or "E id pg=... p=..." or "P id ..."
   const m = line.match(/^[VEP]\s+(\S+)/);
   return m ? m[1] : null;
+}
+
+function extractPage(line) {
+  const m = line.match(/^[VE]\s+\S+\s+pg=(\S+)/);
+  return m ? m[1] : null;
+}
+
+/** Diff identity: page-scoped for cells, plain id for page lines. */
+function extractKey(line) {
+  const id = extractId(line);
+  if (!id) return null;
+  const page = extractPage(line);
+  return page ? page + "/" + id : id;
 }
 
 /**
@@ -950,14 +1210,14 @@ function buildChangeset(rawDiff, lastAppliedCanonical) {
   const lastAppliedIds = new Set();
   if (lastAppliedCanonical) {
     lastAppliedCanonical.split("\n").forEach((l) => {
-      const id = extractId(l);
-      if (id) lastAppliedIds.add(id);
+      const k = extractKey(l);
+      if (k) lastAppliedIds.add(k);
     });
   }
 
   const result = {
     added: rawDiff.added.map((a) => parseCanonLine(a.line)),
-    removed: rawDiff.removed.map((r) => ({ id: r.id })),
+    removed: rawDiff.removed.map((r) => (r.page ? { id: r.id, page: r.page } : { id: r.id })),
     changed: rawDiff.changed.map((c) => describeDelta(c)),
     revertedAiCells: [],
     summary: "",
@@ -965,7 +1225,7 @@ function buildChangeset(rawDiff, lastAppliedCanonical) {
 
   // Detect reverted AI cells
   for (const r of rawDiff.removed) {
-    if (lastAppliedIds.has(r.id)) {
+    if (lastAppliedIds.has(r.key || r.id)) {
       result.revertedAiCells.push(r.id);
     }
   }
@@ -992,11 +1252,12 @@ function parseCanonLine(line) {
   const kind = line.startsWith("V") ? "vertex" : line.startsWith("E") ? "edge" : "page";
   const idM = line.match(/^[VEP]\s+(\S+)/);
   const id = idM ? idM[1] : "";
+  const page = extractPage(line);
   const labelM = line.match(/"([^"]*)"/);
   const label = labelM ? labelM[1].replace(/\\n/g, "\n").replace(/\\"/g, '"') : "";
   const geoM = line.match(/g=\[([^\]]*)\]/);
   const at = geoM ? geoM[1].split(",").map(Number) : [];
-  return { id, kind, label, at };
+  return page ? { id, kind, label, at, page } : { id, kind, label, at };
 }
 
 function describeDelta(change) {
@@ -1466,6 +1727,10 @@ const SUPPORTED_OPS = [
   "delete",
   "adopt",
   "add_page",
+  "rename_page",
+  "delete_page",
+  "duplicate_page",
+  "move_page",
   "align",
   "distribute",
   "grid_layout",
@@ -1477,20 +1742,39 @@ const SUPPORTED_OPS = [
 // full model round trip to retype it. Cheaper to accept both spellings.
 const LIST_ID_OPS = ["move_by", "delete", "align", "distribute", "grid_layout"];
 
+// Ops that rearrange the page list itself rather than cells on a page. They
+// take no `root`, and `page` on them names the page being operated ON, not the
+// page they are scoped to.
+const PAGE_OPS = ["add_page", "rename_page", "delete_page", "duplicate_page", "move_page"];
+
 /**
  * Apply a batch of operations to an XML document string.
  * Returns { xml, report } where report lists per-op results.
  *
- * Single-page scope: `root` is the first <diagram>'s root. `add_page` appends a
- * page but no other op can target it — multi-page editing goes through
- * drawio_apply. This is a real limitation, stated here so it stops being
- * rediscovered.
+ * Page scope: every cell op resolves its own <root>, from `op.page` if it has
+ * one and from `defaultPage` otherwise. `defaultPage` is normally the page the
+ * user is looking at. One batch may therefore touch several pages, and the
+ * page list may itself change mid-batch (add_page then add_node on it), so the
+ * resolution is redone per op rather than hoisted.
  */
-function applyOps(xmlStr, ops) {
+function applyOps(xmlStr, ops, defaultPage) {
   const doc = parseXml(xmlStr);
-  const root = doc.querySelector("mxfile > diagram > mxGraphModel > root");
-  if (!root) throw new Error("Cannot find <root> in XML");
+  if (!doc.querySelector("diagram")) throw new Error("Cannot find <diagram> in XML");
   const report = [];
+
+  const rootFor = (ref) => {
+    const pages = pagesOfDoc(doc);
+    const idx = resolvePage(pages, ref === undefined || ref === null ? defaultPage : ref);
+    const diagram = doc.querySelectorAll("diagram")[idx];
+    const root = diagram && diagram.querySelector("mxGraphModel > root");
+    if (!root) {
+      throw new Error(
+        "Page '" + pages[idx].id + "' has no <mxGraphModel><root>. If its body is " +
+          "still compressed, call drawio_sync to re-read the canvas."
+      );
+    }
+    return { root, page: pages[idx] };
+  };
 
   for (const op of ops) {
     try {
@@ -1501,6 +1785,11 @@ function applyOps(xmlStr, ops) {
       } else if (!op.id && Array.isArray(op.ids) && op.ids.length === 1) {
         op.id = op.ids[0];
       }
+      // Cell ops get a page-scoped root; page ops rearrange the page list and
+      // resolve their own target inside the op.
+      const scope = PAGE_OPS.indexOf(op.op) === -1 ? rootFor(op.page) : null;
+      const root = scope ? scope.root : null;
+      const reportFrom = report.length;
       switch (op.op) {
         case "add_node":
           opAddNode(doc, root, op);
@@ -1566,10 +1855,31 @@ function applyOps(xmlStr, ops) {
           opAdopt(root, op);
           report.push({ op: op.op, id: op.id, newId: op.newId, ok: true });
           break;
-        case "add_page":
-          opAddPage(doc, op);
-          report.push({ op: op.op, id: op.id, ok: true });
+        case "add_page": {
+          const added = opAddPage(doc, op);
+          report.push({ op: op.op, id: added.id, name: added.name, index: added.index, ok: true });
           break;
+        }
+        case "rename_page": {
+          const renamed = opRenamePage(doc, op);
+          report.push({ op: op.op, id: renamed.id, name: renamed.name, ok: true });
+          break;
+        }
+        case "delete_page": {
+          const removed = opDeletePage(doc, op);
+          report.push({ op: op.op, id: removed.id, name: removed.name, ok: true });
+          break;
+        }
+        case "duplicate_page": {
+          const copy = opDuplicatePage(doc, op);
+          report.push({ op: op.op, id: copy.id, name: copy.name, from: copy.from, ok: true });
+          break;
+        }
+        case "move_page": {
+          const moved = opMovePage(doc, op);
+          report.push({ op: op.op, id: moved.id, from: moved.from, to: moved.to, ok: true });
+          break;
+        }
         case "align":
           opAlign(root, op);
           report.push({ op: op.op, ids: op.ids, axis: op.axis || "left", ok: true });
@@ -1589,6 +1899,11 @@ function applyOps(xmlStr, ops) {
             error:
               "Unknown op: " + op.op + ". Supported: " + SUPPORTED_OPS.join(", "),
           });
+      }
+      // Say which page each cell op landed on. On a single-page document this
+      // is noise, so it is omitted there.
+      if (scope && pagesOfDoc(doc).length > 1) {
+        for (let i = reportFrom; i < report.length; i++) report[i].page = scope.page.id;
       }
     } catch (e) {
       report.push({ op: op.op, id: op.id, ok: false, error: e.message });
@@ -2264,12 +2579,47 @@ function opGridLayout(root, op) {
   });
 }
 
-function opAddPage(doc, op) {
-  const mxfile = doc.querySelector("mxfile");
-  if (!mxfile) throw new Error("Missing <mxfile>");
-  const id = op.id || "page-" + (mxfile.querySelectorAll("diagram").length + 1);
-  const name = op.name || id;
+// --- Page ops ------------------------------------------------
+//
+// These edit the page LIST. They go through the same pipeline as any other op,
+// which matters: a page-set change forces `load` rather than `merge`, and
+// loadPreservingPage puts the user back on the page they were watching.
 
+function diagramsOf(doc) {
+  const out = [];
+  doc.querySelectorAll("diagram").forEach((d) => out.push(d));
+  return out;
+}
+
+function uniquePageId(doc, wanted) {
+  const taken = new Set(diagramsOf(doc).map((d) => d.getAttribute("id")));
+  if (wanted) {
+    // An explicit id that collides is an error, not something to paper over:
+    // draw.io refuses to load a file with duplicate page IDs, so silently
+    // renaming it would move the failure to the push, where it reads as a
+    // canvas problem.
+    if (taken.has(wanted)) throw new Error("A page with id '" + wanted + "' already exists");
+    return wanted;
+  }
+  let n = taken.size + 1;
+  let id = "page-" + n;
+  while (taken.has(id)) id = "page-" + ++n;
+  return id;
+}
+
+/** Insert `diagram` at `index` (clamped); appends when index is not given. */
+function insertDiagramAt(doc, mxfile, diagram, index) {
+  const existing = diagramsOf(doc);
+  if (index === undefined || index === null || index >= existing.length) {
+    mxfile.appendChild(diagram);
+    return existing.length;
+  }
+  const at = Math.max(0, Number(index));
+  mxfile.insertBefore(diagram, existing[at]);
+  return at;
+}
+
+function newPageNode(doc, id, name) {
   const diagram = doc.createElement("diagram");
   diagram.setAttribute("id", id);
   diagram.setAttribute("name", name);
@@ -2285,7 +2635,97 @@ function opAddPage(doc, op) {
   root.appendChild(c1);
   model.appendChild(root);
   diagram.appendChild(model);
-  mxfile.appendChild(diagram);
+  return diagram;
+}
+
+function opAddPage(doc, op) {
+  const mxfile = doc.querySelector("mxfile");
+  if (!mxfile) throw new Error("Missing <mxfile>");
+  const id = uniquePageId(doc, op.id);
+  const name = op.name || id;
+  const diagram = newPageNode(doc, id, name);
+  const index = insertDiagramAt(doc, mxfile, diagram, op.index);
+  return { id, name, index };
+}
+
+function opRenamePage(doc, op) {
+  if (!op.name) throw new Error("rename_page requires `name`");
+  const pages = pagesOfDoc(doc);
+  const idx = resolvePage(pages, op.page !== undefined ? op.page : op.id);
+  const diagram = diagramsOf(doc)[idx];
+  diagram.setAttribute("name", op.name);
+  return { id: pages[idx].id, name: op.name };
+}
+
+function opDeletePage(doc, op) {
+  const pages = pagesOfDoc(doc);
+  if (pages.length < 2) {
+    throw new Error("Cannot delete the only page — a document must keep one.");
+  }
+  const idx = resolvePage(pages, op.page !== undefined ? op.page : op.id);
+  const diagram = diagramsOf(doc)[idx];
+  diagram.parentNode.removeChild(diagram);
+  return { id: pages[idx].id, name: pages[idx].name };
+}
+
+/**
+ * Copy a page, cells and all.
+ *
+ * Cell ids are rewritten. Two pages may legally hold the same id, but nothing
+ * good comes of it: `delete`, `set_label` and every other op takes a bare id,
+ * and with a duplicate in the file the op would hit whichever page it resolved
+ * first. References (parent/source/target) are remapped along with the ids.
+ */
+function opDuplicatePage(doc, op) {
+  const mxfile = doc.querySelector("mxfile");
+  if (!mxfile) throw new Error("Missing <mxfile>");
+  const pages = pagesOfDoc(doc);
+  const idx = resolvePage(pages, op.page !== undefined ? op.page : op.id);
+  const source = diagramsOf(doc)[idx];
+
+  const id = uniquePageId(doc, op.newId);
+  const copy = source.cloneNode(true);
+  copy.setAttribute("id", id);
+  const name = op.name || (pages[idx].name || pages[idx].id) + " copy";
+  copy.setAttribute("name", name);
+
+  const suffix = "-" + id;
+  const map = {};
+  const cells = [];
+  copy.querySelectorAll("mxCell").forEach((c) => cells.push(c));
+  for (const c of cells) {
+    const old = c.getAttribute("id");
+    if (old === null || old === "0" || old === "1") continue;
+    map[old] = old + suffix;
+  }
+  for (const c of cells) {
+    const old = c.getAttribute("id");
+    if (map[old]) c.setAttribute("id", map[old]);
+    for (const attr of ["parent", "source", "target"]) {
+      const ref = c.getAttribute(attr);
+      if (ref && map[ref]) c.setAttribute(attr, map[ref]);
+    }
+  }
+
+  const index = insertDiagramAt(doc, mxfile, copy, op.index !== undefined ? op.index : idx + 1);
+  return { id, name, from: pages[idx].id, index };
+}
+
+function opMovePage(doc, op) {
+  const mxfile = doc.querySelector("mxfile");
+  if (!mxfile) throw new Error("Missing <mxfile>");
+  const pages = pagesOfDoc(doc);
+  const from = resolvePage(pages, op.page !== undefined ? op.page : op.id);
+  if (op.to === undefined || op.to === null) throw new Error("move_page requires `to` (target index)");
+  const to = Math.max(0, Math.min(pages.length - 1, Number(op.to)));
+
+  const diagram = diagramsOf(doc)[from];
+  diagram.parentNode.removeChild(diagram);
+  const rest = diagramsOf(doc);
+  if (to >= rest.length) mxfile.appendChild(diagram);
+  else mxfile.insertBefore(diagram, rest[to]);
+
+  return { id: pages[from].id, from, to };
 }
 
 // --- Geometry helpers for the readability lint ----------------
@@ -2462,6 +2902,11 @@ async function toolInit(args) {
     state.turnSynced = false;
     state.history = [];
     state.turnCount = 0;
+    // A fresh load selects the first page (setFileData: urlParams["page"] || 0).
+    // An adopt of what is already on screen keeps whatever bridgePullXml read.
+    if (!state.activePage || resultMode !== "adopt") {
+      state.activePage = pagesOf(xml)[0] || null;
+    }
     return {
       success: true,
       mode: resultMode,
@@ -2592,12 +3037,26 @@ async function toolSync() {
   state.turnSynced = true;
   state.turnCount++;
 
+  const pages = pagesOf(liveXml);
   const result = {
     userDiff,
     canonical: liveCanonical,
-    stats: { cells: (liveCanonical.match(/^[VE]/gm) || []).length, pages: (liveCanonical.match(/^P/gm) || []).length },
+    stats: { cells: (liveCanonical.match(/^[VE]/gm) || []).length, pages: pages.length },
     rev: pulled.rev,
   };
+
+  // On a multi-page document, which page the user is watching is as much a
+  // part of "what changed since your last turn" as the cells are: it is where
+  // unscoped ops will land.
+  if (pages.length > 1) {
+    result.pages = pages;
+    result.activePage = state.activePage || null;
+    if (pulled.currentPage === null) {
+      result.pageNote =
+        "This draw.io build does not report the selected page, so ops default " +
+        "to page 1. Pass `page` on drawio_ops to be certain.";
+    }
+  }
 
   // Renders are opt-in. A full-resolution canvas export is 100k+ tokens of
   // base64 once it lands in conversation history, and it lands there on every
@@ -2664,8 +3123,17 @@ async function toolOps(args) {
   const ops = args.ops;
   if (!Array.isArray(ops) || !ops.length) return { error: "ops must be a non-empty array" };
 
-  // Apply ops to current base
-  const result = applyOps(state.baseXml, ops);
+  // Apply ops to current base. Unscoped ops land on the page the user is
+  // looking at — "add a box" means this page when they are staring at page 3.
+  const defaultPage = args.page !== undefined && args.page !== null && args.page !== ""
+    ? args.page
+    : defaultPageRef();
+  let result;
+  try {
+    result = applyOps(state.baseXml, ops, defaultPage);
+  } catch (e) {
+    return { error: e.message };
+  }
   const newXml = result.xml;
 
   // Validate
@@ -2842,7 +3310,10 @@ async function toolRoute(args) {
 
   let applied;
   try {
-    applied = await bridgeLayout(layouts);
+    // mxParallelEdgeLayout is an mxGraph layout, not an ELK one: it morphs for
+    // longer than the shortened default settle allows, and reading coordinates
+    // mid-morph yields waypoints that are still moving.
+    applied = await bridgeLayout(layouts, { settle: 2500 });
   } catch (e) {
     return { error: "Routing failed: " + e.message };
   }
@@ -3086,6 +3557,26 @@ async function toolRender(args) {
     };
   }
 
+  // SVG export renders whatever page is on screen — draw.io builds it from the
+  // live graph, not from the file — so rendering another page means bringing it
+  // on screen first. It stays selected afterwards: the caller asked to look at
+  // that page, and switching back would put the user somewhere they did not ask
+  // to be a second time.
+  let renderedPage = null;
+  if (args && args.page !== undefined && args.page !== null && args.page !== "") {
+    const pulled = await bridgePullXml();
+    const pages = pagesOf(pulled.xml);
+    let idx;
+    try {
+      idx = resolvePage(pages, args.page);
+    } catch (e) {
+      return { error: e.message, pages };
+    }
+    const res = await bridgeSelectPage(idx);
+    if (!res.ok) return { error: res.error, pages };
+    renderedPage = pages[idx];
+  }
+
   const svg = svgFromExport(await bridgeExport("svg"));
   if (svg === null) {
     return {
@@ -3110,7 +3601,68 @@ async function toolRender(args) {
     };
   }
 
-  return { format: "svg", chars: svg.length, data: svg };
+  return {
+    format: "svg",
+    chars: svg.length,
+    data: svg,
+    ...(renderedPage ? { page: renderedPage } : {}),
+    ...(state.activePage && !renderedPage ? { page: state.activePage } : {}),
+  };
+}
+
+/**
+ * drawio_pages — list the pages, and switch which one is on screen.
+ *
+ * Read-only about the document: creating, renaming, deleting and reordering
+ * pages are ops, because they change the file and belong in the same
+ * push/verify/history pipeline as every other edit. What only this tool can do
+ * is move the VIEW, which is not in the file at all.
+ */
+async function toolPages(args) {
+  args = args || {};
+  await ensureBridge();
+  if (!state.initialized) return { error: "Not initialized" };
+
+  const pulled = await bridgePullXml();
+  let pages = pagesOf(pulled.xml);
+  let selected = null;
+
+  if (args.select !== undefined && args.select !== null && args.select !== "") {
+    let idx;
+    try {
+      idx = resolvePage(pages, args.select);
+    } catch (e) {
+      return { error: e.message, pages };
+    }
+    let res;
+    try {
+      res = await bridgeSelectPage(idx);
+    } catch (e) {
+      return { error: "Page switch failed: " + e.message, pages };
+    }
+    if (!res.ok) return { error: res.error, pages, active: state.activePage };
+    selected = pages[idx];
+  }
+
+  const active = state.activePage;
+  return {
+    ok: true,
+    pages,
+    active,
+    ...(selected ? { selected } : {}),
+    ...(pulled.currentPage === null
+      ? {
+          note:
+            "This draw.io build does not report the selected page. Listing is " +
+            "accurate; switching cannot be verified and is refused.",
+        }
+      : {}),
+    hint:
+      pages.length > 1
+        ? "drawio_ops({page, ops}) edits a page without switching to it. " +
+          "Switching is only needed for what the user (or a screenshot) sees."
+        : undefined,
+  };
 }
 
 /**
@@ -3339,8 +3891,16 @@ return {
         description:
           "Apply a batch of operations (add_node, add_edge, set_label, " +
           "set_edge_label, set_edge_points, set_edge_anchor, resize_to_fit, " +
-          "set_style, set_geometry, move_by, delete, adopt, add_page, align, " +
-          "distribute, grid_layout). Three of these fix a connector without " +
+          "set_style, set_geometry, move_by, delete, adopt, align, " +
+          "distribute, grid_layout), plus the page ops add_page{name, id?, " +
+          "index?}, rename_page{page, name}, delete_page{page}, " +
+          "duplicate_page{page, name?, newId?} and move_page{page, to}. Cell " +
+          "ops land " +
+          "on the page the user is looking at unless you say otherwise: pass " +
+          "`page` on the call to scope the whole batch, or `page` on a single " +
+          "op to target one page — a batch may touch several. `page` accepts a " +
+          "page id, a page name or a 0-based index. You do NOT need to switch " +
+          "pages to edit one. Three ops fix a connector without " +
           "touching the layout: set_edge_label{id, position?, dx?, dy?, " +
           "background?} moves an edge's TEXT; set_edge_points{id, points} " +
           "re-routes one edge by hand (points:[] restores automatic routing); " +
@@ -3377,8 +3937,15 @@ return {
                 "Array of operation objects. Each has an 'op' field. Layout helpers: " +
                 "{op:'align', ids:[...], axis:'left|right|hcenter|top|bottom|vcenter'}, " +
                 "{op:'distribute', ids:[...], axis:'horizontal|vertical', gap?}, " +
-                "{op:'grid_layout', ids:[...], cols, x?, y?, hgap?, vgap?}.",
+                "{op:'grid_layout', ids:[...], cols, x?, y?, hgap?, vgap?}. Any " +
+                "cell op may carry page:'<id|name|index>' to override the batch's page.",
               items: { type: "object" },
+            },
+            page: {
+              type: ["string", "number"],
+              description:
+                "Page every op in this batch targets, as a page id, page name or " +
+                "0-based index. Defaults to the page currently on screen.",
             },
           },
           required: ["ops"],
@@ -3478,13 +4045,45 @@ return {
           "picture to look at: it is the only way to see where an edge label or " +
           "waypoint actually landed after drawio_route, which the XML does not " +
           "record. To LOOK at the diagram, call takeScreenshot() instead — a tool " +
-          "result cannot carry an image, so no PNG is available here.",
+          "result cannot carry an image, so no PNG is available here. Renders " +
+          "the page on screen; pass `page` to render another one, which brings " +
+          "it on screen and leaves it there.",
         displayMessage: "🧾 Exporting diagram as SVG",
         tier: "safe",
         inputSchema: {
           type: "object",
           properties: {
             format: { type: "string", enum: ["svg"], description: "SVG only." },
+            page: {
+              type: ["string", "number"],
+              description:
+                "Page to render, as a page id, page name or 0-based index. " +
+                "Omit to render the page currently on screen.",
+            },
+          },
+        },
+      },
+      {
+        name: "drawio_pages",
+        description:
+          "List the document's pages and, optionally, bring one on screen. " +
+          "Pages are created, renamed, deleted, duplicated and reordered with " +
+          "drawio_ops (add_page, rename_page, delete_page, duplicate_page, " +
+          "move_page) — this tool only reads them and moves the view. You do " +
+          "NOT need to switch pages to edit one: drawio_ops({page}) targets any " +
+          "page directly. Switch when the user asked to be shown a page, or " +
+          "before a screenshot of it.",
+        displayMessage: "📑 Pages",
+        tier: "safe",
+        inputSchema: {
+          type: "object",
+          properties: {
+            select: {
+              type: ["string", "number"],
+              description:
+                "Page to bring on screen: page id, page name, or 0-based index. " +
+                "Omit to only list.",
+            },
           },
         },
       },
@@ -3557,7 +4156,10 @@ return {
       },
       {
         name: "drawio_save",
-        description: "Save/download the diagram as .drawio, .png, or .svg.",
+        description:
+          "Save/download the diagram as .drawio, .png, or .svg. The .drawio file " +
+          "holds every page; png and svg capture only the page on screen — use " +
+          "drawio_pages({select}) first to choose which.",
         displayMessage: "💾 Saving diagram as {{format}}",
         tier: "mutating",
         inputSchema: {
@@ -3601,6 +4203,9 @@ return {
           break;
         case "drawio_render":
           result = await toolRender(args);
+          break;
+        case "drawio_pages":
+          result = await toolPages(args);
           break;
         case "drawio_config":
           result = await toolConfig(args);

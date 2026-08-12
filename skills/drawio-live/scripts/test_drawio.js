@@ -80,7 +80,14 @@ async function liveCanonical() {
 function hasCell(canon, id) {
   return new RegExp("^[VE] " + id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + " ", "m").test(canon);
 }
-// Canonical vertex line: V <id> p=<parent> "<label>" s=<style> g=[x,y,w,h]
+// Which page a cell lives on, from the canonical line's pg= field. Null only
+// for a bare <mxGraphModel> with no <diagram> wrapper, which has no page.
+function cellPage(canon, id) {
+  const line = cellLine(canon, id);
+  const m = line && line.match(/^[VE]\s+\S+\s+pg=(\S+)/);
+  return m ? m[1] : null;
+}
+// Canonical vertex line: V <id> pg=<page> p=<parent> "<label>" s=<style> g=[x,y,w,h]
 function cellLine(canon, id) {
   const re = new RegExp("^[VE] " + id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + " .*$", "m");
   const m = canon.match(re);
@@ -1005,6 +1012,229 @@ if (!driftTested) {
   results.push("⏭️  SKIPPED: drift detection (no out-of-band canvas mutation available)");
   console.log("⏭️  SKIPPED: drift detection — needs evaluateScript to simulate a user edit. " +
     "checkDrift and the guardrail's needsResync latch are UNCOVERED.");
+}
+
+// ---- Test 26: pages — the document, and the view ----
+//
+// Two things that are easy to conflate: which pages exist (XML, edited by ops)
+// and which one is on screen (not in the XML at all). The regression this
+// block exists for is the third assertion group: editing a page you are not
+// looking at, without being thrown back to page 1 by the load that a page-set
+// change forces.
+
+console.log("\n--- Test 26: pages ---");
+let pageSwitchWorks = true;
+
+// Seed a cell of our own on the first page. Nothing from the earlier tests can
+// be assumed to still be there: freshPage() replaces the whole document, and
+// the last one ran at Test 20. Asserting on a cell from Test 2 would report
+// "the batch clobbered the first page" for a document that was legitimately
+// reset five tests ago.
+parseResult(await tools.drawio_sync());
+const pgSeed = parseResult(
+  await tools.drawio_ops({
+    ops: [{ op: "add_node", id: "n.pg_seed", label: "Page One", x: 600, y: 600 }],
+  })
+);
+assert("pages: seeded a cell on the first page", pgSeed && pgSeed.ok === true,
+  JSON.stringify(pgSeed && pgSeed.error));
+
+const pgAdd = parseResult(
+  await tools.drawio_ops({
+    ops: [
+      { op: "add_page", id: "page-arch", name: "Architecture" },
+      { op: "add_page", id: "page-data", name: "Data" },
+    ],
+  })
+);
+assert("pages: two pages added in one batch", pgAdd && pgAdd.ok === true,
+  JSON.stringify(pgAdd && pgAdd.error));
+assert("pages: add_page reports the created id", pgAdd && pgAdd.report &&
+  pgAdd.report.some((r) => r.op === "add_page" && r.id === "page-arch"),
+  JSON.stringify(pgAdd && pgAdd.report));
+
+const pgList = parseResult(await tools.drawio_pages());
+// The first page's id is whatever the last freshPage() left behind, so read it
+// rather than assuming "page-1" — and read it now, before move_page reorders.
+const pgFirstId = (pgList && pgList.pages && pgList.pages[0] && pgList.pages[0].id) || "";
+assert("pages: drawio_pages lists them", pgList && Array.isArray(pgList.pages) &&
+  pgList.pages.some((p) => p.id === "page-arch") &&
+  pgList.pages.some((p) => p.id === "page-data"),
+  JSON.stringify(pgList && pgList.pages));
+assert("pages: names come back", pgList && pgList.pages &&
+  (pgList.pages.find((p) => p.id === "page-arch") || {}).name === "Architecture",
+  JSON.stringify(pgList && pgList.pages));
+
+// --- Editing a page WITHOUT switching to it.
+parseResult(await tools.drawio_sync());
+const pgEdit = parseResult(
+  await tools.drawio_ops({
+    page: "Architecture",
+    ops: [
+      { op: "add_node", id: "n.arch_a", label: "Service A", x: 40, y: 40 },
+      { op: "add_node", id: "n.arch_b", label: "Service B", x: 40, y: 200 },
+      { op: "add_edge", id: "e.arch_ab", source: "n.arch_a", target: "n.arch_b" },
+    ],
+  })
+);
+assert("pages: ops scoped by page name succeed", pgEdit && pgEdit.ok === true,
+  JSON.stringify(pgEdit && pgEdit.error));
+const pgCanon1 = await liveCanonical();
+assert("pages: the cells landed ON page-arch", cellPage(pgCanon1, "n.arch_a") === "page-arch",
+  "n.arch_a is on " + cellPage(pgCanon1, "n.arch_a"));
+assert("pages: the edge landed on page-arch too",
+  cellPage(pgCanon1, "e.arch_ab") === "page-arch",
+  "e.arch_ab is on " + cellPage(pgCanon1, "e.arch_ab"));
+// The real check on the push path: a scoped edit reaches page-arch through
+// `merge`, which reconciles the WHOLE document. Every other page has to come
+// out of it untouched.
+assert("pages: the first page's cells were not disturbed",
+  cellPage(pgCanon1, "n.pg_seed") === pgFirstId,
+  "n.pg_seed is on " + cellPage(pgCanon1, "n.pg_seed") + ", expected " + pgFirstId);
+
+// --- A batch may cross pages.
+parseResult(await tools.drawio_sync());
+const pgCross = parseResult(
+  await tools.drawio_ops({
+    page: "page-arch",
+    ops: [
+      { op: "add_node", id: "n.arch_c", label: "Service C", x: 300, y: 40 },
+      { op: "add_node", id: "n.data_a", label: "Orders", x: 40, y: 40, page: "Data" },
+    ],
+  })
+);
+assert("pages: cross-page batch succeeds", pgCross && pgCross.ok === true,
+  JSON.stringify(pgCross && pgCross.error));
+const pgCanon2 = await liveCanonical();
+assert("pages: per-op page overrides the batch page",
+  cellPage(pgCanon2, "n.arch_c") === "page-arch" &&
+  cellPage(pgCanon2, "n.data_a") === "page-data",
+  "n.arch_c=" + cellPage(pgCanon2, "n.arch_c") + " n.data_a=" + cellPage(pgCanon2, "n.data_a"));
+
+// --- Switching the view.
+const pgSelect = parseResult(await tools.drawio_pages({ select: "Data" }));
+if (pgSelect && pgSelect.error && /does not report the selected page/.test(pgSelect.error)) {
+  pageSwitchWorks = false;
+  results.push("⏭️  SKIPPED: page switching (this draw.io build reports no currentPage)");
+  console.log("⏭️  SKIPPED: page switching — build does not report currentPage.");
+} else {
+  assert("pages: select brings a page on screen", pgSelect && pgSelect.ok === true,
+    JSON.stringify(pgSelect && pgSelect.error));
+  assert("pages: the active page is the one selected",
+    pgSelect && pgSelect.active && pgSelect.active.id === "page-data",
+    JSON.stringify(pgSelect && pgSelect.active));
+}
+
+if (pageSwitchWorks) {
+  // --- Unscoped ops follow the user's eyes, not page 1.
+  parseResult(await tools.drawio_sync());
+  const pgDefault = parseResult(
+    await tools.drawio_ops({
+      ops: [{ op: "add_node", id: "n.data_b", label: "Invoices", x: 300, y: 40 }],
+    })
+  );
+  assert("pages: unscoped ops succeed", pgDefault && pgDefault.ok === true,
+    JSON.stringify(pgDefault && pgDefault.error));
+  assert("pages: unscoped ops land on the VISIBLE page",
+    cellPage(await liveCanonical(), "n.data_b") === "page-data",
+    "landed on " + cellPage(await liveCanonical(), "n.data_b"));
+
+  // --- The regression: a page-set change forces `load`, and setFileData
+  //     selects page 0 on every load. The user must stay where they were.
+  parseResult(await tools.drawio_sync());
+  const pgAdd2 = parseResult(
+    await tools.drawio_ops({ ops: [{ op: "add_page", id: "page-notes", name: "Notes" }] })
+  );
+  assert("pages: add_page during a session succeeds", pgAdd2 && pgAdd2.ok === true,
+    JSON.stringify(pgAdd2 && pgAdd2.error));
+  assert("pages: add_page went through load", pgAdd2 && pgAdd2.pushMethod === "load",
+    "pushMethod was " + (pgAdd2 && pgAdd2.pushMethod));
+  const pgAfterLoad = parseResult(await tools.drawio_pages());
+  assert("pages: the visible page SURVIVES the load a page-set change forces",
+    pgAfterLoad && pgAfterLoad.active && pgAfterLoad.active.id === "page-data",
+    "after the load the canvas is showing " +
+      JSON.stringify(pgAfterLoad && pgAfterLoad.active));
+
+  // --- Rendering a page brings it on screen.
+  const pgRender = parseResult(await tools.drawio_render({ format: "svg", page: "Architecture" }));
+  assert("pages: drawio_render({page}) renders and selects that page",
+    pgRender && pgRender.page && pgRender.page.id === "page-arch",
+    JSON.stringify(pgRender && (pgRender.error || pgRender.page)));
+}
+
+// --- Page CRUD: rename, duplicate (with id remapping), move, delete.
+parseResult(await tools.drawio_sync());
+const pgRename = parseResult(
+  await tools.drawio_ops({ ops: [{ op: "rename_page", page: "page-notes", name: "Scratch" }] })
+);
+if (pgRename && pgRename.ok) {
+  const renamed = parseResult(await tools.drawio_pages());
+  assert("pages: rename_page renames", renamed && renamed.pages &&
+    (renamed.pages.find((p) => p.id === "page-notes") || {}).name === "Scratch",
+    JSON.stringify(renamed && renamed.pages));
+} else {
+  assert("pages: rename_page renames", false, JSON.stringify(pgRename && pgRename.error));
+}
+
+parseResult(await tools.drawio_sync());
+const pgDup = parseResult(
+  await tools.drawio_ops({
+    ops: [{ op: "duplicate_page", page: "page-arch", newId: "page-arch2", name: "Architecture v2" }],
+  })
+);
+assert("pages: duplicate_page succeeds", pgDup && pgDup.ok === true,
+  JSON.stringify(pgDup && pgDup.error));
+const pgCanon3 = await liveCanonical();
+assert("pages: the copy's cells got fresh ids (no duplicates across pages)",
+  hasCell(pgCanon3, "n.arch_a") && hasCell(pgCanon3, "n.arch_a-page-arch2"),
+  "original or remapped copy missing");
+assert("pages: the copy's cells are on the copy",
+  cellPage(pgCanon3, "n.arch_a-page-arch2") === "page-arch2",
+  "copy cell is on " + cellPage(pgCanon3, "n.arch_a-page-arch2"));
+
+parseResult(await tools.drawio_sync());
+const pgMove = parseResult(
+  await tools.drawio_ops({ ops: [{ op: "move_page", page: "page-arch", to: 0 }] })
+);
+assert("pages: move_page reorders", pgMove && pgMove.ok === true,
+  JSON.stringify(pgMove && pgMove.error));
+const pgMoved = parseResult(await tools.drawio_pages());
+assert("pages: the moved page is first now",
+  pgMoved && pgMoved.pages && pgMoved.pages[0] && pgMoved.pages[0].id === "page-arch",
+  JSON.stringify(pgMoved && pgMoved.pages));
+
+parseResult(await tools.drawio_sync());
+const pgDel = parseResult(
+  await tools.drawio_ops({ ops: [{ op: "delete_page", page: "Architecture v2" }] })
+);
+assert("pages: delete_page succeeds", pgDel && pgDel.ok === true,
+  JSON.stringify(pgDel && pgDel.error));
+assert("pages: the deleted page is gone from the canvas",
+  !/^P page-arch2 /m.test(await liveCanonical()), "page-arch2 is still there");
+
+// --- Bad references fail loudly, and name the pages that do exist.
+parseResult(await tools.drawio_sync());
+const pgBad = parseResult(
+  await tools.drawio_ops({ ops: [{ op: "add_node", id: "n.nowhere", label: "X", x: 0, y: 0 }], page: "No Such Page" })
+);
+assert("pages: an unknown page reference is an error",
+  (pgBad && pgBad.error) || (pgBad && pgBad.__error), JSON.stringify(pgBad));
+assert("pages: the error lists the pages that do exist",
+  pgBad && String(pgBad.error || pgBad.message || "").indexOf("Pages:") !== -1,
+  JSON.stringify(pgBad && (pgBad.error || pgBad.message)));
+
+// --- The last page cannot be deleted.
+const pgSingle = await freshPage("Single Page");
+if (pgSingle && pgSingle.success) {
+  parseResult(await tools.drawio_sync());
+  const pgDelLast = parseResult(
+    await tools.drawio_ops({ ops: [{ op: "delete_page", page: 0 }] })
+  );
+  assert("pages: deleting the only page is refused",
+    (pgDelLast && pgDelLast.error) || (pgDelLast && pgDelLast.__error),
+    JSON.stringify(pgDelLast));
+} else {
+  results.push("⏭️  SKIPPED: delete-the-only-page guard (could not reset the canvas)");
 }
 
 // ---- Summary ----

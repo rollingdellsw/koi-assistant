@@ -41,6 +41,9 @@ allowed-tools:
   - drawio_arrange
   - drawio_validate
   - drawio_render
+  # Lists the document's pages and moves the view between them. Page CRUD is
+  # ops, not this tool — see the Pages section of the body.
+  - drawio_pages
   # Reads (or sets) which draw.io deployment this session talks to. The skill's
   # scripts set it before the tab opens; the pre-send hook reads it.
   - drawio_config
@@ -186,8 +189,9 @@ drawio_ops({ "ops": [
 
 Available ops: `add_node`, `add_edge`, `set_label`, `set_edge_label`,
 `set_edge_points`, `set_edge_anchor`, `resize_to_fit`, `set_style`,
-`set_geometry`, `move_by`, `delete`, `adopt`, `add_page`, `align`,
-`distribute`, `grid_layout`.
+`set_geometry`, `move_by`, `delete`, `adopt`, `align`, `distribute`,
+`grid_layout`, plus the page ops `add_page`, `rename_page`, `delete_page`,
+`duplicate_page`, `move_page` (see Pages).
 
 **Connectors have three ops of their own, and none of them moves a shape.**
 Aligning the boxes does not align the lines between them — that is a separate
@@ -410,6 +414,54 @@ Fix what you find with another `drawio_ops` call (max 2 fix rounds), then reply
 describing what you did. Do not describe a layout you have not looked at: "I
 re-routed the connectors around the obstacles" is a claim about pixels, and
 `route`'s success message is not evidence for it.
+
+## Pages
+
+A `.drawio` file holds a list of pages; draw.io shows one at a time, with tabs
+along the bottom. Two separate things follow, and conflating them is the usual
+mistake:
+
+**The document — which pages exist.** Ordinary ops, batched and pushed like any
+other edit:
+
+```json
+drawio_ops({"ops": [
+  {"op": "add_page",       "id": "page-data", "name": "Data Model"},
+  {"op": "rename_page",    "page": "page-2",  "name": "Sequence"},
+  {"op": "duplicate_page", "page": "Data Model", "name": "Data Model v2"},
+  {"op": "move_page",      "page": "page-data", "to": 0},
+  {"op": "delete_page",    "page": "Sequence"}
+]})
+```
+
+**The view — which page is on screen.** Not in the file at all:
+
+```json
+drawio_pages()                        // list pages + which one is showing
+drawio_pages({"select": "Data Model"}) // bring one on screen
+```
+
+**Editing a page does not require switching to it.** `page` scopes a batch, and
+any single op can override it. A page reference is a page id, a page name, or a
+0-based index:
+
+```json
+drawio_ops({"page": "Data Model", "ops": [
+  {"op": "add_node", "id": "n.orders", "label": "Orders", "x": 40, "y": 40},
+  {"op": "add_node", "id": "n.legend", "label": "Legend", "x": 40, "y": 400,
+   "page": "page-1"}
+]})
+```
+
+Omit `page` and ops land on the page the user is looking at — which is what
+"add a box here" means when they are staring at page 3. `drawio_sync` reports
+`pages` and `activePage` whenever there is more than one page; read them before
+assuming which page you are on.
+
+Switch pages only when the user asked to see one, or before `takeScreenshot()`
+— screenshots, `drawio_save({format:"png"|"svg"})` and `drawio_render` all
+capture the visible page. `drawio_render({page})` switches for you and leaves
+that page selected.
 
 ## Validation
 

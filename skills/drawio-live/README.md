@@ -2,7 +2,6 @@
 
 `drawio-live` enables turn-based human/AI co-editing of draw.io diagrams directly inside a live browser tab. The AI interacts with the canvas through structured XML mutations and layout operations, while the human user edits freely in the GUI. Both sides stay in sync through automated turn boundaries and text-based delta diffing.
 
-
 <div align="center">
   <img src="./screenshot.png" width="100%" alt="Opus 5 generates the diagram">
   <br>
