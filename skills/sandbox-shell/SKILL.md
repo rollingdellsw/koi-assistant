@@ -35,9 +35,8 @@ allowed-tools:
   - listConsoleMessages
   - listPages
   - sandbox_exec
+  - overlay_fs_sync
   - sandbox_open_project
-  - sandbox_write_file
-  - sandbox_apply_patch
   - sandbox_start_service
   - sandbox_restart_service
   - sandbox_service_logs
@@ -54,18 +53,26 @@ allowed-tools:
   - get_lsp_diagnostics
 guardrails: scripts/guardrail.js
 reminders:
-  - id: "sandbox:restart-services"
+  - id: "sandbox:prefer-lsp"
     trigger:
-      type: "tool_result"
-      toolName: "^(sandbox_apply_patch|sandbox_write_file)$"
-    content: "You just edited a file. If there are running services (like a dev server), you MUST call sandbox_restart_service for them to see the changes."
-    strategy: "one_shot"
+      type: "file_pattern"
+      pattern: '\.(ts|tsx|js|jsx|rs|py|go|cpp|c|h|hpp)$'
+    content: "For cross-file symbol lookups, type definitions, callers, or implementations, prefer semantic LSP tools (`search` -> `get_references`, `get_implementation`, `get_hover`) over text grep to avoid false positives."
+    strategy: "sticky"
+    priority: "medium"
   - id: "sandbox:outbox-delivery"
     trigger:
       type: "tool_result"
       toolName: "sandbox_exec"
       outputPattern: "git (format-patch|bundle create)"
     content: "Artifact generated! Tell the user the exact host path from sandbox_info.outbox AND the exact filename you just wrote (ls it). Remember: Files left in the overlay are invisible to the user."
+    strategy: "one_shot"
+  - id: "sandbox:truncation-recovery"
+    trigger:
+      type: "tool_result"
+      toolName: "sandbox_exec"
+      outputPattern: "Output truncated"
+    content: "Output was truncated. It is safe to redirect chatty build/test logs to a file in the overlay (e.g. `cmd > test.log 2>&1; echo EXIT:$?`), then use `grep -C 5` or `tail -n 50` to inspect the exact failure without flooding context."
     strategy: "one_shot"
   - id: "sandbox:creds-access"
     trigger:
@@ -91,7 +98,7 @@ You have a **shell on the user's machine inside a sandbox**, plus **LSP code int
    is `$KOI_OUTBOX`. For a GREENFIELD project the overlay tree is itself
    host-visible at `sandbox_info.overlayHostPath` and the user copies it out —
    delivery there is automatic and cannot fail. See "Shipping changes".
-3. **LSP Syncing:** Use `sandbox_apply_patch` or `sandbox_write_file` to edit code. Shell edits (`sed -i`) will **not** update the LSP's memory.
+3. **LSP Syncing:** All edits are made via `sandbox_exec` (e.g. atomic Python scripts or `cat << 'EOF' > file`). The guardrail automatically invokes `overlay_fs_sync` after `sandbox_exec` so code intelligence and LSP memory stay immediately synchronized with the overlay.
 4. **No Guessing:** Never guess the outbox path or context lines for a patch. Always read the file or call `sandbox_info` first.
 5. **Masked Paths:** The host's `/tmp`, `/run`, and credential files (`~/.ssh`, `~/.aws`, etc.) are hidden for security. **Never** tell the user these files "do not exist". Explicitly state: _"This path is masked from the sandbox."_ If you need them for a build, ask the user to restart the MCP server with `--allow-creds`.
 
@@ -116,14 +123,14 @@ For sustained work on one codebase (editing, building, testing, shipping patches
 
 ## Mental model (critical)
 
-| Layer        | What it is                                                                                                        |
-| ------------ | ----------------------------------------------------------------------------------------------------------------- |
-| Host tree    | Real project; **read-only** to you                                                                                |
-| Overlay      | Your writes, including `.git` mutations — commits stay here, host untouched                                       |
-| Outbox       | `$KOI_OUTBOX` in your shell; files written there appear on the host                                               |
-| Overlay path | `sandbox_info.overlayHostPath` — the overlay's host-side location. On greenfield this is the whole project tree   |
-| Services     | Long-running processes owned by the server (e.g. dev servers)                                                     |
-| LSP          | Host-tree index **plus your synced edits** — write/patch tools mirror into it (shell-side edits are not mirrored) |
+| Layer        | What it is                                                                                                      |
+| ------------ | --------------------------------------------------------------------------------------------------------------- |
+| Host tree    | Real project; **read-only** to you                                                                              |
+| Overlay      | Your writes, including `.git` mutations — commits stay here, host untouched                                     |
+| Outbox       | `$KOI_OUTBOX` in your shell; files written there appear on the host                                             |
+| Overlay path | `sandbox_info.overlayHostPath` — the overlay's host-side location. On greenfield this is the whole project tree |
+| Services     | Long-running processes owned by the server (e.g. dev servers)                                                   |
+| LSP          | Host-tree index **plus your synced edits** — automatically synced after `sandbox_exec` mutations                |
 
 ## Navigating code: LSP first, tree-sitter second, grep last
 
@@ -176,9 +183,8 @@ read_ast_node({ file_path: "src/user.rs", name: "User", node_type: "class" })
 ```
 
 It reads through your overlay, so it reflects unshipped edits. **To replace a
-declaration:** call it first, then use the returned `code` as patch context for
-`sandbox_apply_patch` — `start_line`/`end_line` give you the exact span. Never
-hand-count context lines (Golden Rule 4).
+declaration:** call it first, then use the returned `code` as target strings for an
+atomic Python replacement in `sandbox_exec` (`assert old in s; s = s.replace(old, new, 1)`).
 
 **`search_ast` — find a code shape.**
 
@@ -220,21 +226,55 @@ If a tool reports that `ast-grep` is missing, tell the user how to install it
 `cargo install ast-grep --locked`) and that the Gateway needs a restart
 afterwards. Do not retry until they confirm; `search` still works meanwhile.
 
-Never run `ast-grep -U` / `--update-all` in `sandbox_exec` — it rewrites files
-behind the LSP's back. Preview with `--rewrite`, apply with
-`sandbox_apply_patch`.
+Preview ast-grep rewrites with `ast-grep run -p '<pattern>' --rewrite '<replacement>'`,
+then apply them with an atomic script in `sandbox_exec`.
 
 ## Build / test / services
 
 - `sandbox_exec` for finite work: `make`, `cargo build`, `npm test`.
 - `sandbox_start_service` for background dev servers. After edits, use `sandbox_restart_service` so the service sees your overlay changes.
 
-**Shell is `/bin/sh`, not bash.** Commands run through `sh -c`, so bashisms
-fail with `Bad substitution` / `Illegal number`: no `${PIPESTATUS[@]}`, no
-`<(...)` process substitution, no `[[ ]]`. To capture the exit code of a
-command whose output you also want to filter, redirect to a file and check
-`$?` on its own line (`cmd > out.log 2>&1; echo "EXIT: $?"; grep ... out.log`)
-rather than piping and reading `PIPESTATUS`.
+### Atomic multi-edit & in-memory verification (`sandbox_exec`)
+
+For delicate multi-location edits, polyglot/embedded scripts, or when recovering from failed patches, prefer executing an **atomic edit-and-verify pipeline** in a single `sandbox_exec` turn:
+
+```bash
+cp file.ext file.ext.bak && python3 - <<'PY'
+s = open('file.ext').read()
+
+old1 = '''...'''
+new1 = '''...'''
+assert old1 in s, "old1 not found"
+s = s.replace(old1, new1, 1)
+
+old2 = '''...'''
+new2 = '''...'''
+assert old2 in s, "old2 not found"
+s = s.replace(old2, new2, 1)
+
+open('file.ext', 'w').write(s)
+print("Edits applied successfully")
+PY
+npm test && python3 -m pyflakes ...
+```
+
+**Why this works best for complex edits:**
+
+- **Transactional safety:** If any `assert` fails, the file is never written to disk.
+- **1-turn turnaround:** Edit, build, lint, and test occur in a single round trip.
+- **No diff context failures:** Raw multiline strings bypass patch fuzzing and line-number mismatches.
+- **LSP Note:** Shell writes land in the overlay filesystem; call `overlay_fs_sync` if you need the LSP to refresh its symbol cache/diagnostics immediately.
+
+**Shell is `bash` (`/bin/bash`).** Commands run through `bash -c`, so standard
+bash syntax (such as `[[ ... ]]`, process substitution `<(...)`, and `${PIPESTATUS[@]}`)
+is fully supported. Environment defaults include `CI=1`, `DEBIAN_FRONTEND=noninteractive`,
+and `TERM=dumb` to prevent interactive CLI prompts and spinners from hanging.
+
+**Managing verbose test & build logs (Log-to-file pattern):**
+Heavy test suites (`npm test`, `cargo test`, `pytest`) can emit tens of kilobytes of output, exceeding token caps and truncating root assertion failures. Since the overlay filesystem is safe and isolated:
+
+1. Redirect output to a log file: `npm test > test.log 2>&1; echo "EXIT: $?"`
+2. Search for the root failure: `grep -C 5 -E "(FAIL|Error|AssertionError|panic)" test.log | head -n 40` (or `tail -n 30 test.log`)
 
 **Timeout Reminder:**
 The default timeout for `sandbox_exec` is 120,000ms (2 minutes). For heavy commands like `npm install`, `cargo build`, or downloading large dependencies, you **must** pass a higher `timeout_ms` (e.g., `300000` for 5 minutes) to prevent premature termination.
@@ -242,7 +282,11 @@ The default timeout for `sandbox_exec` is 120,000ms (2 minutes). For heavy comma
 ## Shipping changes (Git-native)
 
 0. **Ignore first:** before the FIRST `git add -A` in a new repo, write `.gitignore` (`node_modules/`, `dist/`, `build/`, `target/`, `.venv/`, `__pycache__/`, `.next/`, `coverage/`, `*.log`, `.env`). You ship **source and config only** — keep the manifest and the lockfile so the user can rebuild. An artifact carrying installed dependencies or build output is a defect; the git wrapper will refuse to export one.
-1. **Checkpoint:** `git add -A && git commit -m "feat: your changes"` (Host is untouched; this lives in your overlay).
+1. **Checkpoint & Rollback (Native Git in Overlay):**
+   The `.git` directory in the overlay is fully writable and isolated from the host. Use standard Git for micro-checkpoints, experimental branches, and instant rollbacks:
+   - **Checkpoint milestone:** `git add -A && git commit -m "feat: step 1 passes tests"`
+   - **Roll back bad changes:** `git reset --hard HEAD` (or jump to a prior commit: `git checkout <commit>`)
+   - **Scratch experiment:** `git checkout -b try-idea` -> discard with `git checkout main && git branch -D try-idea` if it fails.
 2. **Export — one form only, whichever `sandbox_info.gitWorkflow` names:**
    - existing host tree: `git format-patch -o "$KOI_OUTBOX" <base>..HEAD` (use `git rev-parse HEAD` at session start to get `<base>`)
    - **greenfield** (the host path did not exist): **nothing here is
@@ -296,8 +340,9 @@ The default timeout for `sandbox_exec` is 120,000ms (2 minutes). For heavy comma
 ## Typical session
 
 1. `sandbox_info`; `sandbox_open_project`; `git rev-parse HEAD` as `<base>`.
+   _(If the user applies your patches mid-session, run `git rev-parse HEAD` again to get the new `<base>` before making further edits, or you will export duplicate patches)._
 2. Explore with `search` / `get_references`.
-3. Edit with `sandbox_apply_patch`.
+3. Edit with atomic in-memory Python script via `sandbox_exec`.
 4. Build/test with `sandbox_exec`.
 5. `git commit` per verified milestone.
 6. Export per `gitWorkflow` (`git format-patch -o "$KOI_OUTBOX" <base>..HEAD`; on greenfield the `cp -r` from `overlayHostPath` is the delivery and a sha-stamped `git bundle create` is optional) → tell the user the real host path, the exact artifact filenames, and the matching `cp -r` / `git am` / `git clone` command.

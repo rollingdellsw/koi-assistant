@@ -25,9 +25,15 @@
 const [canvasUrlArg] = args;
 
 // Filled in from drawio_config before any tab is touched. The literals here are
-// only a fallback for an MCP too old to answer, and are never used to open a
-// tab — only to recognize one.
+// only a fallback for an MCP too old to answer.
+//
+// CRITICAL: open HOST_URL, never CANVAS_URL. CANVAS_URL carries
+// ?embed=1&proto=json and is loaded inside an iframe by the bridge. Opening it
+// as a top-level tab lets draw.io window.close() a script-opened tab the moment
+// the embed handshake has no parent — the tab vanishes, waitForCanvasTab times
+// out, and the user sees "tools pointed at another tab (unknown)".
 let CANVAS_URL = null;
+let HOST_URL = null;
 let CANVAS_HOSTS = ["embed.diagrams.net", "viewer.diagrams.net", "localhost", "127.0.0.1"];
 
 function unwrap(res) {
@@ -58,6 +64,39 @@ async function pageList() {
   }
 }
 
+// listPages' id key is not contractually fixed either — normalize it here so
+// the polling below can compare ids from newPage against ids from listPages.
+function tabIdOf(p) {
+  if (!p) return null;
+  const id = p.id != null ? p.id : p.pageId != null ? p.pageId : p.tabId;
+  return id == null ? null : id;
+}
+
+// A tab that was just created is not necessarily enumerable yet, and while the
+// navigation commits its url is often empty or still the pre-navigation value.
+// Sampling listPages once after a fixed sleep therefore loses a race that no
+// amount of sleeping closes: the old code logged "could not find it" and
+// carried on WITHOUT selectPage, leaving the tools pointed at the new-tab page,
+// where the bridge's evaluateScript fails with "Cannot access a chrome:// URL".
+// Poll until the canvas shows up instead.
+async function waitForCanvasTab(hintId, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 20000);
+  while (Date.now() < deadline) {
+    const pages = await pageList();
+    // Prefer the tab newPage actually created; fall back to matching by URL
+    // for the case where newPage returned nothing useful.
+    const byId =
+      hintId == null ? null : pages.find((p) => tabIdOf(p) === hintId);
+    if (byId && isCanvasUrl(byId.url)) return hintId;
+    const byUrl = pages.find((p) => isCanvasUrl(p.url));
+    if (byUrl) return tabIdOf(byUrl);
+    await tools.sleep(500);
+  }
+  // Timed out with the URL never settling. If newPage gave us an id, focusing
+  // it is still better than leaving the active tab wherever it was.
+  return hintId;
+}
+
 // Best-effort read of the ACTIVE tab's URL. listPages' active-flag key is not
 // contractually fixed, so try the flag first and fall back to getPageContext,
 // which reports meta.url for the tab the tools would actually operate on.
@@ -86,6 +125,16 @@ async function loadMcp() {
   return typeof tools.drawio_init === "function";
 }
 
+function hostUrlFrom(canvasOrHost) {
+  try {
+    const u = new URL(canvasOrHost);
+    const path = u.pathname && u.pathname !== "" ? u.pathname : "/";
+    return u.origin + path;
+  } catch (_) {
+    return "https://embed.diagrams.net/";
+  }
+}
+
 async function resolveDeployment() {
   try {
     const cfg = unwrap(
@@ -94,7 +143,15 @@ async function resolveDeployment() {
     if (cfg && cfg.error) return cfg.error;
     if (cfg && cfg.canvasUrl) {
       CANVAS_URL = cfg.canvasUrl;
+      // Prefer the MCP's hostUrl (strips embed query). Fall back locally for
+      // older MCP builds that returned the same string for both.
+      HOST_URL = cfg.hostUrl ? hostUrlFrom(cfg.hostUrl) : hostUrlFrom(cfg.canvasUrl);
       if (Array.isArray(cfg.hosts) && cfg.hosts.length) CANVAS_HOSTS = cfg.hosts;
+      console.log(
+        "canvas: " + CANVAS_URL.split("?")[0] +
+          " host: " + HOST_URL +
+          (cfg.source ? " (source: " + cfg.source + ")" : "")
+      );
     }
   } catch (e) {
     console.log("drawio_config note: " + (e.message || e));
@@ -108,6 +165,7 @@ async function resolveDeployment() {
         ? origin + "/?embed=1&proto=json&spin=1&modified=0&libraries=1&ui=kennedy&noExitBtn=1"
         : origin;
   }
+  if (!HOST_URL) HOST_URL = hostUrlFrom(CANVAS_URL);
   return null;
 }
 
@@ -149,10 +207,45 @@ async function run() {
       action = "focused-existing";
       console.log("Focused existing canvas tab " + id);
     } else {
-      await tools.newPage(CANVAS_URL);
-      await tools.sleep(4000); // draw.io needs time before the bridge can attach
+      // Open the HOST document, not the embed canvas URL. The bridge installs
+      // an iframe pointed at CANVAS_URL; the top-level tab must not carry
+      // ?proto=json or draw.io will window.close() a script-opened tab.
+      // newPage also does not guarantee the new tab becomes ACTIVE for tools —
+      // always selectPage after.
+      const created = unwrap(await tools.newPage(HOST_URL));
+      const hintId = tabIdOf(created) || tabIdOf(created && created.page);
+      console.log("newPage host=" + HOST_URL + " pageId=" + hintId);
+
+      const openedId = await waitForCanvasTab(hintId, 20000);
+      if (openedId != null) {
+        // Confirm the tab is still alive. A vanished pageId is the classic
+        // symptom of opening CANVAS_URL (embed/proto) top-level.
+        const stillThere = (await pageList()).some(
+          (p) => String(tabIdOf(p)) === String(openedId),
+        );
+        if (!stillThere) {
+          return {
+            success: false,
+            action: "opened",
+            error: "canvas tab self-closed",
+            findings:
+              "Opened a draw.io tab (pageId " + openedId + ") but it closed " +
+              "itself immediately. This happens when the top-level URL carries " +
+              "the embed protocol (?embed=1&proto=json) — draw.io then " +
+              "window.close()s a script-opened tab. The skill should open the " +
+              "host URL (" + HOST_URL + ") and frame the canvas in an iframe. " +
+              "Re-run the skill; if it keeps failing, update the drawio-live skill.",
+          };
+        }
+        await tools.selectPage(openedId);
+        await tools.sleep(500);
+      } else {
+        console.log("Opened the host tab but never saw it in listPages.");
+      }
+      await tools.sleep(1500); // host document boot; iframe is installed later by drawio_init
+
       action = "opened";
-      console.log("Opened a new canvas tab.");
+      console.log("Opened a new host tab for the draw.io canvas.");
     }
   }
 
@@ -160,6 +253,54 @@ async function run() {
   // tell us which URL to open. Registering it does NOT put the SKILL.md body in
   // front of the model; that arrives when the skill auto-loads on the canvas tab
   // or when the model calls readSkill itself.
+
+  // Last line of defence: attaching to the wrong tab produces a chrome:// error
+  // from deep inside the bridge, which reads as a draw.io failure. Check first
+  // and say something the user can act on.
+  const pagesNow = await pageList();
+  const activeNow = await activeUrl(pagesNow);
+  const anyCanvas = pagesNow.find((p) => isCanvasUrl(p.url));
+  if (!isCanvasUrl(activeNow)) {
+    // If a canvas/host tab exists but isn't active, try one more selectPage
+    // before giving up — listPages has no active flag, so activeUrl depends on
+    // getPageContext which can lag a focus change.
+    if (anyCanvas) {
+      const id = tabIdOf(anyCanvas);
+      console.log("activeUrl not canvas (" + (activeNow || "null") + "); re-selecting " + id);
+      try {
+        await tools.selectPage(id);
+        await tools.sleep(500);
+      } catch (e) {
+        console.log("re-select failed: " + (e.message || e));
+      }
+      const retry = await activeUrl(await pageList());
+      if (isCanvasUrl(retry)) {
+        // fall through to drawio_init
+      } else {
+        return {
+          success: false,
+          action,
+          error: "canvas tab not active",
+          findings:
+            "A draw.io host tab is open (" + (anyCanvas.url || id) + "), but " +
+            "the browser tools are still pointed at another tab (" +
+            (retry || activeNow || "unknown") + "). Click the draw.io tab to " +
+            "focus it, then run the skill again.",
+        };
+      }
+    } else {
+      return {
+        success: false,
+        action,
+        error: "canvas tab not active",
+        findings:
+          "No draw.io host tab is open (tools see: " +
+          (activeNow || "unknown") + "). The tab may have self-closed after " +
+          "being opened at the embed URL (?proto=json). Run the skill again; " +
+          "it should open " + (HOST_URL || "the host origin") + " instead.",
+      };
+    }
+  }
 
   // Attach in adopt mode: never writes to the canvas. A diagram the user
   // already has open survives untouched, and a blank canvas stays blank for

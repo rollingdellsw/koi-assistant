@@ -48,9 +48,6 @@
  *     - disk gc:    same reason. Session overlays are a CACHE (see
  *                   --max-overlay-size, default 10GB): once the total exceeds
  *                   the cap the OLDEST overlays are deleted automatically
- *     - write/patch: structured edits (content-matched hunks, per-hunk
- *                   failure reporting) are far more reliable for LLMs than
- *                   shell heredocs; kept for ergonomics, not security
  *     - open_project/info: server state management
  *
  * Usage (spawned by koi-gateway.js, see gateway-config.json):
@@ -70,17 +67,6 @@ import { fileURLToPath } from 'url';
 
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SELF_PATH = fileURLToPath(import.meta.url);
-
-/**
- * Patch-engine error. Declared HERE, not next to the patcher below, because
- * `class` declarations are not hoisted: the `patch` CLI (and any other early
- * caller) invokes the hoisted patcher functions before the patcher section is
- * evaluated, and constructing a still-in-TDZ class throws
- * "Cannot access 'PatchError' before initialization".
- */
-class PatchError extends Error {
-  constructor(message) { super(message); this.name = 'PatchError'; }
-}
 
 // =============================================================================
 // `review` CLI — host-side, READ-ONLY live view of a session overlay
@@ -292,295 +278,6 @@ if (process.argv[2] === 'review') {
   process.exit(await runReviewCli(process.argv.slice(3)));
 }
 
-// =============================================================================
-// `patch` CLI — host-side test harness for the patch engine
-// -----------------------------------------------------------------------------
-// `node sandbox-shell-mcp.mjs patch [options] <file.patch|->` replays a real
-// diff through EXACTLY the parser/matcher that sandbox_apply_patch uses
-// (parsePatch / applyHunksToContent / isFileDeletionHunk are hoisted function
-// declarations, so they are callable from here — before parseArgs(), setProject,
-// the backend or the LSP child exist), but against a plain host directory via
-// node fs instead of the sandbox overlay. Purpose: reproduce "hunk failed to
-// locate context" offline, against a real git format-patch, without booting a
-// topic.
-//
-// SAFE BY DEFAULT: without --apply nothing is written. Files are still READ, so
-// point --project at the tree the patch was generated against — otherwise every
-// hunk correctly fails to locate its context and the run tells you nothing.
-//
-// Like the review CLI, this block must run BEFORE any server side effect.
-// =============================================================================
-
-function patchUsage() {
-  return [
-    'usage: node sandbox-shell-mcp.mjs patch [options] <file.patch | ->',
-    '',
-    '  Run the sandbox_apply_patch engine against a host directory. Dry-run',
-    '  unless --apply is given. Reads "-" from stdin.',
-    '',
-    '  --project PATH        directory the patch applies to (default: cwd)',
-    '  --apply               actually write files (default: dry-run, read-only)',
-    '  --series              treat the input as a git format-patch SERIES and',
-    '                        apply each commit in order (default: all commits are',
-    '                        parsed into one squashed hunk set — which is what the',
-    '                        MCP tool does, and is usually wrong for a series)',
-    '  --parse-only          print the parsed file/hunk structure and exit',
-    '  -v, --verbose         print the full failing hunk text for each failure',
-    '  -h, --help            show this help and exit',
-    '',
-    'Examples:',
-    '  node sandbox-shell-mcp.mjs patch --project ~/workspace/deft-dev \\',
-    '      ~/workspace/deft-dev/0001-show-tool-call-tracing-in-coding-topic.patch',
-    '  git diff | node sandbox-shell-mcp.mjs patch --project . -',
-  ].join('\n');
-}
-
-function patchParseArgs(argv) {
-  const f = { apply: false, series: false, parseOnly: false, verbose: false, files: [] };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--apply') f.apply = true;
-    else if (a === '--series') f.series = true;
-    else if (a === '--parse-only') f.parseOnly = true;
-    else if (a === '-v' || a === '--verbose') f.verbose = true;
-    else if (a === '--project' && argv[i + 1]) f.project = argv[++i];
-    else if (a === '-h' || a === '--help') f.help = true;
-    else f.files.push(a);
-  }
-  return f;
-}
-
-/** Expand a leading ~ the way setProject() does, then resolve. */
-function patchExpandPath(p) {
-  let e = p;
-  if (e === '~') e = os.homedir();
-  else if (e.startsWith('~/')) e = path.join(os.homedir(), e.slice(2));
-  return path.resolve(e);
-}
-
-/**
- * Split a concatenated git format-patch series into per-commit chunks. A
- * series applied as one squashed hunk set misbehaves whenever two commits
- * touch the same region: the second commit's context only exists after the
- * first has been applied. --series replays them in order instead.
- */
-function patchSplitSeries(text) {
-  const lines = text.split('\n');
-  const starts = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (/^From [0-9a-f]{7,40} /.test(lines[i])) starts.push(i);
-  }
-  if (starts.length <= 1) return [{ subject: null, text }];
-  const out = [];
-  for (let k = 0; k < starts.length; k++) {
-    const chunk = lines.slice(starts[k], k + 1 < starts.length ? starts[k + 1] : lines.length);
-    const subjLine = chunk.find((l) => l.startsWith('Subject:'));
-    out.push({
-      subject: subjLine ? subjLine.replace(/^Subject:\s*(\[[^\]]*\]\s*)?/, '') : null,
-      text: chunk.join('\n'),
-    });
-  }
-  return out;
-}
-
-/**
- * Host-fs twin of applyHunksToFile(). Same ordering, same status strings, same
- * CRLF normalization as the sandbox path — so a green run here means the MCP
- * tool would also go green, and a red hunk here is the hunk that fails there.
- */
-function patchApplyHunksToFileOnHost(root, filepath, parsedHunks, opts) {
-  const abs = path.resolve(root, filepath);
-  if (path.relative(root, abs).startsWith('..')) {
-    throw new PatchError(
-      `Security violation: Attempted to patch file '${filepath}' ` +
-      'which is outside of the designated working directory.',
-    );
-  }
-
-  // In-memory overlay so --series chains correctly even in dry-run: commit N+1
-  // sees commit N's result without anything being written to disk.
-  const readMerged = () => {
-    if (opts.mem.has(abs)) {
-      const v = opts.mem.get(abs);
-      if (v === null) { const e = new Error(`ENOENT: ${abs}`); e.code = 'ENOENT'; throw e; }
-      return v;
-    }
-    return fs.readFileSync(abs, 'utf8');
-  };
-
-  let originalContent;
-  let fileExists = true;
-  try {
-    originalContent = readMerged().replace(/\r\n/g, '\n');
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      const firstHunk = parsedHunks[0];
-      const isFileCreation = firstHunk !== undefined && firstHunk.oldStart === 0 && firstHunk.oldCount === 0;
-      if (isFileCreation) { fileExists = false; originalContent = ''; }
-      else {
-        throw new PatchError(
-          `Target file '${filepath}' does not exist. ` +
-          'If this is meant to be a new file, the patch format should indicate ' +
-          'file creation (--- /dev/null with @@ -0,0 +1,N @@).',
-        );
-      }
-    } else throw error;
-  }
-
-  if (parsedHunks.length > 0 && isFileDeletionHunk(parsedHunks[0])) {
-    if (fileExists) {
-      opts.mem.set(abs, null);
-      if (opts.apply) fs.unlinkSync(abs);
-    }
-    return {
-      summary: `✅ ALL HUNKS APPLIED SUCCESSFULLY for ${filepath}\n\n✅ Hunk 1: Deleted file.${opts.apply ? '' : '  (dry-run: not deleted)'}`,
-      failedHunks: [],
-    };
-  }
-
-  const { newContent, appliedHunks, failedHunks, noOpHunks } =
-    applyHunksToContent(originalContent, parsedHunks);
-
-  const hunkResults = [];
-  parsedHunks.forEach((hunk, i) => {
-    const failure = failedHunks.find((f) => f.hunk.originalHunk === hunk.originalHunk);
-    if (failure !== undefined) {
-      hunkResults.push(
-        `❌ Hunk ${i + 1} (L${hunk.oldStart}): FAILED - ${failure.error.message.split('\n')[0]}` +
-        (opts.verbose ? `\n${hunk.originalHunk}` : ''),
-      );
-    } else if (noOpHunks.includes(hunk)) {
-      hunkResults.push(`✅ Hunk ${i + 1} (L${hunk.oldStart}): Skipped as no-op.`);
-    } else {
-      hunkResults.push(`✅ Hunk ${i + 1} (L${hunk.oldStart}): Applied successfully.`);
-    }
-  });
-
-  const successfulHunks = appliedHunks.length;
-  if (successfulHunks > 0 && (newContent !== originalContent || !fileExists)) {
-    opts.mem.set(abs, newContent);
-    if (opts.apply) {
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, newContent);
-    }
-  }
-
-  let status = '❌ ALL HUNKS FAILED';
-  if (successfulHunks > 0 && failedHunks.length === 0) status = '✅ ALL HUNKS APPLIED SUCCESSFULLY';
-  else if (successfulHunks > 0 && failedHunks.length > 0) status = `⚠️ PARTIAL SUCCESS: ${successfulHunks}/${parsedHunks.length} hunks applied`;
-  else if (successfulHunks === 0 && failedHunks.length === 0 && noOpHunks.length > 0) status = '✅ ALL HUNKS APPLIED SUCCESSFULLY';
-
-  return {
-    summary: [`${status} for ${filepath}`, '', ...hunkResults].join('\n'),
-    failedHunks: failedHunks.map((f) => f.hunk),
-  };
-}
-
-/** Apply one parsed diff (Map<file, Hunk[]>) to a host root. Returns a report. */
-function patchApplyOne(root, fileHunks, opts) {
-  const results = [];
-  let successfulFiles = 0, failedFiles = 0;
-  for (const [filepath, hunks] of fileHunks.entries()) {
-    try {
-      const { summary, failedHunks } = patchApplyHunksToFileOnHost(root, filepath, hunks, opts);
-      results.push(summary);
-      if (failedHunks.length > 0) failedFiles++; else successfulFiles++;
-    } catch (e) {
-      failedFiles++;
-      results.push(`❌ FAILED: ${filepath}\n   Error: ${e.message}`);
-    }
-  }
-  const totalFiles = successfulFiles + failedFiles;
-  let report = '';
-  if (totalFiles > 1) {
-    report += `📊 PATCH SUMMARY: ${successfulFiles}/${totalFiles} files patched successfully.\n`;
-    if (failedFiles > 0) report += `⚠️  ${failedFiles} files require manual intervention.\n`;
-    report += '\n';
-  }
-  report += results.join('\n\n');
-  if (failedFiles === 0) report += `\n\n✅ PATCH SUCCESS: ${successfulFiles}/${totalFiles} files patched.`;
-  else if (successfulFiles === 0) report += `\n\n❌ PATCH FAILED: 0/${totalFiles} files patched. See details below.`;
-  else report += `\n\n⚠️ PARTIAL PATCH: ${successfulFiles} file(s) applied, ${failedFiles} file(s) had failed hunks.`;
-  return { report, successfulFiles, failedFiles };
-}
-
-async function runPatchCli(argv) {
-  const f = patchParseArgs(argv);
-  f.mem = new Map(); // abs -> content, or null for "deleted"
-  if (f.help || f.files.length === 0) {
-    process.stdout.write(patchUsage() + '\n');
-    return f.help ? 0 : 2;
-  }
-  const root = patchExpandPath(f.project || '.');
-  if (!fs.existsSync(root)) {
-    process.stderr.write(`patch: --project ${root} does not exist\n`);
-    return 2;
-  }
-
-  let raw = '';
-  for (const src of f.files) {
-    try {
-      raw += src === '-'
-        ? fs.readFileSync(0, 'utf8')
-        : fs.readFileSync(patchExpandPath(src), 'utf8');
-      if (!raw.endsWith('\n')) raw += '\n';
-    } catch (e) {
-      process.stderr.write(`patch: cannot read ${src}: ${e.message}\n`);
-      return 2;
-    }
-  }
-
-  // Same input sanitation as the MCP tool, plus CRLF folding: a diff with CRLF
-  // line endings applied to an LF file matches only via the whitespace-fuzzy
-  // path and then splices CR back in.
-  const sanitized = raw.replace(/^> ?/gm, '').replace(/\r\n/g, '\n');
-  const commits = f.series ? patchSplitSeries(sanitized) : [{ subject: null, text: sanitized }];
-
-  process.stdout.write(
-    `# koi-sandbox patch — target ${root}\n` +
-    `# mode: ${f.apply ? 'APPLY (writes files)' : 'DRY-RUN (no writes)'}` +
-    `${f.series ? `, series: ${commits.length} commit(s)` : ''}\n\n`,
-  );
-
-  let rc = 0;
-  for (const [n, commit] of commits.entries()) {
-    if (f.series) {
-      process.stdout.write(`── [${n + 1}/${commits.length}] ${commit.subject || '(no subject)'} ──\n`);
-    }
-    let parsed;
-    try {
-      parsed = parsePatch(commit.text);
-    } catch (e) {
-      process.stderr.write(`patch: failed to parse the diff: ${e.message}\n`);
-      return 1;
-    }
-    if (parsed.size === 0) {
-      process.stdout.write('ERROR: No valid patches found in input. Please provide a standard unified diff.\n\n');
-      rc = 1;
-      continue;
-    }
-    if (f.parseOnly) {
-      for (const [file, hunks] of parsed.entries()) {
-        process.stdout.write(`${file}  (${hunks.length} hunk${hunks.length === 1 ? '' : 's'})\n`);
-        for (const h of hunks) process.stdout.write(`    ${h.header}\n`);
-      }
-      process.stdout.write('\n');
-      continue;
-    }
-    const { report, failedFiles } = patchApplyOne(root, parsed, f);
-    process.stdout.write(report + '\n\n');
-    if (failedFiles > 0) rc = 1;
-  }
-  if (!f.apply && !f.parseOnly) {
-    process.stdout.write('(dry-run — nothing was written; re-run with --apply to write)\n');
-  }
-  return rc;
-}
-
-if (process.argv[2] === 'patch') {
-  process.exit(await runPatchCli(process.argv.slice(3)));
-}
-
 // -----------------------------------------------------------------------------
 // Top-level `--help` / `-h`. The `review` subcommand has its own `--help`
 // (handled above, before this point), so this only prints the server usage —
@@ -590,7 +287,6 @@ function mainUsage() {
   return [
     'usage: node sandbox-shell-mcp.mjs [options]',
     '       node sandbox-shell-mcp.mjs review [options] [git args...]   (see: review --help)',
-    '       node sandbox-shell-mcp.mjs patch  [options] <file.patch>    (see: patch --help)',
     '',
     '  Sandboxed host-access MCP server (stdio, newline-delimited JSON-RPC) for',
     '  the Koi Gateway. Gives the LLM session a shell inside a lightweight overlay',
@@ -632,15 +328,6 @@ function mainUsage() {
     '                          review --session ID    pick a specific session overlay',
     '                        Run  node sandbox-shell-mcp.mjs review --help  for full options.',
     '',
-    '  patch <file.patch>    Replay a diff through the sandbox_apply_patch engine',
-    '                        against a plain host directory — no sandbox, no server.',
-    '                        DRY-RUN unless --apply. Use it to reproduce a hunk that',
-    '                        failed to locate context, offline.',
-    '                          patch --project ~/proj 0001-foo.patch    dry-run',
-    '                          patch --project ~/proj --apply 0001-foo.patch',
-    '                          patch --parse-only 0001-foo.patch        file/hunk map',
-    '                          patch --series *.patch                   commit by commit',
-    '                        Run  node sandbox-shell-mcp.mjs patch --help  for full options.',
     '',
     'Environment:',
     '  KOI_PROJECT           default value for --project.',
@@ -654,7 +341,6 @@ function mainUsage() {
     '  node sandbox-shell-mcp.mjs --project ~/code/app --net host',
     '  node sandbox-shell-mcp.mjs review --watch -n 2     # live-refresh every 2s',
     '  node sandbox-shell-mcp.mjs review show HEAD        # inspect the latest overlay commit',
-    '  node sandbox-shell-mcp.mjs patch --project ~/code/app 0001-fix.patch   # dry-run a patch',
   ].join('\n');
 }
 
@@ -766,6 +452,12 @@ function parseArgs() {
 }
 
 const OPTS = parseArgs();
+
+// Per-file tracing of lower->upper reconciliation. Off by default (it is one
+// line per refreshed file, every exec); reconciliation FAILURES are logged
+// unconditionally regardless of this flag — a silent desync is the one
+// outcome nobody can debug from the outside.
+const SYNC_DEBUG = process.env.KOI_SANDBOX_DEBUG_SYNC === '1';
 
 const OUTPUT_CAP = 200 * 1024;      // per-stream cap for exec output
 const LOG_CAP = 500 * 1024;         // per-service ring buffer
@@ -1360,9 +1052,20 @@ function buildMaskLists() {
 const { dirs: CRED_DIRS, files: CRED_FILES } = buildMaskLists();
 
 
+const SHELL_BIN = (() => {
+  for (const candidate of ['/bin/bash', '/usr/bin/bash', '/bin/sh']) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {}
+  }
+  return '/bin/sh';
+})();
+
 const BASE_ENV = {
   HOME: H,
-  TERM: 'xterm-256color',
+  TERM: 'dumb',
+  CI: '1',
+  DEBIAN_FRONTEND: 'noninteractive',
   LANG: process.env.LANG || 'C.UTF-8',
   GIT_TERMINAL_PROMPT: '0',        // never hang on credential prompts
   GIT_ASKPASS: '/bin/true',
@@ -1410,7 +1113,7 @@ class BwrapBackend {
   }
 
   /** Build the argv that runs `shCmd` inside the sandbox. */
-  wrap(shCmd, { cwd, extraEnv = {} } = {}) {
+  wrap(shCmd, { cwd } = {}) {
     const argv = ['bwrap',
       '--ro-bind', '/', '/',
       '--dev', '/dev',
@@ -1449,11 +1152,10 @@ class BwrapBackend {
       ...BASE_ENV,
       PATH: composeSandboxPath('/tmp/koi/bin'),
       KOI_OUTBOX: this.outboxInside, // git format-patch -o "$KOI_OUTBOX" lands on the host
-      ...extraEnv,
     };
     for (const [k, v] of Object.entries(env)) argv.push('--setenv', k, String(v));
     argv.push('--chdir', cwd || this.root);
-    argv.push('/bin/sh', '-c', shCmd);
+    argv.push(SHELL_BIN, '-c', shCmd);
     return { cmd: argv[0], args: argv.slice(1), spawnEnv: process.env };
   }
 
@@ -1511,18 +1213,17 @@ ${netRules}
     if (clone.status !== 0) spawnSync('cp', ['-R', PROJ.path + '/.', PROJ.dirs.workspace]);
   }
 
-  wrap(shCmd, { cwd, extraEnv = {} } = {}) {
+  wrap(shCmd, { cwd } = {}) {
     const env = {
       ...BASE_ENV,
       PATH: `${PROJ.dirs.bin}:` + (process.env.PATH || '/usr/local/bin:/usr/bin:/bin'),
       KOI_OUTBOX: this.outboxInside,
-      ...extraEnv,
     };
     // Mask credentials by pointing tools at empty config where env allows.
     env.GIT_SSH_COMMAND = 'false'; // ssh-based fetch/push both blocked on mac backend
     return {
       cmd: 'sandbox-exec',
-      args: ['-f', this.profile, '/bin/sh', '-c', `cd ${JSON.stringify(cwd || this.root)} && ${shCmd}`],
+      args: ['-f', this.profile, SHELL_BIN, '-c', `cd ${JSON.stringify(cwd || this.root)} && ${shCmd}`],
       spawnEnv: env,
     };
   }
@@ -1547,11 +1248,11 @@ class ExecBackend { // DEV/TEST ONLY — no isolation
     this.root = PROJ.hostAbsent ? PROJ.dirs.workspace : PROJ.path;
     this.outboxInside = PROJ.dirs.outbox;
   }
-  wrap(shCmd, { cwd, extraEnv = {} } = {}) {
+  wrap(shCmd, { cwd } = {}) {
     return {
-      cmd: '/bin/sh',
+      cmd: SHELL_BIN,
       args: ['-c', `cd ${JSON.stringify(cwd || this.root)} && ${shCmd}`],
-      spawnEnv: { ...process.env, ...BASE_ENV, PATH: `${PROJ.dirs.bin}:${process.env.PATH}`, KOI_OUTBOX: this.outboxInside, ...extraEnv },
+      spawnEnv: { ...process.env, ...BASE_ENV, PATH: `${PROJ.dirs.bin}:${process.env.PATH}`, KOI_OUTBOX: this.outboxInside },
     };
   }
   reset() {}
@@ -1698,16 +1399,6 @@ class LspChild {
     }
   }
 
-  async removeDocument(absPath) {
-    if (!this.ready || !this.hasTool('close_document')) return { synced: false };
-    try {
-      await this._rpc('tools/call', { name: 'close_document', arguments: { path: absPath } }, 30_000);
-      return { synced: true };
-    } catch (e) {
-      return { synced: false, error: e.message };
-    }
-  }
-
   async resetDocuments() {
     if (!this.ready || !this.hasTool('sync_reset')) return { synced: false };
     try {
@@ -1735,20 +1426,96 @@ LSP.start();
 // =============================================================================
 // Overlay -> LSP re-sync
 // -----------------------------------------------------------------------------
-// Document sync normally happens edit-by-edit (sandbox_write_file /
-// sandbox_apply_patch mirror into the LSP child). Two paths bypass it:
-//   - resuming a previous session's overlay (its edits were synced to a child
-//     that no longer holds them), and
-//   - switching projects and back (set_workspace clears the child's buffers
-//     while the overlay keeps the edits).
+// Edits reach the overlay through the shell (sandbox_exec), which the LSP
+// child never observes, so its buffers are refreshed in bulk instead of
+// edit-by-edit: on resuming a previous session's overlay, and on switching
+// projects and back (set_workspace clears the child's buffers while the
+// overlay keeps the edits).
 // This walks the overlay upperdir and re-pushes every plausible text file so
 // code intelligence matches what the shell sees. Bounded and best-effort: the
 // compiler remains ground truth for anything skipped.
 // =============================================================================
 
-const RESYNC_SKIP_DIRS = new Set(['node_modules', '.git', 'target', 'dist', 'build', 'out', '.next', '.cache', '__pycache__', 'vendor']);
+const RESYNC_SKIP_DIRS = new Set(['node_modules', 'target', 'dist', 'build', 'out', '.next', '.cache', '__pycache__', 'vendor']);
 const RESYNC_MAX_FILES = 300;
 const RESYNC_MAX_BYTES = 512 * 1024;
+
+/**
+ * Overwrite an overlay file with the host's newer version.
+ *
+ * git creates loose objects and packfiles read-only (0444), so a plain
+ * copyFileSync onto an existing one fails with EACCES for every user except
+ * root — root bypasses the mode bit, which is why this reproduces on a normal
+ * account and not under a privileged container. Unlink and retry, then carry
+ * the host's mode across so the overlay copy keeps the same permissions.
+ */
+function copyHostFileOverUpper(hostFile, upperFile, mode) {
+  try {
+    fs.copyFileSync(hostFile, upperFile);
+  } catch (e) {
+    if (e.code !== 'EACCES' && e.code !== 'EPERM') throw e;
+    // The upperdir is ours and tool calls are serialized, so replacing the
+    // file wholesale is safe. Note this touches the upperdir directly, NOT
+    // the overlay mount, so no whiteout is created by the unlink.
+    fs.unlinkSync(upperFile);
+    fs.copyFileSync(hostFile, upperFile);
+  }
+  if (mode !== undefined) {
+    try { fs.chmodSync(upperFile, mode & 0o7777); } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Reconcile lower layer (host) mutations to the upper layer (overlay).
+ * Fast, synchronous local check run before mutating tool handlers.
+ *
+ * Only files present in BOTH layers are refreshed: a host file with no overlay
+ * copy is not shadowed, so overlayfs already shows it through the lower layer.
+ *
+ * Never throws. This runs at the head of sandbox_exec, where an exception would
+ * surface as the shell command itself failing — a maintenance step must not be
+ * able to take out the tool call it precedes.
+ */
+function reconcileLowerToUpper() {
+  const hostRoot = PROJ.path;
+  const upperDir = PROJ.dirs && PROJ.dirs.upper;
+  if (!hostRoot || !upperDir || !fs.existsSync(hostRoot) || !fs.existsSync(upperDir)) {
+    return { reconciled: 0, files: [], failures: [] };
+  }
+  const files = [];
+  const failures = [];
+  try {
+    for (const rel of collectOverlayFiles(upperDir)) {
+      const hostFile = path.join(hostRoot, rel);
+      const upperFile = path.join(upperDir, rel);
+      try {
+        // statSync + ENOENT beats an existsSync pair: one syscall each, and no
+        // window between the check and the copy.
+        const hostStat = fs.statSync(hostFile);
+        const upperStat = fs.statSync(upperFile);
+        if (!hostStat.isFile() || hostStat.mtimeMs <= upperStat.mtimeMs) continue;
+        copyHostFileOverUpper(hostFile, upperFile, hostStat.mode);
+        files.push(rel);
+      } catch (e) {
+        if (e.code === 'ENOENT') continue; // present in only one layer
+        failures.push({ path: rel, error: e.message });
+      }
+    }
+  } catch (e) {
+    failures.push({ path: '(walk)', error: e.message });
+  }
+  if (failures.length) {
+    log(`reconcile: ${failures.length} file(s) could NOT be refreshed from the host — ` +
+      `the sandbox may be reading stale content: ` +
+      failures.slice(0, 5).map((f) => `${f.path} (${f.error})`).join('; ') +
+      (failures.length > 5 ? `; +${failures.length - 5} more` : ''));
+  }
+  if (SYNC_DEBUG) {
+    log(`reconcile: ${files.length} refreshed, ${failures.length} failed` +
+      (files.length ? ` [${files.slice(0, 20).join(', ')}${files.length > 20 ? ', …' : ''}]` : ''));
+  }
+  return { reconciled: files.length, files, failures };
+}
 
 function collectOverlayFiles(upperDir, relBase = '', acc = []) {
   if (acc.length >= RESYNC_MAX_FILES) return acc;
@@ -1758,7 +1525,18 @@ function collectOverlayFiles(upperDir, relBase = '', acc = []) {
     if (acc.length >= RESYNC_MAX_FILES) break;
     const rel = relBase ? path.join(relBase, e.name) : e.name;
     if (e.isDirectory()) {
-      if (RESYNC_SKIP_DIRS.has(e.name) || e.name.startsWith('.')) continue;
+      if (RESYNC_SKIP_DIRS.has(e.name)) continue;
+      // Allow .git to be synced so host commits reflect in the sandbox, but skip other hidden dirs
+      if (e.name.startsWith('.') && rel !== '.git') continue;
+      // The object store is content-addressed and immutable: a path that
+      // exists in both layers holds the same bytes by construction, so
+      // copying it is pure waste (and a hard error, since git writes loose
+      // objects 0444). Host-only objects were never copied here anyway —
+      // overlayfs merges them in from the lower layer. Pruning also stops
+      // thousands of objects from consuming the RESYNC_MAX_FILES budget
+      // before the walk reaches .git/refs and .git/index, which are the
+      // entries that actually have to reconcile for a later commit to work.
+      if (rel === path.join('.git', 'objects')) continue;
       collectOverlayFiles(upperDir, rel, acc);
     } else if (e.isFile()) {
       acc.push(rel);
@@ -1783,6 +1561,7 @@ async function resyncOverlayToLsp() {
   let resynced = 0, skipped = 0;
   for (const rel of rels) {
     try {
+      if (rel.startsWith('.git/')) { skipped++; continue; }
       const st = fs.statSync(path.join(upper, rel));
       if (!st.isFile() || st.size > RESYNC_MAX_BYTES) { skipped++; continue; }
       const buf = fs.readFileSync(path.join(upper, rel));
@@ -1855,13 +1634,13 @@ function ensureSessionDirs() {
   try { installGitWrapper(); } catch { /* best effort */ }
 }
 
-function execInSandbox(shCmd, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, stdinData, extraEnv, outputCap = OUTPUT_CAP } = {}) {
+function execInSandbox(shCmd, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, outputCap = OUTPUT_CAP } = {}) {
   ensureSessionDirs();
   return new Promise((resolve) => {
-    const { cmd, args, spawnEnv } = BACKEND.wrap(shCmd, { cwd, extraEnv });
+    const { cmd, args, spawnEnv } = BACKEND.wrap(shCmd, { cwd });
     const child = spawn(cmd, args, {
       env: spawnEnv,
-      stdio: [stdinData != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached: true, // own process group so timeouts kill the whole tree
     });
     let stdout = '', stderr = '', timedOut = false, done = false;
@@ -1889,7 +1668,6 @@ function execInSandbox(shCmd, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, stdinData, 
       const grace = setTimeout(() => settle(code, signal), 250);
       child.once('close', () => { clearTimeout(grace); settle(code, signal); });
     });
-    if (stdinData != null) { child.stdin.write(stdinData); child.stdin.end(); }
   });
 }
 
@@ -1938,24 +1716,6 @@ function extractServiceUrls(log) {
     urls.push(m[0].replace('0.0.0.0', '127.0.0.1'));
   }
   return [...new Set(urls)];
-}
-
-/** Metadata after overlay writes so agents know to restart services. */
-function overlayVisibilityMeta() {
-  scheduleOverlayGc('write');
-  const running = listRunningServices();
-  const names = running.map((s) => s.name);
-  if (!names.length) {
-    return { runningServices: [], visibility: 'no-running-services', ...overlayPressureMeta() };
-  }
-  return {
-    ...overlayPressureMeta(),
-    runningServices: names,
-    visibility: 'overlay-write-may-not-reach-running-services',
-    hint:
-      'Each bwrap invocation has its own overlay mount. Restart running services ' +
-      '(sandbox_restart_service) before browser-verify; hard-refresh alone is not enough.',
-  };
 }
 
 function startService(name, shCmd, cwd) {
@@ -2052,419 +1812,6 @@ process.on('exit', shutdownChildren);
 process.on('SIGINT', () => { shutdownChildren(); process.exit(0); });
 process.on('SIGTERM', () => { shutdownChildren(); process.exit(0); });
 
-// =============================================================================
-// Patcher — ported from the developer's battle-tested patcher.ts
-// (Gemini CLI lineage, Apache-2.0). Content-based matching that ignores line
-// numbers; handles multi-file diffs, file creation, and file deletion.
-// Healing/confirmation layers from patch.ts are intentionally NOT ported.
-// File I/O is adapted to run THROUGH the sandbox so reads see overlay+host
-// and writes land in the overlay (never the real host tree).
-// =============================================================================
-
-// PatchError is declared near the top of this file: `class` declarations are
-// NOT hoisted (temporal dead zone), and the `patch`/`review` CLIs run before
-// this point while calling the hoisted patch functions below.
-
-/** Parses a hunk header to extract line numbers and context. */
-function parseHunkHeader(hunkStr) {
-  const lines = hunkStr.split('\n');
-  const headerLine = lines[0];
-  if (headerLine === undefined) throw new PatchError('Hunk is empty');
-  const match = /@@ -(\d+)(,(\d+))? \+(\d+)(,(\d+))? @@/.exec(headerLine);
-  if (match === null) throw new PatchError(`Invalid hunk header: ${headerLine}`);
-  return {
-    oldStart: parseInt(match[1] ?? '0', 10),
-    oldCount: match[3] !== undefined ? parseInt(match[3], 10) : 1,
-    newStart: parseInt(match[4] ?? '0', 10),
-    newCount: match[6] !== undefined ? parseInt(match[6], 10) : 1,
-    originalHunk: hunkStr,
-    lines: lines.slice(1),
-    header: headerLine,
-  };
-}
-
-/** Extracts the filename from a diff header line (e.g., '--- a/foo.ts'). */
-function extractFilenameFromDiffHeader(headerLine) {
-  let filename = headerLine.substring(4).trim();
-  const tabIndex = filename.indexOf('\t');
-  if (tabIndex !== -1) {
-    filename = filename.substring(0, tabIndex).trim();
-  } else {
-    const dateMatch = /(.*?)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/.exec(filename);
-    if (dateMatch?.[1] !== undefined) filename = dateMatch[1].trim();
-  }
-  if (filename === '/dev/null') return null;
-  if (filename.startsWith('a/') || filename.startsWith('b/')) filename = filename.substring(2);
-  return filename;
-}
-
-/** Parses a unified diff (possibly multi-file) into Map<filename, Hunk[]>. */
-function parsePatch(diffContent) {
-  const fileHunks = new Map();
-  let currentFile = null;
-  let currentHunk = [];
-
-  const lines = diffContent.split('\n');
-  let i = 0;
-
-  const commitCurrentHunk = () => {
-    if (currentFile !== null && currentHunk.length > 0) {
-      if (!fileHunks.has(currentFile)) fileHunks.set(currentFile, []);
-      fileHunks.get(currentFile).push(parseHunkHeader(currentHunk.join('\n')));
-    }
-    currentHunk = [];
-  };
-
-  // Git format-patch trailer (e.g., "-- " or "2.43.GIT")
-  const isGitTrailer = (line) => {
-    if (line === '--' || line === '-- ') return true;
-    return /^\d+\.\d+(\.\d+)?(\.GIT)?$/.test(line);
-  };
-
-  while (i < lines.length) {
-    const line = lines[i];
-    if (line === undefined) { i++; continue; }
-    if (isGitTrailer(line)) { i++; continue; }
-    // Ignore git format-patch headers and other metadata
-    if (
-      line.startsWith('From ') ||
-      line.startsWith('Date:') ||
-      line.startsWith('Subject:') ||
-      line.startsWith('diff --git') ||
-      line.startsWith('index ') ||
-      line.startsWith('new file mode') ||
-      line.startsWith('deleted file mode') ||
-      line.startsWith('similarity index')
-    ) { i++; continue; }
-
-    // Only treat --- and +++ as file headers when NOT inside a hunk.
-    if (line.startsWith('---')) {
-      commitCurrentHunk();
-      const oldFile = extractFilenameFromDiffHeader(line);
-      if (oldFile !== null) currentFile = oldFile; // deletion may set currentFile here
-      i++;
-      continue;
-    }
-    if (line.startsWith('+++') && currentHunk.length === 0) {
-      const newFile = extractFilenameFromDiffHeader(line);
-      if (newFile !== null) currentFile = newFile;
-      i++;
-      continue;
-    }
-
-    if (line.startsWith('@@')) {
-      commitCurrentHunk();
-      currentHunk = [line];
-    } else if (currentFile !== null) {
-      if (currentHunk.length > 0) currentHunk.push(line);
-    }
-    i++;
-  }
-  commitCurrentHunk();
-  return fileHunks;
-}
-
-/** Extracts [oldBlock, newBlock] from a hunk, preserving exact line structure. */
-function extractOldAndNewBlocksFromHunk(hunkStr) {
-  const lines = hunkStr.trim().split('\n').slice(1); // skip @@ header
-  const oldBlockLines = [];
-  const newBlockLines = [];
-  for (const line of lines) {
-    if (line.startsWith('-- \n') || /^\d+\.\d+\.\d+/.test(line)) continue;
-    const content = line.substring(1);
-    switch (line[0]) {
-      case ' ': oldBlockLines.push(content); newBlockLines.push(content); break;
-      case '-': oldBlockLines.push(content); break;
-      case '+': newBlockLines.push(content); break;
-      default:
-        // Lines without a prefix (e.g., '\ No newline at end of file'):
-        // treat as context, though it's rare.
-        oldBlockLines.push(line); newBlockLines.push(line);
-    }
-  }
-  return [oldBlockLines.join('\n'), newBlockLines.join('\n')];
-}
-
-/**
- * Finds the old block in the file: exact match first, then a fuzzy match that
- * ignores whitespace variations. Returns [startLine, endLine] 1-based, or [-1,-1].
- */
-function findOldBlockInFile(fileContent, oldBlock) {
-  const fileLines = fileContent.split('\n');
-  const oldBlockLines = oldBlock.split('\n');
-  if (oldBlock.length === 0 || (oldBlockLines.length === 1 && oldBlockLines[0] === '')) return [-1, -1];
-
-  // Strategy 1: Exact match
-  const exactSearchEnd = fileLines.length - oldBlockLines.length;
-  for (let i = 0; i <= exactSearchEnd; i++) {
-    const candidateBlock = fileLines.slice(i, i + oldBlockLines.length).join('\n');
-    if (candidateBlock === oldBlock) return [i + 1, i + oldBlockLines.length];
-  }
-
-  // Strategy 2: Fuzzy match (ignore ALL whitespace variations)
-  const normalize = (text) =>
-    text.split('\n').map((line) => line.replace(/\s+/g, ' ').trim()).join('\n');
-  const oldBlockNormalized = normalize(oldBlock);
-  if (oldBlockNormalized === '') return [-1, -1];
-  const fuzzySearchEnd = fileLines.length - oldBlockLines.length;
-  for (let i = 0; i <= fuzzySearchEnd; i++) {
-    const candidateBlock = fileLines.slice(i, i + oldBlockLines.length).join('\n');
-    if (normalize(candidateBlock) === oldBlockNormalized) return [i + 1, i + oldBlockLines.length];
-  }
-  return [-1, -1];
-}
-
-/** Applies a single hunk to in-memory content. */
-function applySingleHunk(currentContent, hunk) {
-  const [oldBlock, newBlock] = extractOldAndNewBlocksFromHunk(hunk.originalHunk);
-  if (oldBlock === newBlock) return currentContent; // no-op hunk
-  if (hunk.oldStart === 0 && hunk.oldCount === 0) return newBlock; // file creation (overwrite if already exists)
-  if (currentContent === '') return newBlock;       // file creation
-
-  const [startLine] = findOldBlockInFile(currentContent, oldBlock);
-  if (startLine === -1) {
-    // Before failing, check if the patch has already been applied.
-    const [alreadyAppliedStart] = findOldBlockInFile(currentContent, newBlock);
-    if (alreadyAppliedStart !== -1) {
-      log('INFO: Hunk seems to be already applied. Skipping.');
-      return currentContent;
-    }
-    throw new PatchError(`Could not locate context for hunk:\n${hunk.originalHunk}`);
-  }
-
-  const fileLines = currentContent.split('\n');
-  const oldBlockLines = oldBlock.split('\n');
-  const newBlockLines = newBlock.split('\n');
-  fileLines.splice(startLine - 1, oldBlockLines.length, ...newBlockLines);
-  const newFileContent = fileLines.join('\n');
-
-  if (newFileContent === currentContent) {
-    throw new PatchError(
-      'Old block was found, but replacement did not change file content. ' +
-      'This can happen with subtle whitespace differences.',
-    );
-  }
-  return newFileContent;
-}
-
-function isFileDeletionHunk(hunk) {
-  return hunk.newStart === 0 && hunk.newCount === 0;
-}
-
-/** Applies an array of hunks to string content (pure, in-memory). */
-function applyHunksToContent(content, hunks) {
-  let modifiedContent = content;
-  const appliedHunks = [];
-  const failedHunks = [];
-  const noOpHunks = [];
-  const isNewFile = content === '';
-
-  // New files: forward order by new position. Existing files: reverse order
-  // to avoid line-number shifts affecting subsequent hunks.
-  const sortedHunks = isNewFile
-    ? [...hunks].sort((a, b) => a.newStart - b.newStart)
-    : [...hunks].sort((a, b) => b.oldStart - a.oldStart);
-
-  for (const hunk of sortedHunks) {
-    const [oldBlock, newBlock] = extractOldAndNewBlocksFromHunk(hunk.originalHunk);
-    if (oldBlock === newBlock) { noOpHunks.push(hunk); continue; }
-    try {
-      modifiedContent = applySingleHunk(modifiedContent, hunk);
-      appliedHunks.push(hunk);
-    } catch (e) {
-      if (isNewFile) failedHunks.push({ hunk, error: e });
-      else failedHunks.unshift({ hunk, error: e });
-    }
-  }
-  return { newContent: modifiedContent, appliedHunks, failedHunks, noOpHunks };
-}
-
-/** Formats failed hunks back into a unified diff string for the LLM. */
-function formatFailedHunksToDiff(failedHunks) {
-  let diffString = '';
-  for (const [filepath, failures] of failedHunks.entries()) {
-    diffString += `--- a/${filepath}\n+++ b/${filepath}\n`;
-    for (const { hunk, error } of failures) {
-      diffString += `${hunk.originalHunk}\nFAILED:\n${error.message}\n`;
-    }
-  }
-  return diffString.trim();
-}
-
-// ---- Sandbox-mediated filesystem service (replaces StandardFileSystemService)
-
-const PATCH_READ_CAP = 5 * 1024 * 1024; // full-file reads for patching
-
-const SandboxFS = {
-  /** Read a text file as seen inside the sandbox. Throws {code:'ENOENT'} if missing. */
-  async readTextFile(abs) {
-    const r = await execInSandbox(
-      'if [ -e "$KOI_TARGET" ]; then cat -- "$KOI_TARGET"; else exit 44; fi',
-      { extraEnv: { KOI_TARGET: abs }, outputCap: PATCH_READ_CAP },
-    );
-    if (r.exitCode === 44) {
-      const e = new Error(`ENOENT: ${abs}`); e.code = 'ENOENT'; throw e;
-    }
-    if (r.exitCode !== 0) throw new PatchError(r.stderr || `read failed (exit ${r.exitCode})`);
-    if (r.stdout.length >= PATCH_READ_CAP) {
-      throw new PatchError(`File too large to patch safely (> ${PATCH_READ_CAP} bytes): ${abs}`);
-    }
-    return r.stdout;
-  },
-
-  /** Write a text file inside the sandbox (creates parent dirs). */
-  async writeTextFile(abs, content) {
-    const r = await execInSandbox(
-      'mkdir -p "$(dirname "$KOI_TARGET")" && cat > "$KOI_TARGET"',
-      { extraEnv: { KOI_TARGET: abs }, stdinData: content },
-    );
-    if (r.exitCode !== 0) throw new PatchError(r.stderr || `write failed (exit ${r.exitCode})`);
-    // Design 2: mirror the new content into the LSP's edit buffers.
-    LSP.syncDocument(abs, content).catch(() => {});
-  },
-
-  /** Delete a file inside the sandbox. */
-  async unlink(abs) {
-    const r = await execInSandbox('rm -f -- "$KOI_TARGET"', { extraEnv: { KOI_TARGET: abs } });
-    if (r.exitCode !== 0) throw new PatchError(r.stderr || `unlink failed (exit ${r.exitCode})`);
-    LSP.removeDocument(abs).catch(() => {});
-  },
-};
-
-/** Applies a series of hunks to a single file (through the sandbox). */
-async function applyHunksToFile(filepath, parsedHunks) {
-  const { abs: safeFilepath, outside } = resolveRel(filepath);
-  if (outside) {
-    throw new PatchError(
-      `Security violation: Attempted to patch file '${filepath}' ` +
-      'which is outside of the designated working directory.',
-    );
-  }
-
-  let originalContent;
-  let fileExists = true;
-  try {
-    originalContent = await SandboxFS.readTextFile(safeFilepath);
-    originalContent = originalContent.replace(/\r\n/g, '\n');
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      // File doesn't exist — only allowed for file creation hunks (oldStart=0, oldCount=0)
-      const firstHunk = parsedHunks[0];
-      const isFileCreation = firstHunk !== undefined && firstHunk.oldStart === 0 && firstHunk.oldCount === 0;
-      if (isFileCreation) {
-        fileExists = false;
-        originalContent = '';
-      } else {
-        throw new PatchError(
-          `Target file '${filepath}' does not exist. ` +
-          'If this is meant to be a new file, the patch format should indicate ' +
-          'file creation (--- /dev/null with @@ -0,0 +1,N @@).',
-        );
-      }
-    } else {
-      throw error;
-    }
-  }
-
-  // File deletion as a special case.
-  if (parsedHunks.length > 0 && parsedHunks[0] !== undefined && isFileDeletionHunk(parsedHunks[0])) {
-    if (fileExists) await SandboxFS.unlink(safeFilepath);
-    const summary = `✅ ALL HUNKS APPLIED SUCCESSFULLY for ${filepath}\n\n✅ Hunk 1: Deleted file.`;
-    return { summary, failedHunks: [] };
-  }
-
-  const { newContent, appliedHunks, failedHunks, noOpHunks } =
-    applyHunksToContent(originalContent, parsedHunks);
-
-  const successfulHunks = appliedHunks.length;
-  const localFailedHunks = failedHunks.map((f) => f.hunk);
-  const hunkResults = [];
-  parsedHunks.forEach((hunk, i) => {
-    const failure = failedHunks.find((f) => f.hunk.originalHunk === hunk.originalHunk);
-    if (failure !== undefined) {
-      hunkResults.push(`❌ Hunk ${i + 1} (L${hunk.oldStart}): FAILED - ${failure.error.message}`);
-    } else if (noOpHunks.includes(hunk)) {
-      hunkResults.push(`✅ Hunk ${i + 1} (L${hunk.oldStart}): Skipped as no-op.`);
-    } else {
-      hunkResults.push(`✅ Hunk ${i + 1} (L${hunk.oldStart}): Applied successfully.`);
-    }
-  });
-
-  // Write back if any changes were successful.
-  if (successfulHunks > 0 && (newContent !== originalContent || !fileExists)) {
-    await SandboxFS.writeTextFile(safeFilepath, newContent);
-  }
-
-  let status = '❌ ALL HUNKS FAILED';
-  if (successfulHunks > 0 && failedHunks.length === 0) {
-    status = '✅ ALL HUNKS APPLIED SUCCESSFULLY';
-  } else if (successfulHunks > 0 && failedHunks.length > 0) {
-    status = `⚠️ PARTIAL SUCCESS: ${successfulHunks}/${parsedHunks.length} hunks applied`;
-  } else if (successfulHunks === 0 && failedHunks.length === 0 && noOpHunks.length > 0) {
-    status = '✅ ALL HUNKS APPLIED SUCCESSFULLY';
-  }
-
-  const summary = [`${status} for ${filepath}`, '', ...hunkResults].join('\n');
-  return { summary, failedHunks: localFailedHunks };
-}
-
-/** Applies a map of file hunks to the sandbox filesystem. Returns a report. */
-async function applyPatchesToSandbox(fileHunks) {
-  if (fileHunks.size === 0) {
-    return { report: 'ERROR: No valid patches found in input. Please provide a standard unified diff.', failedFiles: 1, successfulFiles: 0, failedHunksDiff: '' };
-  }
-
-  const results = [];
-  const allFailedHunks = [];
-  let successfulFiles = 0;
-  let failedFiles = 0;
-
-  for (const [filepath, hunks] of fileHunks.entries()) {
-    try {
-      const { summary, failedHunks } = await applyHunksToFile(filepath, hunks);
-      results.push(summary);
-      if (failedHunks.length > 0) {
-        failedFiles++;
-        allFailedHunks.push([
-          `--- a/${filepath}`, `+++ b/${filepath}`,
-          ...failedHunks.map((h) => h.originalHunk),
-        ].join('\n'));
-      } else {
-        successfulFiles++;
-      }
-    } catch (e) {
-      failedFiles++;
-      results.push(`❌ FAILED: ${filepath}\n   Error: ${e.message}`);
-      allFailedHunks.push([
-        `--- a/${filepath}`, `+++ b/${filepath}`,
-        ...hunks.map((h) => h.originalHunk),
-      ].join('\n'));
-    }
-  }
-
-  const totalFiles = successfulFiles + failedFiles;
-  let finalReport = '';
-  if (totalFiles > 1) {
-    finalReport += `📊 PATCH SUMMARY: ${successfulFiles}/${totalFiles} files patched successfully.\n`;
-    if (failedFiles > 0) finalReport += `⚠️  ${failedFiles} files require manual intervention.\n`;
-    finalReport += '\n';
-  }
-  finalReport += results.join('\n\n');
-  if (failedFiles === 0) {
-    finalReport += `\n\n✅ PATCH SUCCESS: ${successfulFiles}/${totalFiles} files patched.`;
-  } else if (successfulFiles === 0) {
-    finalReport += `\n\n❌ PATCH FAILED: 0/${totalFiles} files patched. See details below.`;
-  } else {
-    finalReport += `\n\n⚠️ PARTIAL PATCH: ${successfulFiles} file(s) applied, ${failedFiles} file(s) had failed hunks.`;
-  }
-
-  return {
-    report: finalReport,
-    successfulFiles,
-    failedFiles,
-    failedHunksDiff: allFailedHunks.join('\n'),
-  };
-}
 
 // =============================================================================
 // Tool definitions
@@ -2485,36 +1832,12 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Shell command (passed to /bin/sh -c)' },
+        command: { type: 'string', description: 'Shell command (passed to /bin/bash -c)' },
         cwd: { type: 'string', description: 'Working directory, relative to project root' },
         timeout_ms: { type: 'number', description: `Timeout in ms (default ${DEFAULT_TIMEOUT_MS})` },
         max_output: { type: 'number', description: `Per-stream output cap in bytes (default ${OUTPUT_CAP}). Use a small cap (e.g. 8192) for chatty commands like installs/builds so the output does not flood the LLM context; combine with tail/grep for the interesting part.` },
       },
       required: ['command'],
-    },
-  },
-  {
-    name: 'sandbox_write_file',
-    tier: 'safe',
-    description: 'Write a file inside the sandbox overlay (never mutates the real host tree). Creates parent directories. Path relative to project root. If services are running, response includes a restart hint — they may not see this write until restarted.',
-    displayMessage: '✏️ Writing {{path}}',
-    inputSchema: {
-      type: 'object',
-      properties: { path: { type: 'string' }, content: { type: 'string' } },
-      required: ['path', 'content'],
-    },
-  },
-  {
-    name: 'sandbox_apply_patch',
-    tier: 'safe',
-    description:
-      'Apply a standard unified diff to the project inside the sandbox. ' +
-      'Preferred over sandbox_write_file for edits to existing files. If services are running, response includes a restart hint — they may not see this patch until restarted.',
-    displayMessage: '🩹 Applying patch: {{patch}}',
-    inputSchema: {
-      type: 'object',
-      properties: { patch: { type: 'string', description: 'Unified diff with a/ b/ prefixes' } },
-      required: ['patch'],
     },
   },
   {
@@ -2604,6 +1927,13 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'overlay_fs_sync',
+    tier: 'safe',
+    description: 'Synchronizes the gateway overlay filesystem and language server buffers to ensure the host, overlay, and LSP states are aligned.',
+    displayMessage: '🔄 Syncing overlay filesystem',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'sandbox_info',
     tier: 'safe',
     description: 'Show sandbox configuration: backend, project root, network mode, state dirs, running services.',
@@ -2618,6 +1948,7 @@ const TOOLS = [
 
 const handlers = {
   async sandbox_exec({ command, cwd, timeout_ms, max_output }) {
+    const rec = reconcileLowerToUpper();
     const dir = cwd ? resolveRel(cwd).abs : BACKEND.root;
     // Clamp the per-stream cap to [1 KiB, OUTPUT_CAP]; callers use small caps
     // to keep chatty build/install logs from flooding an LLM context window.
@@ -2634,35 +1965,14 @@ const handlers = {
       stdout: r.stdout,
       stderr: r.stderr,
       ...overlayPressureMeta(),
+      // A failed refresh means this command may have read a stale file. Say so
+      // rather than letting the session act on content it cannot tell is old.
+      ...(rec.failures.length ? {
+        syncWarning: `${rec.failures.length} file(s) could not be refreshed from the host and may be stale: ` +
+          rec.failures.slice(0, 5).map((f) => f.path).join(', '),
+      } : {}),
       ...(truncated ? { truncated: true, outputCap: cap, hint: 'Output hit the cap. Re-run piped through tail/grep, or raise max_output if you truly need more.' } : {}),
     };
-  },
-
-  // sandbox_write_file is defined after this map (needs extraEnv plumbing).
-
-  async sandbox_apply_patch({ patch }) {
-    // Sanitize LLM input: remove markdown blockquote indicators (from patch.ts)
-    const sanitizedDiff = patch.replace(/^> ?/gm, '');
-    let parsedHunks;
-    try {
-      parsedHunks = parsePatch(sanitizedDiff);
-    } catch (e) {
-      return { success: false, error: `Failed to parse the diff: ${e.message}` };
-    }
-    if (parsedHunks.size === 0) {
-      return { success: false, error: 'The provided diff was empty or invalid.' };
-    }
-    const { report, successfulFiles, failedFiles, failedHunksDiff } =
-      await applyPatchesToSandbox(parsedHunks);
-    const vis = overlayVisibilityMeta();
-    const result = { success: failedFiles === 0, report, ...vis };
-    if (failedFiles > 0 && failedHunksDiff) {
-      result.failedHunks = failedHunksDiff;
-      result.patchHint = 'Re-read the affected files (sandbox_exec: cat/sed -n) and resubmit corrected hunks for the failures only.';
-      result.visibilityHint = vis.hint;
-      result.hint = result.patchHint;
-    }
-    return result;
   },
 
   async sandbox_start_service({ name, command, cwd, ready_pattern, boot_timeout_ms }) {
@@ -2871,25 +2181,46 @@ const handlers = {
       ],
     };
   },
+
+  async overlay_fs_sync() {
+    try {
+      // 1. Lower-to-Upper Reconciliation: detect host modifications.
+      // Shares reconcileLowerToUpper with sandbox_exec deliberately — this used
+      // to be a second copy of the same loop, and the two drifted: a fault in
+      // one path stayed invisible because the other still worked.
+      const rec = reconcileLowerToUpper();
+      const hostUpdated = rec.reconciled;
+
+      // 2. Resync reconciled overlay files into LSP memory buffers
+      let lspResync;
+      if (LSP.available && !PROJ.startedFromHost) {
+        lspResync = await resyncOverlayToLsp().catch((err) => ({ error: err.message }));
+      }
+
+      // 3. Invalidate disk cache and usage stats
+      overlayUsageCache.delete(PROJ.state);
+      const budget = overlayBudgetStatus();
+
+      return {
+        success: true,
+        session: PROJ.sessionId,
+        hostMutationsReconciled: hostUpdated,
+        ...(rec.failures.length ? {
+          reconcileFailures: rec.failures,
+          hint: 'Some overlay files could not be refreshed from the host; commands may still read stale content for those paths.',
+        } : {}),
+        overlayHostPath: projectTreeHostPath(),
+        lspResync: lspResync || { status: 'up-to-date' },
+        overlayBudget: budget,
+        syncedAt: new Date().toISOString(),
+      };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  },
+
 };
 
-// sandbox_write_file: writes happen INSIDE the sandbox (so they land in the
-// overlay, not the host tree), via the same SandboxFS used by the patcher.
-handlers.sandbox_write_file = async ({ path: p, content }) => {
-  const { abs, outside } = resolveRel(p);
-  if (outside) return { success: false, error: 'path escapes the project root' };
-  try {
-    await SandboxFS.writeTextFile(abs, content);
-    return {
-      success: true,
-      path: abs,
-      bytes: Buffer.byteLength(content),
-      ...overlayVisibilityMeta(),
-    };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-};
 
 // =============================================================================
 // MCP over stdio (newline-delimited JSON-RPC 2.0)

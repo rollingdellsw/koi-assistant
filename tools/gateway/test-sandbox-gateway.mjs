@@ -131,9 +131,10 @@ async function fullSuite(client) {
   const toolNames = (toolList?.tools || []).map((t) => t.name);
   console.log(`  tools: ${toolNames.join(', ')}`);
   check('tools/list includes sandbox_exec', toolNames.includes('sandbox_exec'));
+  check('tools/list includes overlay_fs_sync', toolNames.includes('overlay_fs_sync'));
   check('tools/list includes sandbox_restart_service', toolNames.includes('sandbox_restart_service'));
-  check('shell-replaceable tools pruned (read_file/diff/export gone)',
-    !toolNames.includes('sandbox_read_file') && !toolNames.includes('sandbox_diff') && !toolNames.includes('sandbox_export_patch'));
+  check('shell-replaceable tools pruned (read_file/write_file/apply_patch/diff/export gone)',
+    !toolNames.includes('sandbox_read_file') && !toolNames.includes('sandbox_write_file') && !toolNames.includes('sandbox_apply_patch') && !toolNames.includes('sandbox_diff') && !toolNames.includes('sandbox_export_patch'));
 
   // --- info -----------------------------------------------------------------
   section('sandbox_info');
@@ -144,6 +145,12 @@ async function fullSuite(client) {
   check('notes mention restart', Array.isArray(info.notes) && info.notes.some((n) => /restart/i.test(n)));
   let projectRoot = info.project;
   let sandboxRoot = info.sandboxRoot;
+
+  // --- overlay_fs_sync ------------------------------------------------------
+  section('overlay_fs_sync');
+  const syncRes = await client.callTool('overlay_fs_sync');
+  show(syncRes);
+  check('overlay_fs_sync succeeds', syncRes.success === true && typeof syncRes.session === 'string');
 
   const targetArg = process.argv[2] && process.argv[2] !== 'reset' ? path.resolve(process.argv[2]) : null;
   if (targetArg || !info.projectOpened) {
@@ -198,59 +205,15 @@ async function fullSuite(client) {
   check('push blocked by wrapper', (push.stderr || '').includes('koi-sandbox') && /rc=1/.test(push.stdout || ''));
 
   // --- overlay write isolation ---------------------------------------------
-  section('overlay write isolation');
+  section('overlay write isolation (via sandbox_exec)');
   const marker = `koi-sandbox-test/hello-${Date.now()}.txt`;
-  const wr = await client.callTool('sandbox_write_file', { path: marker, content: 'written in the sandbox\n' });
-  check('sandbox_write_file ok', wr.success === true, wr.error);
-  check('write returns visibility field', typeof wr.visibility === 'string', JSON.stringify(wr));
+  const wr = await client.callTool('sandbox_exec', { command: `mkdir -p koi-sandbox-test && echo "written in the sandbox" > '${marker}'` });
+  check('sandbox_exec write ok', wr.exitCode === 0, wr.stderr);
   const rd = await client.callTool('sandbox_exec', { command: `cat -- '${marker}'` });
   check('file visible inside sandbox (shell cat)', rd.exitCode === 0 && /written in the sandbox/.test(rd.stdout || ''));
   // This test client runs ON THE HOST — the file must NOT exist in the real tree.
   const hostHasIt = fs.existsSync(`${projectRoot}/${marker}`);
   check('file NOT in real host tree', !hostHasIt, `${projectRoot}/${marker} exists on host!`);
-
-  // --- patcher (content-based matching) ------------------------------------
-  section('sandbox_apply_patch (LLM patcher)');
-  const create = await client.callTool('sandbox_apply_patch', {
-    patch: [
-      '--- /dev/null',
-      '+++ b/koi-sandbox-test/math.js',
-      '@@ -0,0 +1,3 @@',
-      '+function add(a, b) {',
-      '+  return a + b;',
-      '+}',
-      '',
-    ].join('\n'),
-  });
-  check('file creation via patch', create.success === true, create.report);
-  // Deliberately wrong @@ line numbers — must succeed via content matching.
-  const modify = await client.callTool('sandbox_apply_patch', {
-    patch: [
-      '--- a/koi-sandbox-test/math.js',
-      '+++ b/koi-sandbox-test/math.js',
-      '@@ -940,3 +940,3 @@',
-      ' function add(a, b) {',
-      '-  return a + b;',
-      '+  return Number(a) + Number(b);',
-      ' }',
-      '',
-    ].join('\n'),
-  });
-  check('content-based match (bogus line numbers)', modify.success === true, modify.report);
-  check('patch returns runningServices array', Array.isArray(modify.runningServices));
-  const bad = await client.callTool('sandbox_apply_patch', {
-    patch: [
-      '--- a/koi-sandbox-test/math.js',
-      '+++ b/koi-sandbox-test/math.js',
-      '@@ -1,3 +1,3 @@',
-      ' function DOES_NOT_EXIST() {',
-      '-  nope;',
-      '+  nada;',
-      ' }',
-      '',
-    ].join('\n'),
-  });
-  check('bad hunk reported as failure', bad.success === false && !!bad.failedHunks);
 
   // --- background service + host-visible port ------------------------------
   section('dev server visible on host localhost (browser loop)');
@@ -272,13 +235,11 @@ async function fullSuite(client) {
   const logs = await client.callTool('sandbox_service_logs', { name: 'koitest' });
   check('service logs captured', /listening/.test(logs.log || ''));
 
-  // Overlay write while service is running should advertise restart hint
-  const wrWhile = await client.callTool('sandbox_write_file', {
-    path: 'koi-sandbox-test/while-running.txt',
-    content: 'service was running\\n',
+  // Overlay write while service is running
+  const wrWhile = await client.callTool('sandbox_exec', {
+    command: 'echo "service was running" > koi-sandbox-test/while-running.txt',
   });
-  check('write while running lists service', Array.isArray(wrWhile.runningServices) && wrWhile.runningServices.includes('koitest'), JSON.stringify(wrWhile));
-  check('write while running has visibility hint', wrWhile.visibility === 'overlay-write-may-not-reach-running-services');
+  check('exec write while running ok', wrWhile.exitCode === 0);
 
   // restart_service keeps the same command and frees the port
   const restarted = await client.callTool('sandbox_restart_service', {
@@ -308,8 +269,8 @@ async function fullSuite(client) {
   const switchRes = await client.callTool('sandbox_open_project', { path: tmpProject });
   check('switch project succeeds', switchRes.success === true && switchRes.project === tmpProject);
 
-  const write2 = await client.callTool('sandbox_write_file', { path: 'new-proj-file.txt', content: 'test' });
-  check('write in new project', write2.success === true);
+  const write2 = await client.callTool('sandbox_exec', { command: 'echo "test" > new-proj-file.txt' });
+  check('write in new project', write2.exitCode === 0);
 
   const switchBack = await client.callTool('sandbox_open_project', { path: projectRoot });
   check('switch back succeeds', switchBack.success === true && switchBack.project === projectRoot);
@@ -385,8 +346,8 @@ async function fullSuite(client) {
   check('info reports greenfield', gfInfo.greenfield === true);
   check('gitWorkflow ships via bundle', JSON.stringify(gfInfo.gitWorkflow || '').includes('bundle'));
 
-  const gfWrite = await client.callTool('sandbox_write_file', { path: 'src/index.js', content: 'export const hi = () => "hi";\n' });
-  check('greenfield write ok', gfWrite.success === true, gfWrite.error);
+  const gfWrite = await client.callTool('sandbox_exec', { command: `mkdir -p src && echo 'export const hi = () => "hi";' > src/index.js` });
+  check('greenfield write ok', gfWrite.exitCode === 0, gfWrite.stderr);
   check('write did NOT create the dir on the host', !fs.existsSync(gfPath), `${gfPath} exists on host!`);
   const gfCat = await client.callTool('sandbox_exec', { command: 'cat -- src/index.js' });
   check('greenfield file visible in sandbox', gfCat.exitCode === 0 && /hi/.test(gfCat.stdout || ''), gfCat.stderr);

@@ -107,6 +107,7 @@ let state = {
   canvasUrl: null, // resolved deployment URL (see DEFAULT_CANVAS_ORIGIN)
   hostUrl: null, // document that frames the canvas; same origin by default
   canvasHosts: null, // hostnames ensureBridge will attach to
+  canvasSource: null, // "argument" | "skill-config" | "default"
   layoutEngine: null, // "elk" | "mx"; null = whatever SKILL.md configured
   activePage: null, // { index, id, name } — the page the USER is looking at
 };
@@ -123,11 +124,40 @@ function serverConfig() {
   }
 }
 
-// YAML keys are hyphenated by convention; accept camelCase too so a caller
-// passing the same name through drawio_config does not have to think about it.
+// How a SKILL.md key reaches here is not contractually fixed. The frontmatter
+// spells it `canvas-url`; a parser may camelCase it, snake_case it, or nest the
+// non-standard keys under `config:`/`options:` rather than leaving them on the
+// server entry. Rather than guess which, look in all of them — the cost is a
+// few property reads and the alternative is a setting that silently does
+// nothing, which is what `canvas-url` did before the host started forwarding
+// author keys.
 function configValue(cfg, name) {
   const hyphen = name.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase());
-  return cfg[name] !== undefined ? cfg[name] : cfg[hyphen];
+  const snake = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  const scopes = [cfg, cfg && cfg.config, cfg && cfg.options, cfg && cfg.settings];
+  for (const scope of scopes) {
+    if (!scope || typeof scope !== "object") continue;
+    for (const key of [name, hyphen, snake]) {
+      if (scope[key] !== undefined) return scope[key];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * What SKILL.md actually handed this server, for diagnostics.
+ * A configuration key that is read but never arrives is indistinguishable from
+ * one that arrives and is ignored — both look like "the setting does nothing".
+ */
+function serverConfigKeys() {
+  const cfg = serverConfig();
+  const keys = Object.keys(cfg);
+  for (const nested of ["config", "options", "settings"]) {
+    if (cfg[nested] && typeof cfg[nested] === "object") {
+      keys.push(...Object.keys(cfg[nested]).map((k) => nested + "." + k));
+    }
+  }
+  return keys;
 }
 
 /**
@@ -154,6 +184,40 @@ function buildCanvasUrl(origin) {
   const existing = u.search.replace(/^\?/, "");
   u.search = existing ? existing + "&" + CANVAS_QUERY : CANVAS_QUERY;
   return u.href;
+}
+
+/**
+ * Host document URL — scaffolding the bridge wipes and frames the canvas into.
+ *
+ * MUST NOT carry the embed protocol (`embed=1&proto=json`). That protocol is
+ * for the iframe only. Loading it as a top-level tab has two failure modes:
+ *   1. draw.io's embed handshake has no parent (`window.parent === window`), so
+ *      the postMessage protocol is silently dead (the reason the iframe exists).
+ *   2. On a script-opened tab (`chrome.tabs.create` / `window.open`), draw.io
+ *      can `window.close()` itself when the handshake has no parent. Browsers
+ *      permit that for script-opened tabs, so the tab vanishes immediately —
+ *      which is exactly the "canvas is open but tools point at unknown" failure
+ *      `scripts/run.js` was observing (newPage returned a pageId that was gone
+ *      by the next listPages).
+ */
+function buildHostUrl(origin) {
+  const base = String(origin == null ? "" : origin).trim() || DEFAULT_CANVAS_ORIGIN;
+  let u;
+  try {
+    u = new URL(base);
+  } catch (_) {
+    throw new Error(
+      "Invalid draw.io host URL: " + base + ". Pass an absolute URL, e.g. " +
+        "http://localhost:7080 or https://embed.diagrams.net/"
+    );
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error("draw.io host URL must be http(s): " + base);
+  }
+  // Origin + path only. Drop any embed/query the caller may have pasted in —
+  // host-url is scaffolding, not the editor surface.
+  const path = u.pathname && u.pathname !== "" ? u.pathname : "/";
+  return u.origin + path;
 }
 
 function hostOf(url) {
@@ -183,8 +247,14 @@ function canvasConfig() {
 
 function setCanvasConfig(args) {
   const cfg = serverConfig();
-  const url = args.canvasUrl || configValue(cfg, "canvasUrl");
+  const fromSkill = configValue(cfg, "canvasUrl");
+  const url = args.canvasUrl || fromSkill;
   const canvasUrl = buildCanvasUrl(url);
+  state.canvasSource = args.canvasUrl
+    ? "argument"
+    : fromSkill
+      ? "skill-config"
+      : "default";
   const hostSrc = args.hostUrl || configValue(cfg, "hostUrl") || url;
   const hosts =
     toHostList(args.hosts) ||
@@ -194,8 +264,10 @@ function setCanvasConfig(args) {
   state.canvasUrl = canvasUrl;
   // The host document only has to be scriptable and permit framing the canvas.
   // Every draw.io deployment frames itself, so same-origin is the default and
-  // the skill stays self-contained.
-  state.hostUrl = hostSrc ? buildCanvasUrl(hostSrc) : canvasUrl;
+  // the skill stays self-contained. NEVER put the embed query on the host —
+  // see buildHostUrl. Falling back through canvasUrl used to re-introduce
+  // ?proto=json and the tab self-closed on open.
+  state.hostUrl = buildHostUrl(hostSrc || canvasUrl);
   state.canvasHosts = [hostOf(canvasUrl), hostOf(state.hostUrl)]
     .concat(hosts)
     .filter(Boolean)
@@ -3694,18 +3766,40 @@ async function toolConfig(args) {
     state.layoutEngine = want;
   }
 
-  return {
+  const keys = serverConfigKeys();
+  const out = {
     canvasUrl: cfg.canvasUrl,
     hostUrl: cfg.hostUrl,
     hosts: cfg.hosts,
     layoutEngine: layoutEngine(),
     attached: state.initialized,
+    // Where the URL came from, and what SKILL.md actually delivered. Without
+    // these, "canvas-url has no effect" cannot be told apart from "canvas-url
+    // never arrived", and the two have different fixes.
+    source: state.canvasSource,
+    skillConfigKeys: keys,
     note:
       changing && state.initialized
         ? "Canvas URL changed while a canvas is attached. The open tab still " +
           "points at the old deployment — reopen it to use the new one."
         : undefined,
   };
+
+  if (state.canvasSource === "default" && !configValue(serverConfig(), "canvasUrl")) {
+    out.hint =
+      keys.length
+        ? "SKILL.md sent this server " + keys.join(", ") + " — no canvas-url among " +
+          "them, so the built-in default is in use. Some builds forward only the " +
+          "keys they know onto a server entry. Pass canvasUrl to this tool (the " +
+          "skill's canvasUrl parameter does exactly that), or set " +
+          "DEFAULT_CANVAS_ORIGIN in mcp/drawio_mcp.js to pin it."
+        : "This server received no configuration from SKILL.md at all, so " +
+          "canvas-url there cannot take effect. Pass canvasUrl to this tool (the " +
+          "skill's canvasUrl parameter does exactly that), or set " +
+          "DEFAULT_CANVAS_ORIGIN in mcp/drawio_mcp.js to pin it.";
+  }
+
+  return out;
 }
 
 async function toolGet(args) {

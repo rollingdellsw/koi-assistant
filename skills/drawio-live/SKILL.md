@@ -14,7 +14,7 @@ parameters:
       origin: http://localhost:7080 for a local webapp checkout, or any
       self-hosted https origin.
     required: false
-    default: ""
+    default: "https://embed.diagrams.net"
 mcp-servers:
   - name: drawio_bridge
     script: mcp/drawio_mcp.js

@@ -18,7 +18,10 @@
 const [name, initialXml, mode, canvasUrlArg] = args;
 
 // Resolved from the MCP before any tab is touched — see resolveDeployment().
+// Open HOST_URL (no embed query). CANVAS_URL is for the iframe only; loading
+// it top-level with ?proto=json makes draw.io window.close() script-opened tabs.
 let CANVAS_URL = null;
+let HOST_URL = null;
 let CANVAS_HOSTS = ["embed.diagrams.net", "viewer.diagrams.net", "localhost", "127.0.0.1"];
 
 function unwrap(res) {
@@ -61,11 +64,22 @@ try {
   console.log("readSkill note: " + (e.message || e));
 }
 
+function hostUrlFrom(canvasOrHost) {
+  try {
+    const u = new URL(canvasOrHost);
+    const path = u.pathname && u.pathname !== "" ? u.pathname : "/";
+    return u.origin + path;
+  } catch (_) {
+    return "https://embed.diagrams.net/";
+  }
+}
+
 try {
   const cfg = unwrap(await tools.drawio_config(canvasUrlArg ? { canvasUrl: canvasUrlArg } : {}));
   if (cfg && cfg.error) return { success: false, error: "Invalid canvasUrl: " + cfg.error };
   if (cfg && cfg.canvasUrl) {
     CANVAS_URL = cfg.canvasUrl;
+    HOST_URL = cfg.hostUrl ? hostUrlFrom(cfg.hostUrl) : hostUrlFrom(cfg.canvasUrl);
     if (Array.isArray(cfg.hosts) && cfg.hosts.length) CANVAS_HOSTS = cfg.hosts;
   }
 } catch (e) {
@@ -78,6 +92,7 @@ if (!CANVAS_URL) {
       ? origin + "/?embed=1&proto=json&spin=1&modified=0&libraries=1&ui=kennedy&noExitBtn=1"
       : origin;
 }
+if (!HOST_URL) HOST_URL = hostUrlFrom(CANVAS_URL);
 
 // 1. Reuse an existing canvas tab if one is open — the user may already have
 //    a diagram in progress, and opening a second tab strands it.
@@ -85,10 +100,18 @@ let canvasTabId = await findCanvasTab();
 let reused = canvasTabId !== null;
 
 if (!reused) {
-  console.log("No canvas tab found — opening one...");
-  await tools.newPage(CANVAS_URL);
-  await tools.sleep(4000);
+  console.log("No canvas tab found — opening host " + HOST_URL + " ...");
+  await tools.newPage(HOST_URL);
+  await tools.sleep(3000);
   canvasTabId = await findCanvasTab();
+  if (canvasTabId === null) {
+    return {
+      success: false,
+      error:
+        "Opened host tab at " + HOST_URL + " but it never appeared in listPages. " +
+        "If the URL carried ?proto=json the tab may have self-closed.",
+    };
+  }
 } else {
   console.log("Reusing existing canvas tab: " + canvasTabId);
 }
