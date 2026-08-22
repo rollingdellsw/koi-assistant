@@ -691,6 +691,33 @@ function listOverlaySessions() {
 }
 
 /**
+ * Recursively remove a directory tree, robust to overlayfs workdir (mode 0000),
+ * read-only git objects (mode 0444), and permission quirks on Linux/gLinux.
+ */
+function rmrf(target) {
+  if (!target) return;
+  try {
+    fs.rmSync(target, { recursive: true, force: true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    if (e.code === 'EACCES' || e.code === 'EPERM') {
+      try {
+        spawnSync('chmod', ['-R', 'u+rwX', target]);
+        fs.rmSync(target, { recursive: true, force: true });
+      } catch {
+        try {
+          spawnSync('rm', ['-rf', target]);
+        } catch {
+          if (fs.existsSync(target)) throw e;
+        }
+      }
+    } else {
+      throw e;
+    }
+  }
+}
+
+/**
  * Enforce the cap: delete the least recently used unprotected overlays until
  * total usage is back under the low-water mark. Returns a summary (also stored
  * in LAST_OVERLAY_GC for sandbox_info).
@@ -711,7 +738,7 @@ function enforceOverlayBudget(reason = 'periodic') {
       .sort((a, b) => a.newestMtimeMs - b.newestMtimeMs); // oldest first
     for (const c of candidates) {
       if (total <= target) break;
-      try { fs.rmSync(c.dir, { recursive: true, force: true }); }
+      try { rmrf(c.dir); }
       catch (e) { log(`overlay cache: could not evict ${c.sessionId}: ${e.message}`); continue; }
       overlayUsageCache.delete(c.dir);
       total -= c.bytes;
@@ -1160,8 +1187,8 @@ class BwrapBackend {
   }
 
   reset() {
-    fs.rmSync(PROJ.dirs.upper, { recursive: true, force: true });
-    fs.rmSync(PROJ.dirs.work, { recursive: true, force: true });
+    rmrf(PROJ.dirs.upper);
+    rmrf(PROJ.dirs.work);
     fs.mkdirSync(PROJ.dirs.upper, { recursive: true });
     fs.mkdirSync(PROJ.dirs.work, { recursive: true });
   }
@@ -1207,10 +1234,28 @@ ${netRules}
       // path is never created here.
       return;
     }
-    if (fs.readdirSync(PROJ.dirs.workspace).length > 0) return;
+    if (fs.readdirSync(PROJ.dirs.workspace).length > 0) {
+      this.ensureGitAlternates();
+      return;
+    }
     // APFS clonefile: instant copy-on-write clone; fall back to plain copy.
     const clone = spawnSync('cp', ['-cR', PROJ.path + '/.', PROJ.dirs.workspace]);
     if (clone.status !== 0) spawnSync('cp', ['-R', PROJ.path + '/.', PROJ.dirs.workspace]);
+    this.ensureGitAlternates();
+  }
+
+  ensureGitAlternates() {
+    if (!PROJ.dirs?.workspace || !PROJ.path) return;
+    const hostGitObjects = path.join(PROJ.path, '.git', 'objects');
+    if (!fs.existsSync(hostGitObjects)) return;
+    try {
+      const altDir = path.join(PROJ.dirs.workspace, '.git', 'objects', 'info');
+      const altFile = path.join(altDir, 'alternates');
+      fs.mkdirSync(altDir, { recursive: true });
+      if (!fs.existsSync(altFile) || fs.readFileSync(altFile, 'utf8').trim() !== hostGitObjects) {
+        fs.writeFileSync(altFile, hostGitObjects + '\n');
+      }
+    } catch { /* best effort */ }
   }
 
   wrap(shCmd, { cwd } = {}) {
@@ -1229,7 +1274,7 @@ ${netRules}
   }
 
   reset() {
-    fs.rmSync(PROJ.dirs.workspace, { recursive: true, force: true });
+    rmrf(PROJ.dirs.workspace);
     fs.mkdirSync(PROJ.dirs.workspace, { recursive: true });
     this.ensureWorkspace();
   }
@@ -1478,9 +1523,12 @@ function copyHostFileOverUpper(hostFile, upperFile, mode) {
  */
 function reconcileLowerToUpper() {
   const hostRoot = PROJ.path;
-  const upperDir = PROJ.dirs && PROJ.dirs.upper;
+  const upperDir = projectTreeHostPath();
   if (!hostRoot || !upperDir || !fs.existsSync(hostRoot) || !fs.existsSync(upperDir)) {
     return { reconciled: 0, files: [], failures: [] };
+  }
+  if (process.platform === 'darwin' && typeof BACKEND !== 'undefined' && BACKEND?.ensureGitAlternates) {
+    BACKEND.ensureGitAlternates();
   }
   const files = [];
   const failures = [];
@@ -1555,7 +1603,7 @@ function looksBinary(buf) {
 /** Push overlay upperdir contents into the LSP buffers. Returns a summary. */
 async function resyncOverlayToLsp() {
   if (!LSP.ready || !LSP.hasTool('sync_document')) return { resynced: 0, skipped: 0, reason: 'document sync unavailable' };
-  const upper = PROJ.dirs && PROJ.dirs.upper;
+  const upper = projectTreeHostPath();
   if (!upper || !fs.existsSync(upper)) return { resynced: 0, skipped: 0 };
   const rels = collectOverlayFiles(upper);
   let resynced = 0, skipped = 0;

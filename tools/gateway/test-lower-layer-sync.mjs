@@ -43,8 +43,9 @@
  *   KOI_TEST_KEEP=1              keep the temp host repo + sandbox state
  *   KOI_TEST_MTIME_SETTLE_MS=..  mtime granularity guard (default 1100)
  *
- * Requires the bwrap-overlay backend (Linux). KOI_SANDBOX_BACKEND=exec has no
- * overlay at all, so the test would pass vacuously — it refuses to run there.
+ * Requires the bwrap-overlay (Linux) or seatbelt-clone (macOS) backend.
+ * KOI_SANDBOX_BACKEND=exec has no isolation layer, so the test would pass
+ * vacuously — it refuses to run there.
  */
 
 import { spawn, spawnSync } from 'child_process';
@@ -144,7 +145,11 @@ class SandboxServer {
     this.proc.stderr.on('data', (chunk) => { this.stderr = (this.stderr + chunk).slice(-64 * 1024); });
     this.proc.on('exit', (code, signal) => {
       this.exited = { code, signal };
-      for (const [, p] of this.pending) p.reject(new Error(`server exited (code=${code} signal=${signal})`));
+      const errDetail = this.stderr.trim() ? `\n--- server stderr ---\n${this.stderr.trim()}` : '';
+      for (const [, p] of this.pending) {
+        clearTimeout(p.timer);
+        p.reject(new Error(`server exited (code=${code} signal=${signal})${errDetail}`));
+      }
       this.pending.clear();
     });
   }
@@ -258,6 +263,33 @@ function readIfExists(p) {
   try { return fs.readFileSync(p, 'utf8'); } catch { return null; }
 }
 
+/**
+ * Recursively remove a directory tree, robust to overlayfs workdir (mode 0000),
+ * read-only git objects (mode 0444), and permission quirks on Linux/gLinux.
+ */
+function rmrf(target) {
+  if (!target) return;
+  try {
+    fs.rmSync(target, { recursive: true, force: true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    if (e.code === 'EACCES' || e.code === 'EPERM') {
+      try {
+        spawnSync('chmod', ['-R', 'u+rwX', target]);
+        fs.rmSync(target, { recursive: true, force: true });
+      } catch {
+        try {
+          spawnSync('rm', ['-rf', target]);
+        } catch {
+          if (fs.existsSync(target)) throw e;
+        }
+      }
+    } else {
+      throw e;
+    }
+  }
+}
+
 // =============================================================================
 // Test
 // =============================================================================
@@ -281,7 +313,7 @@ async function runTest() {
     // -- 0. Host baseline repo -------------------------------------------------
     step(0, 'Host baseline repo (lower layer)');
     // `git init -b` is not available on older git; symbolic-ref is universal.
-    hostShOk(hostRepo, 'git init -q && git symbolic-ref HEAD refs/heads/main');
+    hostShOk(hostRepo, 'git -c init.defaultRefFormat=files init -q && git symbolic-ref HEAD refs/heads/main');
     fs.writeFileSync(path.join(hostRepo, 'README.md'), '# lower-layer sync fixture\n');
     hostShOk(hostRepo, `git add -A && git ${GIT_ID} commit -q -m "baseline"`);
     const hostBase = hostShOk(hostRepo, 'git rev-parse HEAD').stdout.trim();
@@ -293,15 +325,14 @@ async function runTest() {
 
     const info = await server.callTool('sandbox_info', {});
     console.log(`  backend: ${info.backend}  platform: ${info.platform}`);
-    if (info.backend !== 'bwrap-overlay') {
+    if (info.backend !== 'bwrap-overlay' && info.backend !== 'seatbelt-clone') {
       throw new Error(
-        `this test requires the bwrap-overlay backend, got "${info.backend}".\n` +
+        `this test requires the bwrap-overlay or seatbelt-clone backend, got "${info.backend}".\n` +
         (info.backend === 'exec-UNSAFE'
           ? 'The exec backend writes straight to the host tree — there is no upper layer to shadow ' +
             'the lower one, so every assertion here would pass without testing anything. ' +
-            'Unset KOI_SANDBOX_BACKEND and re-run on Linux with bubblewrap installed.'
-          : 'The darwin/seatbelt backend uses a CoW workspace clone rather than an overlay upperdir; ' +
-            'lower->upper reconciliation does not apply there.'));
+            'Unset KOI_SANDBOX_BACKEND and re-run.'
+          : 'Unsupported backend for lower->upper reconciliation.'));
     }
 
     const opened = await server.callTool('sandbox_open_project', { path: hostRepo, fresh: true });
@@ -456,14 +487,15 @@ async function runTest() {
   } finally {
     if (server) {
       const failed = results.some((r) => !r.ok);
-      if (failed && server.stderr.trim()) {
+      const exitedWithError = server.exited && (server.exited.code !== 0 || server.exited.signal);
+      if ((failed || exitedWithError || results.length === 0) && server.stderr.trim()) {
         console.log('\n── server stderr (tail)');
         console.log(indent(server.stderr.trim().split('\n').slice(-40).join('\n'), '     '));
       }
       await server.close();
     }
     if (KEEP) console.log(`\n(KOI_TEST_KEEP=1 — left behind: ${tmp})`);
-    else fs.rmSync(tmp, { recursive: true, force: true });
+    else rmrf(tmp);
   }
 
   const failed = results.filter((r) => !r.ok);

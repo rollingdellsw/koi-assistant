@@ -7,19 +7,27 @@ runnable: true
 parameters:
   - name: bridgeUrl
     description: >-
-      Where koi_bridge.py is listening inside the running FreeCAD. Leave blank
-      for the configured default (bridge-url below). Loopback unless FreeCAD is
-      in a container with a published port.
-    required: false
+      Where koi_bridge.py is listening inside the running FreeCAD. Check https://github.com/rollingdellsw/koi-assistant/blob/main/skills/freecad-live/HOWTO.md for details.
+    required: true
+    default: ""
+  - name: bridgeToken
+    description: >-
+      The token in FreeCAD server side. Check https://github.com/rollingdellsw/koi-assistant/blob/main/skills/freecad-live/HOWTO.md for details.
+    required: true
+    default: ""
+  - name: streamUrl
+    description: >-
+      The FreeCAD server WebRTC URL. Check https://github.com/rollingdellsw/koi-assistant/blob/main/skills/freecad-live/HOWTO.md for details.
+    required: true
     default: ""
 mcp-servers:
   - name: freecad_bridge
     script: mcp/freecad_mcp.js
     # Where the FreeCAD-side macro listens. Loopback: the bridge binds
     # 127.0.0.1 and nothing off this machine can reach it.
-    bridge-url: http://127.0.0.1:8765
-    bridge-token: "57c5d4c01a424d1fb891d20021987080"
-    stream-url: https://192.168.68.113:3001
+    bridge-url: http://localhost:8765
+    bridge-token: "b2d9a53a51a46cd7d2d425cc718b656f"
+    stream-url: http://localhost:3000
     # Optional. The page showing this FreeCAD's window — KasmVNC, Selkies,
     # any WebRTC/VNC front end. Nothing in the skill talks to it; it exists so
     # the human can see the model and take the mouse. Without it the session
@@ -46,7 +54,10 @@ mcp-servers:
     #                    with no revision hash, and the only layer that answers
     #                    while the interpreter is busy. It moves under an
     #                    upgrade, a reinstall or a re-pulled container image —
-    #                    which is the point.
+    #                    which is the point. DELIBERATELY UNSET here: this
+    #                    build carries a revision hash, so the commit is the
+    #                    identity and the fingerprint only adds false drift.
+    #                    See the note below before pasting it back in.
     #   pin-mode:        off | warn | strict. strict refuses to attach to a
     #                    build that is not the pinned one.
     #
@@ -70,9 +81,21 @@ mcp-servers:
     # pin-version: ""
     # pin-commit: ""
     # pin-fingerprint: ""
+
+    # NOTE: freecad_version() returns a pinBlock that INCLUDES a
+    # pin-fingerprint. Do not paste that field back in on this deployment.
+    # exe:<size>@<mtime> is taken from whichever `freecad` file the bridge
+    # resolves, and on this image that is not stable: the value once pinned
+    # here was exe:159624@1784962801 (159 KB) against an actual
+    # exe:9479072@1784955697 (9.0 MB), with the *pinned* file stamped 96
+    # seconds EARLIER — a launcher shim measured instead of the real ELF,
+    # not a rebuild. It reported drift on every attach for a binary that had
+    # not changed, which is how a gate stops being read. The commit is
+    # prefix-matched and identifies the build; the fingerprint is only worth
+    # setting on a build with no revision hash, or to catch a local patch on
+    # top of a matching commit.
     pin-version: "1.1.3"
     pin-commit: "145529fe741292ff0b3977a01195bf0247425794"
-    pin-fingerprint: "exe:159624@1784962801"
     pin-mode: strict
     # Probe-stage escape hatch. freecad_exec and freecad_edit are arbitrary
     # code at `mutating` tier, which is what the freecad_call/freecad_script

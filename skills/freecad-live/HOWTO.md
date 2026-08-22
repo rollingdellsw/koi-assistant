@@ -17,13 +17,13 @@ A guide to deploying a WebRTC-streamed **Native FreeCAD (v1.1.x+)** server using
 
 ## 💻 Verified Hardware & Environment
 
-| Component            | Tested Spec                                             |
-| :------------------- | :------------------------------------------------------ |
-| **OS**               | Ubuntu 24.04 LTS (x86_64 / arm64)                       |
-| **CPU**              | 64-bit CPU (AVX2 supported for Wayland mode)            |
-| **GPU**              | _None required_ (CPU rendering default; GPU optional)   |
-| **Container Engine** | Podman v4.9.3+ (Rootless) or Docker                     |
-| **Image**            | `docker.io/linuxserver/freecad:latest` (FreeCAD 1.1.3+) |
+| Component            | Tested Spec                                                                |
+| :------------------- | :------------------------------------------------------------------------- |
+| **OS**               | Windows 11 + WSL2 Ubuntu 22.04 LTS, and Ubuntu 24.04 LTS standalone server |
+| **CPU**              | 64-bit CPU (AVX2 supported for Wayland mode)                               |
+| **GPU**              | _None required_ (CPU rendering default; GPU optional)                      |
+| **Container Engine** | Podman v4.9.3+ (Rootless) or Docker                                        |
+| **Image**            | `docker.io/linuxserver/freecad:latest` (FreeCAD 1.1.3+)                    |
 
 > **Pin the image before you rely on the CAD behaviour.** `:latest` plus
 > `Restart=always` plus any auto-update means the FreeCAD under your agent can
@@ -36,8 +36,8 @@ A guide to deploying a WebRTC-streamed **Native FreeCAD (v1.1.x+)** server using
 > ```
 >
 > Put that digest in the `ExecStart` below. The freecad-live skill pins the
-> build a second time, independently, from inside the process (`pin-commit`,
-> `pin-fingerprint`), and will refuse to attach in `strict` mode if the image
+> build a second time, independently, from inside the process (`pin-commit`),
+> and will refuse to attach in `strict` mode if the image
 > moved under it. Two pins, because the image tag and the binary are two things
 > that can drift separately.
 >
@@ -59,11 +59,11 @@ podman unshare chown -R 1000:1000 ~/freecad-stream/config
 # Where the bridge will write exports (STEP/FCStd handovers). It lives under
 # the workspace bind mount on purpose: files the AI writes show up on the host
 # immediately, with no download and no copy out of the container.
-mkdir -p ~/freecad-stream/workspace/koi_export
+podman unshare mkdir -p ~/freecad-stream/workspace/koi_export
 
 # The FreeCAD macro directory, bind-mounted through /config. This is how
 # koi_bridge.py gets into the container without rebuilding the image.
-mkdir -p ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro
+podman unshare mkdir -p ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro
 ```
 
 ---
@@ -377,7 +377,7 @@ except ImportError:
 QtCore.QTimer.singleShot(4000, _start_koi_bridge)
 EOF
 
-chmod -R u+rwX,g+rX,o+rX "$MODDIR"
+podman unshare chmod -R u+rwX,g+rX,o+rX "$MODDIR"
 
 systemctl --user restart freecad.service
 ```
@@ -418,12 +418,11 @@ In `skills/freecad-live/SKILL.md`:
 mcp-servers:
   - name: freecad_bridge
     script: mcp/freecad_mcp.js
-    bridge-url: http://127.0.0.1:8765
+    bridge-url: http://localhost:8765
     bridge-token: "57c5d4c01a424d1fb891d20021987080"
     stream-url: https://192.168.68.113:3001
     pin-version: "1.1.3"
     pin-commit: "145529fe741292ff0b3977a01195bf0247425794"
-    pin-fingerprint: "exe:159624@1784962801"
     pin-mode: strict
 ```
 

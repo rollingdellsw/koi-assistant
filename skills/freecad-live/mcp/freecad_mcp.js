@@ -1724,14 +1724,10 @@ def _numx(args, key, default=None):
             return float(expr), None
         except ValueError:
             pass
-        value = _eval_expr(expr)
+        value, err = _eval_expr(expr)
         if value is None:
-            raise KoiOpError(
-                "could not evaluate %r for %r. This is a document expression "
-                "-- 'koi_params.StackHeight', 'koi_params.pitch / 2' -- so "
-                "the alias has to exist before the feature that binds to it: "
-                "set it with fn 'param', or insert the component that "
-                "publishes it." % (expr, key))
+            raise _expr_error(expr, key, err,
+                              "'koi_params.StackHeight', 'koi_params.pitch / 2'")
         return float(value), expr
     if v is None:
         raise KoiOpError("missing required argument %r" % (key,))
@@ -2055,22 +2051,49 @@ def _eval_expr(expr, doc=None):
     """
     doc = doc or App.ActiveDocument
     if doc is None:
-        return None
+        return None, None
     hosts = []
     sh = params_sheet(doc, create=False)
     if sh is not None:
         hosts.append(sh)
     hosts.extend(doc.Objects[:1])
+    err = None
     for h in hosts:
         try:
             v = h.evalExpression(str(expr))
-        except Exception:
+        except Exception as e:
+            err = "%s: %s" % (type(e).__name__, e)
             continue
         try:
-            return float(getattr(v, "Value", v))
+            return float(getattr(v, "Value", v)), None
         except Exception:
             continue
-    return None
+    return None, err
+
+
+def _expr_error(expr, key, err, kind):
+    """Why an expression did not evaluate, in the caller's terms.
+
+    The parameter sheet stores plain floats, so a sheet reference is
+    unit-bare and mixing it with a unit literal raises a unit mismatch
+    inside the expression engine. A bare koi_params.X evaluates fine,
+    which makes the failure read as bad syntax rather than a unit rule --
+    and the error the engine raised was being discarded, so nothing in the
+    reply said which of the two it was.
+    """
+    if err and "Unit mismatch" in err:
+        bare = " ".join(expr.replace("mm", "").replace("deg", "").split())
+        return KoiOpError(
+            "%r could not be evaluated for %r: the parameter sheet holds "
+            "PLAIN NUMBERS in the document's own units (mm, deg), so a "
+            "sheet reference carries no unit and mixing it with a unit "
+            "literal is a unit mismatch. Write it unit-bare -- %r -- or "
+            "put no unit on any term. (%s)" % (expr, key, bare, err))
+    return KoiOpError(
+        "could not evaluate %r for %r. This is a document expression -- %s "
+        "-- so the alias has to exist before the feature that binds to it: "
+        "set it with fn 'param', or insert the component that publishes "
+        "it.%s" % (expr, key, kind, (" (%s)" % err) if err else ""))
 
 
 def _dim(g, key, default=None):
@@ -2092,14 +2115,10 @@ def _dim(g, key, default=None):
         expr = v.strip()
         if not expr:
             raise KoiOpError("%r is an empty expression" % (key,))
-        value = _eval_expr(expr)
+        value, err = _eval_expr(expr)
         if value is None:
-            raise KoiOpError(
-                "could not evaluate %r for %r. This is a document expression "
-                "-- 'koi_params.bore', 'koi_params.pitch / 2' -- so the alias "
-                "has to exist before the sketch that binds to it: set it with "
-                "fn 'param', or insert the component that publishes it."
-                % (expr, key))
+            raise _expr_error(expr, key, err,
+                              "'koi_params.bore', 'koi_params.pitch / 2'")
         return float(value), expr
     if v is None:
         raise KoiOpError("missing required argument %r" % (key,))
@@ -8237,6 +8256,44 @@ def _prior_split(doc, kid, kids):
     return out
 
 
+def _purge_stale_split_records(doc, kid, src_name, names, ids):
+    """Drop split records that this split supersedes.
+
+    Records are keyed by kid, but _split_lint reads every one of them. A
+    re-split under a NEW id therefore leaves the old record behind, still
+    pointing at the same halves with the old source volume, and it reports
+    split-stale forever -- on halves that are current, with no op able to
+    clear it. Re-running split_body is the recovery this skill documents
+    for split-stale, so the recovery was what created the fault.
+    """
+    cur = SPLIT_PREFIX + str(kid)
+    mine = set(str(n) for n in (names or []))
+    mine |= set(str(i) for i in (ids or []))
+    purged = []
+    for k in sorted(_meta(doc)):
+        if not k.startswith(SPLIT_PREFIX) or k == cur:
+            continue
+        try:
+            rec = _json.loads(_meta(doc)[k])
+        except Exception:
+            continue
+        if str(rec.get("source") or "") != str(src_name):
+            continue
+        theirs = set(str(n) for n in (rec.get("names") or []))
+        theirs |= set(str(i) for i in (rec.get("ids") or []))
+        if not (theirs & mine):
+            continue
+        d = _meta(doc)
+        d.pop(k, None)
+        try:
+            doc.Meta = d
+        except Exception:
+            pass
+        _FALLBACK.get(doc.Name, {}).pop(k, None)
+        purged.append(k)
+    return purged
+
+
 def _op_split_body(doc, args, kid):
     """Cut one solid into two parts, each in its own body.
 
@@ -8352,6 +8409,11 @@ def _op_split_body(doc, args, kid):
         "gap": gap, "ids": list(kids),
         "names": [h["name"] for h in out["halves"]],
     }))
+
+    superseded = _purge_stale_split_records(
+        doc, kid, src.Name, [h["name"] for h in out["halves"]], kids)
+    if superseded:
+        out["supersededRecords"] = superseded
 
     if str(args.get("keep") or "hide") == "hide":
         hidden = []
