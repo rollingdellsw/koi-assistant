@@ -22,7 +22,53 @@
 // works: http://localhost:7080 for a local webapp checkout, or a corporate
 // self-host. The MCP owns the resolution so that the scripts, the bridge and
 // the host allowlist can never disagree about which instance is in play.
-const [canvasUrlArg] = args;
+//
+// The Skills panel's "Additional Instructions (Optional)" box has no channel of
+// its own. useSkillExecution folds it into the FIRST declared parameter before
+// the script runs:
+//
+//   canvasUrl filled  ->  args[0] = "<url>\n\n# Additional Instructions\n<text>"
+//   canvasUrl blank   ->  args[0] = "<text>"
+//
+// Handing that blob to drawio_config as a URL loses the text silently — the
+// WHATWG URL parser strips newlines, so the prose is folded into a fragment and
+// the canvas opens as if nothing had been typed. Split the two halves here:
+// only the URL half reaches drawio_config, and the prose half is carried out
+// through `findings`, which IS seeded into the follow-up session.
+const ADDITIONAL_HEADER = /\n\s*#+\s*Additional Instructions\s*\n/i;
+
+function looksLikeUrl(s) {
+  if (!s || /\s/.test(s)) return false;
+  return (
+    /^https?:\/\//i.test(s) ||
+    /^(localhost|127\.0\.0\.1)(:\d+)?(\/.*)?$/i.test(s)
+  );
+}
+
+function splitEntryArg(raw) {
+  const s = (raw || "").trim();
+  if (s === "") return { canvasUrl: "", instructions: "" };
+  const parts = s.split(ADDITIONAL_HEADER);
+  if (parts.length > 1) {
+    const head = parts[0].trim();
+    const tail = parts.slice(1).join("\n").trim();
+    // A saved parameter default puts a real URL in head; anything else means
+    // the user typed prose into the parameter box too — keep all of it.
+    return looksLikeUrl(head)
+      ? { canvasUrl: head, instructions: tail }
+      : { canvasUrl: "", instructions: (head + "\n\n" + tail).trim() };
+  }
+  return looksLikeUrl(s)
+    ? { canvasUrl: s, instructions: "" }
+    : { canvasUrl: "", instructions: s };
+}
+
+const ENTRY = splitEntryArg(args[0]);
+const canvasUrlArg = ENTRY.canvasUrl;
+// args[1] is a forward-compatible slot: if the dispatcher is ever changed to
+// pass the instructions on their own rather than merged into parameter 0, they
+// land here and this script keeps working either way.
+const USER_INSTRUCTIONS = ENTRY.instructions || (args[1] || "").trim();
 
 // Filled in from drawio_config before any tab is touched. The literals here are
 // only a fallback for an MCP too old to answer.
@@ -349,4 +395,19 @@ async function run() {
   };
 }
 
-return run();
+// Every exit path — success, config rejection, bridge failure — goes through
+// here, so the instructions survive even when the canvas did not come up.
+function attachInstructions(res) {
+  if (USER_INSTRUCTIONS === "") return res;
+  const out = res || {};
+  const note =
+    "\n\n---\n\nYou also gave me these instructions when you started the skill:\n\n" +
+    USER_INSTRUCTIONS +
+    "\n\nI haven't acted on them yet — send a message when the canvas is ready " +
+    "and I'll start there.";
+  out.instructions = USER_INSTRUCTIONS;
+  out.findings = (typeof out.findings === "string" ? out.findings : "") + note;
+  return out;
+}
+
+return run().then(attachInstructions);

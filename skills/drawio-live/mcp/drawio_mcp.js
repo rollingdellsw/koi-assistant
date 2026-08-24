@@ -40,8 +40,22 @@ const DEFAULT_CANVAS_ORIGIN = "https://embed.diagrams.net/";
 // `embed=1&proto=json` is the protocol the bridge speaks and is not optional;
 // the rest is chrome. Kept as one string so every entry point builds the same
 // URL from the same rule.
+//
+// `format=0` closes the right-hand Diagram/Style panel. It is off by default
+// because this canvas is usually driven from a sidepanel-width window, where
+// the panel eats a third of the drawing area on every load, and embed mode
+// gives no obvious way to dismiss it. Styling stays reachable from the toolbar
+// and right-click ▸ Edit Style. Two ways to get it back: `format-panel: 1` on
+// this server's block in SKILL.md, or a `canvas-url:` that already carries
+// `embed=1`, which is taken verbatim (see buildCanvasUrl).
+//
+// `sidebar=1` pins the left Shapes panel open. `libraries=1` only ENABLES the
+// libraries in embed mode (default 0) — it does not decide whether the panel
+// starts expanded, which the theme and the origin's stored state otherwise
+// settle between them. The human draws during their own turn; the palette is
+// how they do it, so it should never come up collapsed.
 const CANVAS_QUERY =
-  "embed=1&proto=json&spin=1&modified=0&libraries=1&ui=kennedy&noExitBtn=1";
+  "embed=1&proto=json&spin=1&modified=0&libraries=1&sidebar=1&ui=kennedy&noExitBtn=1&format=0";
 
 // Hostnames ensureBridge will attach to in addition to the configured one.
 // A deployment that wants a tighter list sets `canvas-hosts:` in SKILL.md,
@@ -183,6 +197,12 @@ function buildCanvasUrl(origin) {
   if (u.searchParams.get("embed") === "1") return u.href;
   const existing = u.search.replace(/^\?/, "");
   u.search = existing ? existing + "&" + CANVAS_QUERY : CANVAS_QUERY;
+  // `format-panel: 1` opts the Diagram/Style panel back in without having to
+  // restate the whole query in canvas-url.
+  const fmt = configValue(serverConfig(), "formatPanel");
+  if (fmt === true || fmt === 1 || String(fmt).toLowerCase() === "true" || String(fmt) === "1") {
+    u.searchParams.delete("format");
+  }
   return u.href;
 }
 

@@ -107,6 +107,7 @@ const state = {
   // that is still alive.
   busy: null,
   koiCadVersion: null, // set once the in-process module is loaded
+  koiCadRevived: 0,    // times the module had to be re-bootstrapped mid-session
   koiCadOps: null, // op names the process reported, checked against OP_SPECS
   koiCadFile: null, // where the process actually imported it from
   koiCadReplacedStale: false, // a previous session's module was evicted
@@ -405,17 +406,15 @@ async function bridgeFetch(path, payload, timeoutMs) {
     opts.body = JSON.stringify(payload);
   }
   let res;
-  try {
-    res = await runtime.fetch(url, opts);
-  } catch (e) {
-    if (!payload) throw e;
-    // The POST could not be issued at all. Same request, urlencoded, so a
-    // failure after this is attributable to the bridge and not to the proxy.
-    const q =
-      "?payload=" + encodeURIComponent(JSON.stringify(payload)) +
-      (state.bridgeToken ? "&token=" + encodeURIComponent(state.bridgeToken) : "");
-    res = await runtime.fetch(url + q, { skipAuth: true, timeoutMs: opts.timeoutMs });
-  }
+  // No urlencoded fallback. It used to retry a failed POST as
+  // ?payload=...&token=..., which put the shared secret in a query string --
+  // into shell history, access logs, browser history and Referer headers --
+  // and, worse, made every bridge call issuable as a simple request: no custom
+  // header, so no CORS preflight, so any page the human happened to be
+  // visiting could drive an interpreter that executes arbitrary Python. A
+  // fallback that downgrades authentication is worse than the failure it was
+  // covering for, so the failure is now reported instead.
+  res = await runtime.fetch(url, opts);
   if (!res) throw new Error("no response from the bridge at " + url);
   let json = null;
   try {
@@ -512,7 +511,81 @@ function busyNote() {
  * wrapPython — because a traceback that only reaches FreeCAD's report view is
  * a traceback this side cannot read.
  */
+// The module can go away underneath us, and until now nothing noticed.
+//
+// ensureKoiCad caches state.koiCadVersion and returns early on every call
+// after the first. That is right when the FreeCAD it bootstrapped is the
+// FreeCAD still running -- and wrong the moment that process restarts. The
+// module lives in a temp directory on sys.path of THAT interpreter; a restart
+// takes both with it, while this server goes on believing 0.7.1 is loaded.
+// Every subsequent call then dies with ModuleNotFoundError, forever, with no
+// path back except reloading the extension. A full test run reported one pass
+// out of sixteen for exactly this reason, and not one line of the output said
+// "FreeCAD restarted" -- because nothing here knew.
+//
+// A cached fact about another process is a fact with an expiry date nobody
+// can see. So: notice the specific error, re-run the bootstrap once, and
+// retry. If the reload fails, say what happened rather than passing an import
+// error up as if it were the answer to the question that was asked.
+const KOI_MISSING_RE = /No module named ['"]koi_cad['"]/;
+let koiReviving = false;
+
 async function execPython(body, timeoutMs) {
+  const first = await execPythonOnce(body, timeoutMs);
+  const d = first && first.data;
+  if (!d || d.ok !== false || !KOI_MISSING_RE.test(String(d.error || ""))) {
+    return first;
+  }
+  // Guarded, because the bootstrap snippet imports koi_cad too: without this
+  // a FreeCAD that cannot load the module at all would recurse until the
+  // stack ran out instead of reporting why.
+  if (koiReviving) return first;
+
+  koiReviving = true;
+  let boot;
+  try {
+    state.koiCadVersion = null;
+    state.koiCadFile = null;
+    boot = await ensureKoiCad(true);
+  } catch (e) {
+    throw new Error(
+      "koi_cad is not loaded in the FreeCAD this server is attached to, and " +
+        "re-loading it failed: " + e.message + " The usual cause is that " +
+        "FreeCAD restarted since the last call — the module lives in a temp " +
+        "directory on that process's sys.path and goes with it. Nothing was " +
+        "lost in the document; ask the user to confirm FreeCAD is up, then " +
+        "call freecad_attach again."
+    );
+  } finally {
+    koiReviving = false;
+  }
+
+  const again = await execPythonOnce(body, timeoutMs);
+  state.koiCadRevived = (state.koiCadRevived || 0) + 1;
+  try {
+    runtime.console.warn(
+      "freecad_mcp: koi_cad had vanished from the FreeCAD process; " +
+        "re-bootstrapped " + boot + " and retried."
+    );
+  } catch (_) { /* console is best-effort */ }
+  const data = again && again.data;
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    // Said out loud on the first reply after a revive, because a restarted
+    // FreeCAD is not the one that held the baseline: the turn diff, the
+    // isolate record and every koi id that was never saved to disk went with
+    // the old process. Reporting the call as ordinary would hide that.
+    data.bridgeReloaded = true;
+    data.bridgeReloadedNote =
+      "koi_cad was missing from the FreeCAD process and was re-loaded before " +
+      "this call, which almost always means FreeCAD restarted. The user-diff " +
+      "baseline is gone, so this turn cannot tell what the human changed, and " +
+      "any koi id from before the restart only survives if the document was " +
+      "saved. Re-read the document before editing it.";
+  }
+  return again;
+}
+
+async function execPythonOnce(body, timeoutMs) {
   const budget = timeoutMs || EXEC_TIMEOUT;
   const id = "koi" + ++state.jobSeq + "_" + Date.now();
   let res;
@@ -548,9 +621,14 @@ async function execPython(body, timeoutMs) {
     }
     if (e.status === 401 || e.status === 403) {
       throw new Error(
-        "The bridge rejected the token. Set `bridge-token:` under the " +
-          "freecad_bridge server in SKILL.md to the value koi_bridge.py printed " +
-          "when it started, or pass it to freecad_config({bridgeToken})."
+        "The bridge rejected the token. A 401 here means the bridge is up and " +
+          "guarded, not that it is broken. Ask the user to open Skills \u2192 " +
+          "freecad-live \u2192 Run and enter bridgeUrl and bridgeToken there " +
+          "\u2014 do not ask them to paste the token into the chat, where it " +
+          "would be stored in the transcript. The value is the " +
+          "KOI_BRIDGE_TOKEN the bridge was started with; on the documented " +
+          "deploy, `grep KOI_BRIDGE_TOKEN ~/freecad-stream/bridge.env` on the " +
+          "FreeCAD host."
       );
     }
     state.bridge = null;
@@ -740,7 +818,37 @@ async function readBridgeEvidence(refresh) {
     tokenRequired: !!hello.tokenRequired,
     fingerprint: hello.fingerprint || null,
   };
+  const insecure = insecureBridgeWarning();
+  if (insecure) state.bridge.insecureTransport = insecure;
   return hello;
+}
+
+/**
+ * The token authenticates a channel that runs arbitrary Python. Over loopback
+ * or an SSH tunnel, plain HTTP is fine — the bytes never touch a wire. Pointed
+ * at another machine over http://, every call ships the secret and the whole
+ * document in the clear to anyone on the path, and the deployment guide's own
+ * advice is a tunnel. Worth saying once per attach rather than never.
+ */
+function insecureBridgeWarning() {
+  let host;
+  try {
+    host = new URL(state.bridgeUrl || DEFAULT_BRIDGE_URL);
+  } catch (_) {
+    return null;
+  }
+  if (host.protocol !== "http:") return null;
+  const h = host.hostname;
+  const loopback =
+    h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]" ||
+    /^127\./.test(h);
+  if (loopback) return null;
+  return (
+    "the bridge is " + host.origin + ": plain HTTP to another host, so the " +
+    "token and every document travel the network in the clear. Tunnel it " +
+    "(ssh -N -L 8765:127.0.0.1:8765 user@host) and point bridge-url at " +
+    "http://localhost:8765, or terminate TLS in front of it."
+  );
 }
 
 function protocolStatus() {
@@ -781,7 +889,7 @@ function protocolStatus() {
 //                window freeze while it runs.
 
 const KOI_CAD_PY = String.raw`
-VERSION = "0.5.0"
+VERSION = "0.7.3"
 
 import json as _json
 import math as _math
@@ -1820,7 +1928,14 @@ def _resolve_or_die(doc, ref, what):
     return o
 
 
-def _resolve_body(doc, ref):
+# A sketch lives in exactly one Body, and a pad built on it can go nowhere
+# else. Only these two: 'target' and 'base' can legitimately name something in
+# a different body from the one being built in, and guessing there would put a
+# feature in the wrong solid -- which is worse than asking.
+BODY_HINT_KEYS = ("sketch", "profile")
+
+
+def _resolve_body(doc, ref, args=None):
     if ref:
         b = _resolve_or_die(doc, ref, "body")
         if "PartDesign::Body" not in b.TypeId:
@@ -1831,8 +1946,27 @@ def _resolve_body(doc, ref):
         return bodies[0]
     if not bodies:
         raise KoiOpError("no body in the document; call fn 'body' first")
+
+    # The second body in a document used to break every pad after it: the
+    # caller had already said which body it meant, by naming a sketch that is
+    # inside one, and this asked again anyway. Refusing on an ambiguity the
+    # arguments resolve is a refusal the caller cannot act on except by
+    # repeating itself.
+    if args:
+        for key in BODY_HINT_KEYS:
+            r = args.get(key)
+            if not isinstance(r, str) or not r:
+                continue
+            owner = resolve(doc, r)
+            if owner is None:
+                continue
+            b = _owning_body(owner)
+            if b is not None:
+                return b
     raise KoiOpError(
-        "several bodies (%s); pass body=<id>"
+        "several bodies (%s); pass body=<id>. A sketch or profile argument "
+        "would also have settled it -- this is asked only because nothing in "
+        "this call names a body or anything inside one."
         % ", ".join(b.Name for b in bodies))
 
 
@@ -2499,6 +2633,14 @@ def _sk_bspline(sk, C, Part, V, g):
             "periodic": periodic, "blocked": blocked}
 
 
+# One table, two callers. sketch builds a profile and sketch_edit adds to
+# one that already exists; a primitive that only half of them accepts is a
+# primitive that works until the day somebody edits instead of rebuilding.
+SK_BUILDERS = {"rect": _sk_rect, "circle": _sk_circle, "slot": _sk_slot,
+               "line": _sk_line, "arc": _sk_arc, "polyline": _sk_polyline,
+               "bspline": _sk_bspline}
+
+
 def _sk_constraint(C, c):
     if not isinstance(c, dict):
         raise KoiOpError("each constraint must be an object")
@@ -2785,12 +2927,170 @@ def _fit_view():
     if Gui is None:
         return False
     try:
-        if Gui.ActiveDocument is None:
+        gdoc = Gui.ActiveDocument
+        if gdoc is None and App.ActiveDocument is not None:
+            try:
+                gdoc = Gui.getDocument(App.ActiveDocument.Name)
+            except Exception:
+                gdoc = None
+        if gdoc is None:
             return False
-        Gui.SendMsgToActiveView("ViewFit")
+        view = getattr(gdoc, "ActiveView", None)
+        if view is None and hasattr(gdoc, "activeView"):
+            try:
+                view = gdoc.activeView()
+            except Exception:
+                view = None
+        if view and hasattr(view, "fitAll"):
+            try:
+                view.fitAll()
+            except Exception:
+                pass
+        try:
+            Gui.SendMsgToActiveView("ViewFit")
+        except Exception:
+            pass
+        try:
+            if view and hasattr(view, "repaint"):
+                view.repaint()
+            if hasattr(Gui, "updateGui"):
+                Gui.updateGui()
+        except Exception:
+            pass
         return True
     except Exception:
         return False
+
+
+_QT_WIDGETS = None
+
+
+def _qt_widgets():
+    """PySide's widget module, or None. Imported lazily, once, and cached.
+
+    Not assumed to be in globals(). The first version of this tested
+    'QtGui' in globals(), which is False in this module on every build --
+    nothing ever imports it -- so the branch that raised the document window
+    was dead code that read as a fix. QMdiArea moved from QtGui to QtWidgets
+    in Qt5, so the Qt4 spelling is the LAST thing tried rather than the first.
+    """
+    global _QT_WIDGETS
+    if _QT_WIDGETS is not None:
+        return _QT_WIDGETS or None
+    mod = False
+    for name, attr in (("PySide6", "QtWidgets"), ("PySide2", "QtWidgets"),
+                       ("PySide", "QtWidgets"), ("PySide", "QtGui")):
+        try:
+            m = __import__(name, globals(), locals(), [attr])
+            cand = getattr(m, attr, None)
+            if cand is not None and hasattr(cand, "QMdiArea"):
+                mod = cand
+                break
+        except Exception:
+            continue
+    _QT_WIDGETS = mod
+    return _QT_WIDGETS or None
+
+
+def _raise_document_window(doc):
+    """Bring this document's own MDI tab to the front.
+
+    A two-document session -- the model and the parameter spreadsheet, which
+    is every session that uses koi_params -- can leave the spreadsheet tab in
+    front while the model is edited behind it. The human watching the stream
+    then sees a table of numbers and concludes nothing was built.
+    """
+    w = _qt_widgets()
+    if Gui is None or w is None or doc is None:
+        return False
+    try:
+        mw = Gui.getMainWindow()
+        mdi = mw.findChild(w.QMdiArea) if mw is not None else None
+        if mdi is None:
+            return False
+        wanted = [n for n in (getattr(doc, "Name", None),
+                              getattr(doc, "Label", None)) if n]
+        matches = [sw for sw in mdi.subWindowList()
+                   if any(n in (sw.windowTitle() or "") for n in wanted)]
+        if not matches:
+            return False
+        # Prefer the 3D view over the spreadsheet tab of the SAME document:
+        # koi_params opens one, and raising it hides the model behind a table
+        # of numbers, which is the failure this function exists to undo.
+        pick = matches[0]
+        for sw in matches:
+            try:
+                if _is_3d_view(sw.widget()):
+                    pick = sw
+                    break
+            except Exception:
+                continue
+        if mdi.activeSubWindow() is not pick:
+            mdi.setActiveSubWindow(pick)
+        try:
+            pick.raise_()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+GUI_SYNC_KEY = "koi.view.sync"
+
+
+def _gui_sync(doc):
+    """Make the human's window show the document we just changed.
+
+    Deliberately NOT part of _auto_fit, and the reason is the bug this fixes.
+    Whether the CAMERA moves is the human's business and is rationed on
+    purpose -- a view that jumps on every pocket is worse than one that never
+    moves. Whether the viewport REDRAWS is not a policy question at all: a
+    window still showing the pre-pocket solid is simply wrong. Because the
+    only Gui.updateGui() on the write path lived inside _fit_view, and
+    _fit_view only ran when the model grew by a quarter, every ordinary edit
+    -- pocket, fillet, draft, a parameter change -- completed with no repaint
+    at all. freecad_render looked right the whole time because saveImage()
+    renders the scene graph offscreen and never touches the on-screen view,
+    which is exactly why the two disagreed.
+
+    Cheap enough to run unconditionally: on an unchanged view the redraw is a
+    no-op, and updateGui() is one pass of the event loop.
+    """
+    if Gui is None:
+        return None
+    if _meta(doc).get(GUI_SYNC_KEY) == "off":
+        return {"synced": False, "why": "view_fit({sync: false})"}
+    out = {"raised": _raise_document_window(doc), "redrawn": False}
+    gdoc, view, is_front = _resolve_gui_view(doc)
+    if view is None:
+        out["note"] = ("no 3D view in this document to redraw -- the viewport "
+                       "the human is watching may be stale")
+        return out
+    out["frontTab"] = bool(is_front)
+    # redraw() is the Coin-level invalidate and is what a scene-graph change
+    # actually needs; repaint()/update() are the Qt fallbacks for builds that
+    # do not expose it.
+    for name in ("redraw", "repaint", "update"):
+        fn = getattr(view, name, None)
+        if not callable(fn):
+            continue
+        try:
+            fn()
+            out["redrawn"] = True
+            out["how"] = name
+            break
+        except Exception:
+            continue
+    try:
+        Gui.updateGui()
+        out["pumped"] = True
+    except Exception:
+        out["pumped"] = False
+    if not out["redrawn"] and not out.get("pumped"):
+        out["note"] = ("the 3D view refused both a redraw and an event-loop "
+                       "pass; treat what the human can see as stale and say so")
+    return out
 
 
 def _auto_fit(doc, before):
@@ -2821,7 +3121,10 @@ def _op_view_fit(doc, args, kid):
     out = {}
     if "auto" in args:
         _meta_set(doc, AUTO_VIEW_KEY, "on" if args.get("auto") else "off")
+    if "sync" in args:
+        _meta_set(doc, GUI_SYNC_KEY, "on" if args.get("sync") else "off")
     out["auto"] = _auto_view(doc)
+    out["sync"] = _meta(doc).get(GUI_SYNC_KEY) != "off"
     out.update(_span_detail(doc))
     if out.get("span") is None:
         out["emptyNote"] = (
@@ -2832,6 +3135,7 @@ def _op_view_fit(doc, args, kid):
         out["error"] = "no GUI document to fit -- this FreeCAD is headless"
         return out
     out["fitted"] = _fit_view()
+    out["guiSync"] = _gui_sync(doc)
     return out
 
 
@@ -2844,12 +3148,256 @@ def _op_body(doc, args, kid):
     return {"name": b.Name, "label": b.Label}
 
 
+# ---------- external geometry ----------
+#
+# The hole the parametric story had. Every dimension in this skill traces back
+# to koi_params or to a literal; nothing could trace back to the MODEL. So a
+# cover plate sketched to match a housing carried the housing's width as a
+# number, and the day the housing changed the plate silently did not.
+#
+# addExternal projects a model edge or face into the sketch, and constraints
+# can then be written against it -- which is the difference between a plate
+# that is 60 mm wide and a plate that is as wide as the thing it bolts to.
+#
+# It is addressed the same way fillet addresses an edge, and for the same
+# reason: refs from a user pick, or a query whose FILTER is stored and re-run.
+# An authored Edge7 renumbers on the next upstream edit, and here that does
+# not merely error -- FreeCAD drops every constraint that referenced it.
+
+EXT_PREFIX = "koi.ext."
+EXTERNAL_LIMIT = 32
+# GeoIds: -1 is the sketch's X axis, -2 its Y axis, and external geometry
+# starts at -3 in the order it was added. This is the address a constraint
+# uses, so the op reports it rather than leaving the caller to count.
+EXTERNAL_GEOID_BASE = -3
+
+
+def _ext_count(sk):
+    try:
+        return len(list(getattr(sk, "ExternalGeometry", []) or []))
+    except Exception:
+        return 0
+
+
+def _constraint_count(sk):
+    try:
+        return len(list(getattr(sk, "Constraints", []) or []))
+    except Exception:
+        return 0
+
+
+def _ext_refs(doc, body, args, what):
+    """(refs, stored filter) for external geometry -- or (None, None).
+
+    Same contract as _dress_target: external:[...] from a user pick, or
+    query:{...} whose description survives a renumber. Defaults to kind
+    'edge', which is what a sketch projects in almost every case.
+    """
+    refs = args.get("external") or args.get("externals")
+    if isinstance(refs, str):
+        refs = [refs]
+    if refs and not isinstance(refs, list):
+        raise KoiOpError("external must be a list of refs, not %r" % (refs,))
+    qspec = None
+    if not refs and args.get("query"):
+        # Positionally compatible with both signatures of _dress_query: edge
+        # is its default and is what a sketch projects in almost every case,
+        # so this does not depend on the kind parameter existing.
+        refs, qspec = _dress_query(doc, body, args, what)
+    if not refs:
+        return None, None
+    if len(refs) > EXTERNAL_LIMIT:
+        raise KoiOpError(
+            "external geometry is capped at %d references per sketch"
+            % EXTERNAL_LIMIT)
+    return refs, qspec
+
+
+def _add_externals(doc, sk, refs, what):
+    """Project each ref into the sketch, and report the GeoId it landed on.
+
+    Verified by counting rather than by trusting the call: addExternal
+    returns a build-dependent value and refuses silently on some of them, and
+    an external that was never added reads exactly like one that was until a
+    constraint against its GeoId fails to solve.
+    """
+    out = []
+    for r in refs:
+        owner, sub = _resolve_ref_sub(doc, r)
+        if owner is None:
+            raise KoiOpError("%r did not resolve to an object" % (r,))
+        if not sub:
+            raise KoiOpError(
+                "%r names an object, not an edge or face; %s needs an element "
+                "reference" % (r, what))
+        if owner.Name == sk.Name:
+            raise KoiOpError(
+                "a sketch cannot project its own geometry as external")
+        before = _ext_count(sk)
+        try:
+            sk.addExternal(owner.Name, sub)
+        except Exception as e:
+            msg = str(e)
+            if "circular" in msg.lower() or "dependency" in msg.lower():
+                raise KoiOpError(
+                    "%s:%s is downstream of this sketch, so projecting it "
+                    "would make the document depend on itself. Project from a "
+                    "feature EARLIER in the tree, or from another body through "
+                    "fn 'bind'." % (owner.Name, sub))
+            raise KoiOpError(
+                "could not project %s:%s into %s: %s: %s"
+                % (owner.Name, sub, sk.Name, type(e).__name__, e))
+        after = _ext_count(sk)
+        if after != before + 1:
+            raise KoiOpError(
+                "%s:%s was not projected into %s -- the call did not raise "
+                "and the external list is unchanged at %d. PartDesign refuses "
+                "geometry from another body this way; use fn 'bind' for that."
+                % (owner.Name, sub, sk.Name, after))
+        out.append({"ref": "%s:%s" % (owner.Name, sub),
+                    "owner": owner.Name, "sub": sub,
+                    "geoId": EXTERNAL_GEOID_BASE - before})
+    return out
+
+
+def _ext_remember(doc, sk, refs, qspec):
+    """Keep the filter, and the refs it produced, next to the sketch."""
+    rec = {"refs": [r.get("ref") for r in refs]}
+    if qspec:
+        rec["query"] = dict(qspec)
+    _meta_set(doc, EXT_PREFIX + sk.Name, _json.dumps(rec))
+
+
+def _ext_durability(qspec, what):
+    if qspec:
+        return ("the filter is kept with this sketch, so an upstream change "
+                "that renumbers the edges is re-resolved instead of dropping "
+                "the projection. It is re-derived, not durable: check the "
+                "result")
+    return ("these are element INDICES. An upstream change renumbers them, "
+            "and FreeCAD DELETES every constraint that referenced the "
+            "projection when that happens -- which is worse than an error, "
+            "because the sketch still solves. Place it with query:{...} "
+            "instead if the model is still moving")
+
+
+def _reheal_external(doc, names):
+    """Re-run the stored filter for sketches whose projection just broke.
+
+    Separate from _reheal_dress because the repair is destructive: putting an
+    external back means deleting the old one, and FreeCAD drops every
+    constraint that referenced its GeoId when it goes. So the constraints are
+    counted before and after, and a heal that cost the sketch constraints is
+    reported as a loss rather than as a fix.
+    """
+    healed = []
+    m = _meta(doc)
+    for name in list(names)[:16]:
+        raw = m.get(EXT_PREFIX + str(name))
+        if not raw:
+            continue
+        sk = doc.getObject(str(name))
+        if sk is None:
+            continue
+        try:
+            rec = _json.loads(raw)
+            q = dict(rec.get("query") or {})
+        except Exception:
+            continue
+        if not q:
+            # Placed by ref, not by filter. There is nothing to re-derive, and
+            # guessing would be authoring an index.
+            continue
+        was_refs = list(rec.get("refs") or [])
+        was_constraints = _constraint_count(sk)
+        try:
+            res = query(q, doc)
+        except Exception:
+            continue
+        refs = list(res.get("refs") or [])
+        if not refs or refs == was_refs:
+            continue
+        try:
+            for i in range(_ext_count(sk) - 1, -1, -1):
+                sk.delExternal(i)
+            added = _add_externals(doc, sk, refs, "external geometry")
+        except Exception:
+            continue
+        now_constraints = _constraint_count(sk)
+        rec["refs"] = [r["ref"] for r in added]
+        _meta_set(doc, EXT_PREFIX + sk.Name, _json.dumps(rec))
+        row = {"sketch": sk.Name, "was": was_refs,
+               "now": rec["refs"], "matched": res.get("matched"),
+               "constraintsBefore": was_constraints,
+               "constraintsAfter": now_constraints}
+        if now_constraints < was_constraints:
+            row["lostConstraints"] = was_constraints - now_constraints
+            row["note"] = (
+                "re-projecting cost this sketch %d constraint(s): FreeCAD "
+                "deletes what referenced the old projection. The sketch may "
+                "solve and be the wrong shape -- check it before reporting "
+                "the edit" % (was_constraints - now_constraints))
+        healed.append(row)
+    return healed
+
+
+def _op_bind(doc, args, kid):
+    """A SubShapeBinder: geometry from ELSEWHERE, usable in this body.
+
+    addExternal refuses across bodies, which is the case that matters --
+    a cover plate is its own body and the housing it matches is another. The
+    binder is a real object in the target body holding a link to the source,
+    so a sketch can attach to it or project from it like anything local, and
+    it follows the source when the source moves.
+    """
+    body = _resolve_body(doc, args.get("body"), args)
+    raw = args.get("of") or args.get("target") or args.get("source")
+    if not raw:
+        raise KoiOpError(
+            "bind needs of: the object, or '<object>:Face3', to bring into "
+            "this body")
+    owner, sub = _resolve_ref_sub(doc, raw)
+    if owner is None:
+        raise KoiOpError("of %r did not resolve" % (raw,))
+    b = body.newObject("PartDesign::SubShapeBinder", _safe_name(kid, "Binder"))
+    try:
+        b.Support = [(owner, [sub] if sub else [""])]
+    except Exception as e:
+        raise KoiOpError(
+            "could not bind %s to %s: %s: %s"
+            % (owner.Name, body.Name, type(e).__name__, e))
+    # Relative binders track the source through its container placement, which
+    # is what "follows the housing" means once the housing sits in an App::Part.
+    if "relative" in args:
+        _set_if(b, "Relative", bool(args["relative"]))
+    b.Label = str(args.get("label") or kid)
+    if args.get("visible") is not True:
+        try:
+            b.Visibility = False
+        except Exception:
+            pass
+    doc.recompute()
+    if not b.isValid():
+        raise KoiOpError(
+            "the binder did not build on %s%s: %s"
+            % (owner.Name, (":" + sub) if sub else "",
+               ", ".join(list(getattr(b, "State", []))) or "invalid"))
+    register(doc, kid, b, args.get("turn"))
+    return {"name": b.Name, "of": owner.Name, "sub": sub or None,
+            "relative": bool(getattr(b, "Relative", False)),
+            "bbox": _bbox_of(b),
+            "note": ("project from this with sketch({external: ['%s:Edge1']}) "
+                     "or attach to it with sketch({on: '%s'}) -- it is a "
+                     "local object now, and it moves when %s moves"
+                     % (kid or b.Name, kid or b.Name, owner.Name))}
+
+
 def _op_sketch(doc, args, kid):
     import Part
     import Sketcher
     from FreeCAD import Vector as V
 
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     geom = args.get("geometry")
     if not isinstance(geom, list) or not geom:
         raise KoiOpError("geometry must be a non-empty list")
@@ -2863,7 +3411,7 @@ def _op_sketch(doc, args, kid):
     # than making the caller follow every sketch with fn 'attach' saves a
     # round trip, a transaction and a confirmation for one intent -- and the
     # readback is the same one 'attach' does, so it cannot silently no-op.
-    on = args.get("on", "XY")
+    on = args.get("on") or args.get("plane") or "XY"
     if str(on).upper() in ("XY", "XZ", "YZ"):
         _attach(sk, _origin_plane(body, on))
         attached_to = str(on).upper()
@@ -2890,11 +3438,16 @@ def _op_sketch(doc, args, kid):
                 % (attached_to, read.get("placement"), owner.Name,
                    read.get("targetAt"), ", ".join(read.get("modesTried") or [])))
 
+    # Projected BEFORE the primitives. External GeoIds are assigned in the
+    # order they are added and a constraint written against one has to know
+    # its address, so they are fixed before anything can reference them.
+    ext_refs, ext_qspec = _ext_refs(doc, body, args, "external geometry")
+    externals = (_add_externals(doc, sk, ext_refs, "external geometry")
+                 if ext_refs else [])
+
     C = Sketcher.Constraint
     made = []
-    builders = {"rect": _sk_rect, "circle": _sk_circle, "slot": _sk_slot,
-                "line": _sk_line, "arc": _sk_arc, "polyline": _sk_polyline,
-                "bspline": _sk_bspline}
+    builders = SK_BUILDERS
     for i, g in enumerate(geom):
         if not isinstance(g, dict):
             raise KoiOpError("geometry[%d] must be an object" % i)
@@ -2934,6 +3487,19 @@ def _op_sketch(doc, args, kid):
     out = {"name": sk.Name, "geometry": made, "on": attached_to,
            "conflicts": [int(x) for x in (getattr(sk, "ConflictingConstraints", None) or [])],
            "redundancies": [int(x) for x in (getattr(sk, "RedundantConstraints", None) or [])]}
+    if externals:
+        _ext_remember(doc, sk, externals, ext_qspec)
+        out["external"] = externals
+        out["externalDurability"] = _ext_durability(ext_qspec, "sketch")
+        if ext_qspec:
+            out["externalQuery"] = ext_qspec
+        out["externalNote"] = (
+            "geoId is the address a constraint uses: "
+            "constraints:[{type:'Distance', args:[%d, 1, 0, 5.0]}] measures "
+            "from the first projection. A sketch that PROJECTS a dimension "
+            "and then writes it as a literal anyway has not become "
+            "parametric; constrain to the projection or do not project it."
+            % (externals[0]["geoId"],))
     if bindings:
         # Read back, for the reason bolt_sketch reads its own binding back: a
         # dimension that silently stayed a literal looks identical until the
@@ -2973,6 +3539,352 @@ def _op_sketch(doc, args, kid):
                 "two of these outlines overlap without nesting. PartDesign "
                 "will not union them; pad/pocket refuse rather than silently "
                 "building one of them. One outline per sketch.")
+    return out
+
+
+def _sk_object(doc, ref):
+    sk = _resolve_or_die(doc, ref, "sketch")
+    if "Sketch" not in str(getattr(sk, "TypeId", "")):
+        raise KoiOpError(
+            "%s is a %s, not a sketch. sketch_edit changes profiles; use "
+            "feature_edit for a feature's properties."
+            % (sk.Name, sk.TypeId))
+    return sk
+
+
+def _sk_is_construction(sk, i):
+    for getter in ("getConstruction",):
+        try:
+            return bool(getattr(sk, getter)(i))
+        except Exception:
+            pass
+    try:
+        return bool(sk.Geometry[i].Construction)
+    except Exception:
+        return False
+
+
+def _sk_geometry_rows(sk):
+    """Every geoId with the numbers that identify it to a human.
+
+    Enough to say WHICH circle without a screenshot, and not the full
+    definition of the curve: the caller is choosing a geoId to edit, not
+    reconstructing the sketch.
+    """
+    rows = []
+    geo = list(getattr(sk, "Geometry", []) or [])
+    for i, g in enumerate(geo):
+        kind = type(g).__name__.replace("Geom", "")
+        row = {"geoId": i, "type": kind,
+               "construction": _sk_is_construction(sk, i)}
+        try:
+            if kind in ("Circle", "ArcOfCircle"):
+                c = g.Center
+                row["center"] = [round(c.x, 4), round(c.y, 4)]
+                row["radius"] = round(g.Radius, 4)
+                if kind == "ArcOfCircle":
+                    a0, a1 = g.FirstParameter, g.LastParameter
+                    row["angles"] = [round(_math.degrees(a0), 3),
+                                     round(_math.degrees(a1), 3)]
+            elif kind == "LineSegment":
+                s, e = g.StartPoint, g.EndPoint
+                row["from"] = [round(s.x, 4), round(s.y, 4)]
+                row["to"] = [round(e.x, 4), round(e.y, 4)]
+                row["length"] = round(s.distanceToPoint(e), 4)
+            elif "BSpline" in kind:
+                row["poles"] = len(g.getPoles())
+        except Exception:
+            pass
+        rows.append(row)
+    return rows
+
+
+def _sk_expressions(sk):
+    out = {}
+    try:
+        for path, expr in (sk.ExpressionEngine or []):
+            out[str(path).lstrip(".")] = str(expr)
+    except Exception:
+        pass
+    return out
+
+
+def _sk_constraint_rows(sk):
+    engine = _sk_expressions(sk)
+    rows = []
+    for i, c in enumerate(list(getattr(sk, "Constraints", []) or [])):
+        row = {"index": i, "type": str(getattr(c, "Type", "?"))}
+        name = str(getattr(c, "Name", "") or "")
+        if name:
+            row["name"] = name
+        for attr, key in (("First", "first"), ("Second", "second"),
+                          ("Third", "third")):
+            v = getattr(c, attr, None)
+            if isinstance(v, int) and v != -2000:
+                row[key] = v
+        try:
+            if getattr(c, "Value", None) is not None:
+                row["value"] = _plain(round(float(c.Value), 6))
+        except Exception:
+            pass
+        if getattr(c, "IsDriving", True) is False:
+            row["driving"] = False
+        expr = engine.get("Constraints[%d]" % i)
+        if expr is None and name:
+            expr = engine.get("Constraints." + name)
+        if expr:
+            row["expression"] = expr
+        rows.append(row)
+    return rows
+
+
+def _op_sketch_get(doc, args, kid):
+    """Read a sketch back: geometry, constraints, bindings, degrees of freedom.
+
+    This exists because sketch_edit could not: an edit addresses a geoId or a
+    constraint index, and before this there was no way to learn one except by
+    remembering what the call that built the sketch returned -- which is the
+    same class of mistake as authoring Face6 from memory, one level down.
+    Indices shift when geometry is deleted, so read them in the turn you use
+    them.
+    """
+    sk = _sk_object(doc, _need(args, "target"))
+    out = {"name": sk.Name, "label": sk.Label,
+           "geometry": _sk_geometry_rows(sk),
+           "constraints": _sk_constraint_rows(sk),
+           "external": int(getattr(sk, "ExternalGeometry", None) is not None
+                           and len(sk.ExternalGeometry) or 0),
+           "conflicts": [int(x) for x in
+                         (getattr(sk, "ConflictingConstraints", None) or [])],
+           "redundancies": [int(x) for x in
+                            (getattr(sk, "RedundantConstraints", None) or [])],
+           "visible": bool(getattr(sk, "Visibility", False))}
+    out.update(_sk_dof(sk))
+    prof = _profile_report(sk)
+    if prof is not None:
+        out["profile"] = prof
+    used = [o.Name for o in doc.Objects
+            if sk in (getattr(o, "OutList", None) or [])]
+    if used:
+        out["usedBy"] = used[:16]
+        out["usedByNote"] = (
+            "editing this sketch rebuilds %s. Dry-run the change if anything "
+            "downstream could break." % ", ".join(used[:16]))
+    return out
+
+
+def _op_sketch_edit(doc, args, kid):
+    """Change a sketch that already exists, instead of rebuilding it.
+
+    The rule everywhere else in this file is feature_edit before replacement,
+    because a rebuild throws away the DAG, the downstream features and the
+    user's own references. Sketches were the exception, and they are the
+    object that changes most: adding one hole to a profile meant deleting the
+    sketch, which meant deleting the pad, which meant deleting everything
+    attached to the pad.
+
+    Order is fixed and matters: removals, then geometry, then constraints,
+    then expressions. Deleting a geoId renumbers every id above it, so
+    removals go last-first and are reported by the ids they had when the call
+    was written.
+
+    What this refuses to be quiet about: deleting geometry deletes every
+    constraint that referenced it. FreeCAD does that silently, the sketch
+    still solves, and what it solves to is a different shape. The constraint
+    count before and after comes back either way.
+    """
+    import Part
+    import Sketcher
+    from FreeCAD import Vector as V
+
+    sk = _sk_object(doc, _need(args, "target"))
+    C = Sketcher.Constraint
+
+    before_dof = _sk_dof(sk)
+    before_geo = len(list(getattr(sk, "Geometry", []) or []))
+    before_cons = len(list(getattr(sk, "Constraints", []) or []))
+
+    out = {"name": sk.Name, "removed": [], "added": [],
+           "constraintsAdded": 0, "constraintsRemoved": []}
+
+    # ---- removals, descending. An ascending loop deletes geoId 2 and then
+    # deletes whatever moved into 5, which is not what the caller named.
+    rem = args.get("remove")
+    if rem is not None:
+        if not isinstance(rem, list):
+            raise KoiOpError("remove must be a list of geoIds")
+        ids_ = sorted(set(int(x) for x in rem), reverse=True)
+        for i in ids_:
+            if i < 0:
+                raise KoiOpError(
+                    "geoId %d is external geometry; remove it with "
+                    "removeExternal, not remove" % i)
+            if i >= before_geo:
+                raise KoiOpError(
+                    "geoId %d does not exist: this sketch has %d elements "
+                    "(0..%d). Read them with fn 'sketch_get' in the same turn "
+                    "you edit them -- indices move."
+                    % (i, before_geo, before_geo - 1))
+            sk.delGeometry(i)
+        out["removed"] = sorted(ids_)
+
+    drop = args.get("removeConstraints")
+    if drop is not None:
+        if not isinstance(drop, list):
+            raise KoiOpError("removeConstraints must be a list of indices")
+        names = dict((str(getattr(c, "Name", "") or ""), i)
+                     for i, c in enumerate(list(sk.Constraints or []))
+                     if getattr(c, "Name", ""))
+        want = []
+        for x in drop:
+            if isinstance(x, str) and not x.lstrip("-").isdigit():
+                if x not in names:
+                    raise KoiOpError("no constraint named %r" % x)
+                want.append(names[x])
+            else:
+                want.append(int(x))
+        for i in sorted(set(want), reverse=True):
+            sk.delConstraint(i)
+        out["constraintsRemoved"] = sorted(set(want))
+
+    # Counted HERE, before anything is added. The builders write constraints
+    # of their own (a rect is four lines and eight constraints), so a count
+    # taken at the end cannot tell a cascade from a rectangle.
+    cons_after_removals = len(list(getattr(sk, "Constraints", []) or []))
+    cascade = (before_cons - len(out["constraintsRemoved"])) - cons_after_removals
+
+    # ---- geometry, through the same builders 'sketch' uses.
+    add = args.get("add") or []
+    if not isinstance(add, list):
+        raise KoiOpError("add must be a list of primitives")
+    if len(add) > 64:
+        raise KoiOpError("add is capped at 64 primitives per call")
+    made = []
+    for i, g in enumerate(add):
+        if not isinstance(g, dict):
+            raise KoiOpError("add[%d] must be an object" % i)
+        b = SK_BUILDERS.get(g.get("type"))
+        if b is None:
+            raise KoiOpError(
+                "add[%d]: unknown type %r (%s)"
+                % (i, g.get("type"), ", ".join(sorted(SK_BUILDERS))))
+        made.append(b(sk, C, Part, V, g))
+    out["added"] = made
+
+    extra = args.get("constraints") or []
+    if not isinstance(extra, list):
+        raise KoiOpError("constraints must be a list of {type, args}")
+    if len(extra) > 128:
+        raise KoiOpError("constraints are capped at 128 per call")
+    for c in extra:
+        sk.addConstraint(_sk_constraint(C, c))
+    out["constraintsAdded"] = len(extra)
+
+    # ---- construction toggles. A profile line that should have been a
+    # centreline is a lint warning forever otherwise.
+    con = args.get("construction")
+    if con is not None:
+        if not isinstance(con, dict):
+            raise KoiOpError(
+                "construction must be an object of {geoId: true|false}")
+        toggled = []
+        for k, v in con.items():
+            i = int(k)
+            try:
+                sk.setConstruction(i, bool(v))
+            except Exception as e:
+                raise KoiOpError(
+                    "could not set construction on geoId %d: %s: %s"
+                    % (i, type(e).__name__, e))
+            toggled.append({"geoId": i, "construction": bool(v)})
+        out["construction"] = toggled
+
+    # ---- expressions last, on indices that have stopped moving.
+    bindings = []
+    for m in made:
+        for idx, expr in sorted((m.pop("bind", None) or {}).items()):
+            bindings.append({"constraint": int(idx), "expression": str(expr)})
+    exprs = args.get("expressions")
+    if exprs is not None:
+        if not isinstance(exprs, dict):
+            raise KoiOpError(
+                "expressions must be an object of {constraintIndexOrName: "
+                "expression}")
+        named = dict((str(getattr(c, "Name", "") or ""), i)
+                     for i, c in enumerate(list(sk.Constraints or []))
+                     if getattr(c, "Name", ""))
+        for k, expr in exprs.items():
+            key = str(k)
+            if key.lstrip("-").isdigit():
+                idx = int(key)
+            elif key in named:
+                idx = named[key]
+            else:
+                raise KoiOpError(
+                    "expressions key %r is neither a constraint index nor the "
+                    "name of a constraint on this sketch" % key)
+            bindings.append({"constraint": idx, "expression": str(expr)})
+    for b in bindings:
+        try:
+            sk.setExpression("Constraints[%d]" % b["constraint"],
+                             b["expression"])
+        except Exception as e:
+            raise KoiOpError(
+                "could not bind constraint %d to %r: %s: %s"
+                % (b["constraint"], b["expression"], type(e).__name__, e))
+
+    if args.get("visible") is not None:
+        sk.Visibility = bool(args["visible"])
+
+    doc.recompute()
+
+    after_cons = len(list(getattr(sk, "Constraints", []) or []))
+    out["geometry"] = _sk_geometry_rows(sk)
+    out["constraintCount"] = {"before": before_cons, "after": after_cons}
+    out["dofBefore"] = before_dof
+    out.update(_sk_dof(sk))
+    out["conflicts"] = [int(x) for x in
+                        (getattr(sk, "ConflictingConstraints", None) or [])]
+    out["redundancies"] = [int(x) for x in
+                           (getattr(sk, "RedundantConstraints", None) or [])]
+
+    if bindings:
+        engine = _sk_expressions(sk)
+        for b in bindings:
+            path = "Constraints[%d]" % b["constraint"]
+            b["verified"] = bool(path in engine)
+            try:
+                b["value"] = _plain(sk.Constraints[b["constraint"]].Value)
+            except Exception:
+                b["value"] = None
+        out["bindings"] = bindings
+        if not all(b["verified"] for b in bindings):
+            out["bindingNote"] = (
+                "at least one dimension did not keep its expression and is a "
+                "literal: it will NOT follow a change to the parameter. Say "
+                "so rather than reporting a parametric sketch.")
+
+    # The measurement this op exists to make impossible to miss. Deleting
+    # geometry takes its constraints with it, without an error and without
+    # the sketch failing to solve -- it simply solves to a different shape.
+    if cascade > 0:
+        out["constraintsLost"] = cascade
+        out["constraintsLostNote"] = (
+            "%d constraint(s) went with the geometry that was removed -- "
+            "nobody asked for those. FreeCAD deletes them silently and the "
+            "sketch still solves, at whatever shape is left. Check the "
+            "profile and the DOF before reporting this edit as clean."
+            % cascade)
+
+    prof = _profile_report(sk)
+    if prof is not None:
+        out["profile"] = prof
+        if not prof.get("closed") or not prof.get("area"):
+            out["profileNote"] = (
+                "this sketch no longer encloses an area, so pad and pocket "
+                "will REFUSE it and any feature already built on it is in "
+                "error. That is this edit, not something that was already "
+                "wrong.")
     return out
 
 
@@ -3104,7 +4016,7 @@ def _profile_gate(sk, what):
 
 
 def _op_pad(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     sk = _resolve_or_die(doc, _need(args, "sketch"), "sketch")
     # Before the feature exists, so a refusal leaves no half-built pad behind.
     profile = _profile_gate(sk, "pad")
@@ -3113,7 +4025,7 @@ def _op_pad(doc, args, kid):
     dim = _set_dim(pad, "Length", args, "length")
     if args.get("reversed"):
         pad.Reversed = True
-    if args.get("midplane"):
+    if args.get("midplane") or args.get("symmetric"):
         pad.Midplane = True
     hidden = _tidy_construction(doc, sk)
     doc.recompute()
@@ -3195,6 +4107,10 @@ def _cut_at_profile(feat, sk):
     try:
         if prof.isNull():
             return None
+        gpl = _global_placement(sk)
+        if gpl is not None:
+            prof = prof.copy()
+            prof.Placement = gpl
         return round(float(lump.distToShape(prof)[0]), 6)
     except Exception:
         return None
@@ -3360,7 +4276,7 @@ def _cut_note(removed, flipped, told, what="cut", at=None):
 
 
 def _op_pocket(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     sk = _resolve_or_die(doc, _need(args, "sketch"), "sketch")
     profile = _profile_gate(sk, "cut")
     pk = body.newObject("PartDesign::Pocket", _safe_name(kid, "Pocket"))
@@ -3370,12 +4286,12 @@ def _op_pocket(doc, args, kid):
         pk.Type = "ThroughAll"
     else:
         dim = _set_dim(pk, "Length", args, "length")
-    told = "reversed" in args
+    told = "reversed" in args and args["reversed"] is not None and str(args["reversed"]).lower() != "auto"
     if told:
         pk.Reversed = bool(args["reversed"])
-    told_mid = "midplane" in args
+    told_mid = "midplane" in args or "symmetric" in args
     if told_mid:
-        _set_if(pk, "Midplane", bool(args["midplane"]))
+        _set_if(pk, "Midplane", bool(args.get("midplane") or args.get("symmetric")))
     # Measured, exactly like the flip below and for the same reason. A through
     # cut from a sketch on a plane that runs THROUGH the material goes one way
     # and leaves the other half of the bore standing -- it recomputes clean,
@@ -3465,17 +4381,96 @@ def _op_feature_edit(doc, args, kid):
     doc.recompute()
     return {"name": tgt.Name, "changed": changed, "volume": _vol(tgt)}
 
+def _owning_body(o):
+    """The PartDesign Body this object lives in, or None.
+
+    Two ways of asking, because one of them came back empty on the build this
+    was tested against and the failure was silent: _tip_warning returned None
+    for a Pad that is plainly inside a Body, so the notTip note never fired
+    and a mid-tree measurement went out unlabelled -- the exact thing the note
+    exists to prevent.
+
+    getParentGeoFeatureGroup first, since it is the direct question. Then the
+    Group walk, which is slower, bounded, and true by construction: a feature
+    is in the Body whose Group holds it.
+    """
+    if o is None:
+        return None
+    tid = str(getattr(o, "TypeId", ""))
+    if tid == "PartDesign::Body":
+        return o
+    try:
+        b = o.getParentGeoFeatureGroup()
+        if b is not None and str(getattr(b, "TypeId", "")) == "PartDesign::Body":
+            return b
+    except Exception:
+        pass
+    doc = getattr(o, "Document", None)
+    if doc is None:
+        return None
+    name = getattr(o, "Name", None)
+    for cand in doc.Objects[:2000]:
+        if str(getattr(cand, "TypeId", "")) != "PartDesign::Body":
+            continue
+        try:
+            for member in (cand.Group or []):
+                if getattr(member, "Name", None) == name:
+                    return cand
+        except Exception:
+            continue
+    return None
+
+def _tip_warning(o):
+    """A PartDesign feature that is NOT its body's tip, or None.
+
+    In PartDesign every feature owns the whole solid AS IT WAS at that point
+    in the tree. Measuring the pad of a plate that is pocketed two features
+    later returns the volume before the holes -- correctly, and it looks
+    exactly like the answer to the question that was asked.
+
+    This is not hypothetical. The suite written for this file measured
+    pad.plate on a plate with two bores, got 24000 for a part that is
+    22994.8, and read it as the pocket having silently failed. The pocket was
+    fine. The object was the wrong one to ask, and nothing said so.
+
+    The number is right. The note says which number it is.
+    """
+    tid = str(getattr(o, "TypeId", ""))
+    if not tid.startswith("PartDesign::") or tid == "PartDesign::Body":
+        return None
+    body = _owning_body(o)
+    if body is None:
+        # Said rather than skipped. A PartDesign feature always belongs to a
+        # Body; not finding one means this check could not run, and a check
+        # that quietly does not run is indistinguishable from a check that
+        # passed -- which is how the first version of this shipped.
+        return {"body": None, "tip": None,
+                "note": ("%s is a PartDesign feature but no owning Body could "
+                         "be found, so whether this is the finished solid or "
+                         "an intermediate one was NOT checked. Treat the "
+                         "numbers as possibly mid-tree." % o.Name)}
+    tip = getattr(body, "Tip", None)
+    if tip is None or tip.Name == o.Name:
+        return None
+    return {
+        "body": body.Name, "tip": tip.Name,
+        "note": (
+            "%s is a feature in the MIDDLE of %s, not its tip (%s). In "
+            "PartDesign a feature's shape is the solid as it was at THAT "
+            "point in the tree, so this reading is from before every feature "
+            "after it -- the holes cut later are not in it. Ask %s or %s for "
+            "the finished part."
+            % (o.Name, body.Name, tip.Name, body.Name, tip.Name)),
+    }
+
 
 def _tip_owner(doc, o):
     """(body, tip) when this object is a feature inside a PartDesign Body."""
     tid = str(getattr(o, "TypeId", ""))
     if not tid.startswith("PartDesign::") or "Body" in tid:
         return None, None
-    try:
-        body = o.getParentGeoFeatureGroup()
-    except Exception:
-        body = None
-    if body is None or "Body" not in str(getattr(body, "TypeId", "")):
+    body = _owning_body(o)
+    if body is None:
         return None, None
     return body, getattr(body, "Tip", None)
 
@@ -3612,28 +4607,357 @@ VIEW_PRESETS = {
 }
 
 
-def _op_view_set(doc, args, kid):
-    # 'view' is the word half the callers reach for first, and refusing it
-    # costs a turn to learn a synonym rather than to design anything.
-    preset = str(args.get("preset") or args.get("view") or "iso").lower()
-    fn = VIEW_PRESETS.get(preset)
+def _is_3d_view(v):
+    """A 3D view, as opposed to a TechDraw page or a spreadsheet tab.
+
+    ActiveView is whatever MDI tab is in front, and in a document with a
+    drawing in it that is routinely not the 3D view at all. A TechDraw page
+    has neither viewIsometric nor saveImage, which is the whole difference
+    that matters here.
+    """
+    return v is not None and hasattr(v, "saveImage") and hasattr(v, "viewIsometric")
+
+
+def _resolve_gui_view(doc):
+    """(gdoc, 3D view, is_front_tab) for the document the human is looking at.
+
+    One resolver for view_set and render both. The copy render used to carry
+    left out setActiveDocument, which is how a two-document session ends up
+    capturing the wrong window and reporting it as a success.
+
+    The front tab is preferred and is not switched: a render is an
+    observation, and yanking the human off the drawing they were reading to
+    photograph a model is the same rudeness as moving their camera. When the
+    front tab is not a 3D view, the document's 3D view is used where it sits
+    and the caller is told so, because a picture of the model captioned as
+    what the human is looking at is exactly the lie this tool exists to stop.
+    """
+    if Gui is None:
+        return None, None, False
+    gdoc = Gui.ActiveDocument
+    if gdoc is None and doc is not None:
+        try:
+            gdoc = Gui.getDocument(doc.Name)
+        except Exception:
+            gdoc = None
+    if gdoc is None and App.ActiveDocument is not None:
+        try:
+            gdoc = Gui.getDocument(App.ActiveDocument.Name)
+        except Exception:
+            gdoc = None
+    if gdoc is None:
+        return None, None, False
+    try:
+        Gui.setActiveDocument(gdoc.Document.Name)
+    except Exception:
+        pass
+    front = getattr(gdoc, "ActiveView", None)
+    if front is None and hasattr(gdoc, "activeView"):
+        try:
+            front = gdoc.activeView()
+        except Exception:
+            front = None
+    if _is_3d_view(front):
+        return gdoc, front, True
+    try:
+        others = list(gdoc.mdiViewsOfType("Gui::View3DInventor"))
+    except Exception:
+        others = []
+    for v in others:
+        if _is_3d_view(v):
+            return gdoc, v, False
+    return gdoc, None, False
+
+
+def _preset_fn(preset):
+    """VIEW_PRESETS lookup that refuses a typo instead of ignoring it.
+
+    Swallowing an unknown preset renders whatever the camera happened to hold
+    and then reports the preset that was asked for, which is a result that
+    lies about what is in the picture.
+    """
+    if preset in (None, ""):
+        return None
+    fn = VIEW_PRESETS.get(str(preset).lower())
     if fn is None:
         raise KoiOpError(
             "preset must be one of %s" % ", ".join(sorted(VIEW_PRESETS)))
-    if Gui is None or Gui.ActiveDocument is None:
-        return {"preset": preset, "applied": False,
-                "error": "no GUI document to point"}
-    view = getattr(Gui.ActiveDocument, "ActiveView", None)
-    if view is None or not hasattr(view, fn):
-        return {"preset": preset, "applied": False,
-                "error": "this build's view has no %s" % fn}
-    getattr(view, fn)()
-    if args.get("fit", True):
+    return fn
+
+
+def _frame_view(view, fn, fit):
+    if fn:
+        getattr(view, fn)()
+    if fit:
+        if hasattr(view, "fitAll"):
+            try:
+                view.fitAll()
+            except Exception:
+                pass
         try:
             Gui.SendMsgToActiveView("ViewFit")
         except Exception:
             pass
-    return {"preset": preset, "applied": True}
+    try:
+        if hasattr(view, "repaint"):
+            view.repaint()
+        if hasattr(Gui, "updateGui"):
+            Gui.updateGui()
+    except Exception:
+        pass
+
+
+def _get_camera(view):
+    try:
+        return view.getCamera()
+    except Exception:
+        return None
+
+
+def _parse_camera(s):
+    if not s:
+        return {}
+    import re
+    props = {}
+    m_type = re.search(r'(OrthographicCamera|PerspectiveCamera)', str(s))
+    if m_type:
+        props['type'] = m_type.group(1)
+    for line in str(s).splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or line.endswith('{') or line == '}':
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            key = parts[0]
+            try:
+                nums = [float(p) for p in parts[1:]]
+                props[key] = nums
+            except ValueError:
+                props[key] = parts[1:]
+    return props
+
+
+def _cameras_match(cam1, cam2, tol=1e-2):
+    if not cam1 or not cam2:
+        return False
+    if " ".join(str(cam1).split()) == " ".join(str(cam2).split()):
+        return True
+    p1 = _parse_camera(cam1)
+    p2 = _parse_camera(cam2)
+    if not p1 or not p2:
+        return False
+    if p1.get('type') != p2.get('type'):
+        return False
+    for key in ['position', 'orientation', 'height', 'focalDistance', 'heightAngle']:
+        if key in p1 and key in p2:
+            v1, v2 = p1[key], p2[key]
+            if len(v1) != len(v2):
+                return False
+            for a, b in zip(v1, v2):
+                if abs(a - b) > tol:
+                    return False
+    return True
+
+
+def _set_camera(view, cam):
+    """Put the camera back, and check that it went back.
+
+    setCamera swallows a malformed string on some builds, so the return value
+    is a comparison against what the view actually holds afterwards rather
+    than "the call did not raise".
+    """
+    if not cam:
+        return False
+    try:
+        view.setCamera(cam)
+        if hasattr(view, "repaint"):
+            view.repaint()
+        if hasattr(Gui, "updateGui"):
+            Gui.updateGui()
+    except Exception:
+        return False
+    now = _get_camera(view)
+    return bool(now) and _cameras_match(now, cam)
+
+
+def _op_view_set(doc, args, kid):
+    # 'view' is the word half the callers reach for first, and refusing it
+    # costs a turn to learn a synonym rather than to design anything.
+    preset = str(args.get("preset") or args.get("view") or "iso").lower()
+    fn = _preset_fn(preset)
+    gdoc, view, front = _resolve_gui_view(doc)
+    if gdoc is None:
+        return {"preset": preset, "applied": False,
+                "error": "no GUI document to point"}
+    if view is None:
+        return {"preset": preset, "applied": False,
+                "error": "no 3D view in this document to point: every open tab "
+                         "is a drawing, a spreadsheet or the start page"}
+    if not hasattr(view, fn):
+        return {"preset": preset, "applied": False,
+                "error": "this build's view has no %s" % fn}
+    _frame_view(view, fn, args.get("fit", True))
+    _gui_sync(doc)
+    out = {"preset": preset, "applied": True}
+    if not front:
+        out["isFrontTab"] = False
+        out["note"] = ("the 3D view was pointed, but it is not the tab in "
+                       "front — the human is looking at something else")
+    return out
+
+
+RENDER_INLINE_LIMIT = 4000000
+
+
+def render_view(width=800, height=600, background="Current", view_preset=None,
+                fit=True, img_format="png", save_path=None, restore=True,
+                inline=True, doc=None):
+    """Snapshot the 3D view through FreeCAD's own renderer.
+
+    Two things this is careful about. The camera is an observation, not an
+    edit: framing for the shot and leaving the human's view somewhere else is
+    the same rudeness as moving their mouse, so the camera is put back unless
+    restore:False says otherwise. And the bytes are optional: inline:False
+    returns the metadata and the path only, because a base64 payload has one
+    safe channel out of here and the whitelist dispatcher is not it.
+    """
+    import os, tempfile, base64
+
+    # Arguments are checked before the GUI is touched. A bad preset or a
+    # missing savePath is wrong no matter what tab is in front, and reporting
+    # it as a view problem sends the caller to fix the wrong thing.
+    fn = _preset_fn(view_preset)
+
+    bg_map = {
+        "current": "Current",
+        "white": "White",
+        "black": "Black",
+        "transparent": "Transparent",
+    }
+    bg = bg_map.get(str(background).lower(), "Current")
+
+    fmt = str(img_format or "png").lower()
+    ext = ".png" if fmt == "png" else ".jpg" if fmt in ("jpg", "jpeg") else ".png"
+    if bg == "Transparent" and ext != ".png":
+        return {"ok": False, "applied": False,
+                "error": "a transparent background needs format:'png'; JPEG has no alpha"}
+    if not inline and not save_path:
+        raise KoiOpError(
+            "render through the dispatcher returns metadata only, so it needs "
+            "savePath to leave anything behind. Pass savePath, or call the "
+            "freecad_render tool, which returns the pixels themselves.")
+    if save_path:
+        save_path = confined_path(save_path, (ext,))
+
+    if Gui is None:
+        return {"ok": False, "applied": False,
+                "error": "no GUI available: FreeCAD must have a GUI to render viewports"}
+    doc = doc or App.ActiveDocument
+    gdoc, view, front = _resolve_gui_view(doc)
+    if gdoc is None:
+        return {"ok": False, "applied": False,
+                "error": "no active GUI document to render"}
+    if view is None:
+        return {"ok": False, "applied": False,
+                "error": "this document has no 3D view open: every tab is a "
+                         "drawing, a spreadsheet or the start page. Open the "
+                         "model tab, or ask the user to"}
+    if fn and not hasattr(view, fn):
+        return {"ok": False, "applied": False,
+                "error": "this build's 3D view has no %s" % fn}
+
+    tmp_path = save_path
+    cleanup_temp = False
+    if not tmp_path:
+        fd, tmp_path = tempfile.mkstemp(prefix="koi_render_", suffix=ext)
+        os.close(fd)
+        cleanup_temp = True
+
+    cam = _get_camera(view) if (restore and (fn or fit)) else None
+    try:
+        w = max(64, min(int(width or 800), 3840))
+        h = max(64, min(int(height or 600), 2160))
+        _frame_view(view, fn, fit)
+        view.saveImage(tmp_path, w, h, bg)
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            return {"ok": False, "applied": False,
+                    "error": "saveImage failed to produce a valid image file"}
+
+        file_size = os.path.getsize(tmp_path)
+        b64 = None
+        if inline:
+            if file_size > RENDER_INLINE_LIMIT:
+                return {"ok": False, "applied": False,
+                        "sizeBytes": file_size,
+                        "error": ("the render is %d bytes, over the %d-byte inline "
+                                  "limit: ask for smaller width/height, or pass "
+                                  "savePath and read the file"
+                                  % (file_size, RENDER_INLINE_LIMIT))}
+            with open(tmp_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+
+        # Put the camera back before the reply is built, so cameraRestored
+        # reports a fact rather than an intention. The finally below is left
+        # as the safety net for the paths that never get here.
+        restored = _set_camera(view, cam) if cam is not None else None
+        cam = None
+        if restored is False and fit:
+            _frame_view(view, fn, fit=True)
+            _gui_sync(doc)
+
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        note = "Rendered %dx%d %s viewport" % (w, h, fmt.upper())
+        if not front:
+            note += (" — NOT the tab in front: the human is looking at a "
+                     "drawing or spreadsheet, not at this")
+        if restored is False:
+            note += " — the camera could not be put back where it was"
+        out = {
+            "ok": True,
+            "applied": True,
+            "width": w,
+            "height": h,
+            "sizeBytes": file_size,
+            "mimeType": mime,
+            "format": fmt,
+            "view": str(view_preset).lower() if view_preset else None,
+            "path": save_path or None,
+            "isFrontTab": front,
+            "cameraRestored": restored,
+            "note": note,
+        }
+        if inline:
+            out["imageData"] = b64
+        return out
+    except Exception as e:
+        return {"ok": False, "applied": False,
+                "error": "%s: %s" % (type(e).__name__, str(e))}
+    finally:
+        if cam is not None:
+            _set_camera(view, cam)
+        if cleanup_temp and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _op_render(doc, args, kid):
+    # No pixels through this door. A dispatcher result is JSON in a text
+    # block, a batch is capped at 24 steps, and 24 base64 PNGs in one reply is
+    # a payload nobody can read and everybody pays for.
+    return render_view(
+        width=args.get("width", 800),
+        height=args.get("height", 600),
+        background=args.get("background", "Current"),
+        view_preset=args.get("view") or args.get("preset"),
+        fit=args.get("fit", True),
+        img_format=args.get("format", "png"),
+        save_path=args.get("savePath") or args.get("path"),
+        restore=args.get("restore", True),
+        inline=False,
+        doc=doc,
+    )
 
 
 def _op_ids(doc, args, kid):
@@ -4308,6 +5632,7 @@ def query(args, doc=None):
         except Exception:
             raise KoiOpError(
                 "expect must be 'one', 'many' or a count, not %r" % (want,))
+    stale = _tip_warning(owner)
     out = {"of": owner.Name, "kind": kind, "total": len(items),
            "matched": matched, "returned": len(kept),
            "candidates": kept,
@@ -4316,6 +5641,14 @@ def query(args, doc=None):
            "refs": [r["ref"] for r in kept],
            "expected": want if want is not None else "one",
            "ambiguous": ambiguous}
+    if stale:
+        # Worth more here than anywhere else: a query against a mid-tree
+        # feature returns elements that are NOT on the finished part, and
+        # every one of them is a ref a later fillet will happily take.
+        out["notTip"] = stale
+        out["notTipNote"] = stale["note"] + (
+            " Elements found here may not exist on the finished solid, and a "
+            "ref captured from one is a ref to a face nobody will ever see.")
     if matched == 0:
         out["note"] = (
             "nothing matched. Loosen a filter or widen tol -- and do NOT fall "
@@ -4970,7 +6303,7 @@ def _profile_circles(sk):
 
 
 def _op_hole(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     sk = _resolve_or_die(doc, _need(args, "sketch"), "sketch")
     h = body.newObject("PartDesign::Hole", _safe_name(kid, "Hole"))
     h.Profile = sk
@@ -5157,7 +6490,7 @@ def _op_hole(doc, args, kid):
     _set_if(h, "ModelThread", False)
     _set_if(h, "ModelActualThread", False)
 
-    told = "reversed" in args
+    told = "reversed" in args and args["reversed"] is not None and str(args["reversed"]).lower() != "auto"
     if told:
         applied["Reversed"] = _set_if(h, "Reversed", bool(args["reversed"]))
     hidden = _tidy_construction(doc, sk)
@@ -5291,7 +6624,7 @@ def _op_bolt_sketch(doc, args, kid):
     to koi_params.<pid>_bolts_pitch, and FreeCAD's recompute does the rest --
     the same mechanism, and the same argument, as the diameter binding.
     """
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     pid = str(_need(args, "component"))
     rec = component(pid, doc)
     if rec is None:
@@ -5870,10 +7203,148 @@ def _op_show(doc, args, kid):
     return out
 
 
+# ---------- looking inside ----------
+#
+# Everything in this file that verifies internal geometry does it with a
+# number, which is right and is not sufficient: at some point the human has
+# to SEE that the pocket clears the boss. Until now that meant isolate, hide
+# the housing, take a picture, restore -- four calls, a changed document and
+# a view of the pocket from outside a part that is no longer there.
+#
+# A clip plane is the tool for this and it belongs to the VIEW, not the
+# model. Nothing is cut, no geometry changes, no recompute happens, and the
+# document is byte-identical afterwards. What the human sees is the inside.
+#
+# The one thing to be honest about: this is a clip, not a capped section.
+# The cut face is open, so you are looking into a hollow shell rather than at
+# a solid cross-section with a hatched face. It answers "does that pocket
+# break through" perfectly and "how thick is that wall" not at all -- that is
+# measure_between's job.
+
+_SECTIONS = {}
+
+
+def _active_3d_view():
+    if Gui is None:
+        return None
+    try:
+        gdoc = Gui.activeDocument()
+        view = gdoc.activeView() if gdoc is not None else None
+        return view if _is_3d_view(view) else None
+    except Exception:
+        return None
+
+
+def _section_clear(doc):
+    key = doc.Name if doc is not None else "*"
+    node = _SECTIONS.pop(key, None)
+    if node is None:
+        return False
+    view = _active_3d_view()
+    if view is None:
+        return False
+    try:
+        sg = view.getSceneGraph()
+        sg.removeChild(node)
+        if hasattr(view, "redraw"):
+            view.redraw()
+        elif hasattr(view, "repaint"):
+            view.repaint()
+        if hasattr(Gui, "updateGui"):
+            Gui.updateGui()
+        return True
+    except Exception:
+        return False
+
+
+def _op_view_section(doc, args, kid):
+    """Clip the 3D view on a plane so the human can see inside.
+
+    off:true removes it, and so does view_restore -- leaving a session's clip
+    plane on the human's view after the question it answered has been settled
+    is the same class of mistake as leaving their model isolated.
+    """
+    if Gui is None:
+        raise KoiOpError(
+            "this FreeCAD is headless, so there is no view to clip. "
+            "freecad_render still works and shows the outside; for what is "
+            "inside, use freecad_measure and fn 'measure_between'.")
+    view = _active_3d_view()
+    if view is None:
+        raise KoiOpError("no 3D view is active in this document")
+
+    if args.get("off") or args.get("enabled") is False:
+        removed = _section_clear(doc)
+        _gui_sync(doc)
+        return {"enabled": False, "removed": removed,
+                "note": ("the view is unclipped" if removed
+                         else "there was no section cut to remove")}
+
+    try:
+        from pivy import coin
+    except Exception as e:
+        raise KoiOpError(
+            "this build has no pivy/coin binding available to this "
+            "interpreter (%s), so the view cannot be clipped from here. Ask "
+            "the human to use View > Persistent section cut instead."
+            % type(e).__name__)
+
+    plane = str(args.get("plane") or "XZ").upper()
+    normals = {"XY": (0.0, 0.0, 1.0), "XZ": (0.0, 1.0, 0.0),
+               "YZ": (1.0, 0.0, 0.0)}
+    if args.get("normal") is not None:
+        n = args["normal"]
+        if not (isinstance(n, list) and len(n) == 3):
+            raise KoiOpError("normal must be [x, y, z]")
+        nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
+        plane = "custom"
+    elif plane in normals:
+        nx, ny, nz = normals[plane]
+    else:
+        raise KoiOpError(
+            "plane must be XY, XZ or YZ, or pass normal:[x, y, z]")
+    if args.get("flip"):
+        nx, ny, nz = -nx, -ny, -nz
+    offset = float(args.get("offset") or 0.0)
+
+    _section_clear(doc)
+    clip = coin.SoClipPlane()
+    clip.plane.setValue(coin.SbPlane(coin.SbVec3f(nx, ny, nz), offset))
+    clip.on = True
+    try:
+        sg = view.getSceneGraph()
+        sg.insertChild(clip, 0)
+    except Exception as e:
+        raise KoiOpError(
+            "the clip plane could not be inserted into the scene graph: "
+            "%s: %s" % (type(e).__name__, e))
+    _SECTIONS[doc.Name if doc is not None else "*"] = clip
+    _gui_sync(doc)
+
+    return {"enabled": True, "plane": plane,
+            "normal": [nx, ny, nz], "offset": offset,
+            "note": (
+                "this clips the VIEW, not the model: no geometry changed, "
+                "nothing recomputed, and the cut face is OPEN rather than "
+                "capped -- you are looking into a hollow shell. Which half "
+                "disappears is a viewer convention, so pass flip:true if it "
+                "took the half you wanted to see. Turn it off with "
+                "off:true before handing the view back."),
+            "measureNote": (
+                "a clipped view shows that a wall exists. It does not show "
+                "that the wall is 2.4 mm -- that is fn 'measure_between'.")}
+
+
 def _op_view_restore(doc, args, kid):
+    # A section cut is part of "put their view back", and forgetting it here
+    # is how a human ends up with half a model on screen and a session that
+    # has already moved on to talking about something else.
+    unclipped = _section_clear(doc)
     raw = _meta(doc).get(ISOLATE_KEY)
     if not raw:
-        return {"restored": [], "note": "nothing was isolated"}
+        return {"restored": [], "sectionRemoved": unclipped,
+                "note": ("the section cut was removed; nothing was isolated"
+                         if unclipped else "nothing was isolated")}
     try:
         was = _json.loads(raw)
     except Exception:
@@ -5964,6 +7435,172 @@ EXPORT_DIR = _export_dir()
 EXPORT_FORMATS = ("FCSTD", "STEP", "BREP", "STL")
 
 
+def confined_path(path, allowed_ext):
+    """Resolve a caller-supplied write path inside EXPORT_DIR, or refuse it.
+
+    Everything else in this runtime builds its own filenames; a path that
+    arrives from the caller is a write primitive, and this process has the
+    human's config directory mounted. The InitGui.py under the config mount
+    is executed on every FreeCAD start, so one unconfined savePath is the
+    difference between a screenshot tool and a persistence mechanism — and the
+    caller here can be a document's own text, by way of an injection.
+
+    realpath first, so a symlink planted inside the export directory cannot
+    point out of it, and the extension is pinned to the format actually being
+    written, so the primitive cannot produce a .py or a .FCMacro whatever the
+    rest of the name says.
+    """
+    import os
+    root = os.path.realpath(EXPORT_DIR)
+    raw = str(path or "").strip()
+    if not raw:
+        raise KoiOpError("path is empty")
+    cand = raw if os.path.isabs(raw) else os.path.join(root, raw)
+    try:
+        os.makedirs(root, exist_ok=True)
+    except Exception:
+        pass
+    real = os.path.realpath(cand)
+    if real != root and not real.startswith(root + os.sep):
+        raise KoiOpError(
+            "path must stay inside the export directory (%s): %r resolves to "
+            "%r. Pass a bare filename, or a path under that directory."
+            % (root, raw, real))
+    ext = os.path.splitext(real)[1].lower()
+    allowed = tuple(e.lower() for e in allowed_ext)
+    if ext not in allowed:
+        raise KoiOpError(
+            "path must end in %s, not %r" % (" or ".join(allowed), ext))
+    parent = os.path.dirname(real)
+    if not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception as e:
+            raise KoiOpError("cannot create %s: %s" % (parent, e))
+    return real
+
+
+# ---------- paths that arrive from the caller: the READ side ----------
+#
+# confined_path above is the WRITE policy and is unchanged. This is the read
+# policy, and it is deliberately wider and still not "anywhere on the disk".
+#
+# A read is not a write, but open_document reads a whole document tree back
+# into the conversation and import_geometry pulls a file into the model, so an
+# unconfined read path is an exfiltration primitive -- and the thing that can
+# ask for it includes a document's own text, by way of an injection. So a path
+# has to sit under a root somebody already chose: the export directory,
+# whatever KOI_OPEN_DIRS names, and the directory of a document the human
+# already has open (they opened it, so it is already theirs and already on
+# their screen).
+#
+# The FreeCAD config and macro directories are refused from BOTH sides. Files
+# under them execute at every start, which is the whole reason confined_path
+# exists; reading them back is the other half of the same problem.
+
+OPEN_FORMATS = {
+    ".fcstd": "FCStd", ".step": "STEP", ".stp": "STEP",
+    ".iges": "IGES", ".igs": "IGES", ".brep": "BREP", ".brp": "BREP",
+}
+IMPORT_FORMATS = ("STEP", "IGES", "BREP")
+IMPORT_EXTS = tuple(e for e, f in sorted(OPEN_FORMATS.items())
+                    if f in IMPORT_FORMATS)
+
+
+def _real(p):
+    import os
+    try:
+        return os.path.realpath(p)
+    except Exception:
+        return None
+
+
+def _banned_roots():
+    """Directories no caller-supplied path may touch, in either direction."""
+    out = []
+    for fn in ("getUserAppDataDir", "getUserMacroDir", "getUserConfigDir"):
+        try:
+            d = getattr(App, fn)()
+        except Exception:
+            continue
+        r = _real(d) if d else None
+        if r and r not in out:
+            out.append(r)
+    return out
+
+
+def _open_roots():
+    import os
+    roots = []
+
+    def add(d):
+        if not d:
+            return
+        r = _real(d)
+        if r and os.path.isdir(r) and r not in roots:
+            roots.append(r)
+
+    add(EXPORT_DIR)
+    for part in str(os.environ.get("KOI_OPEN_DIRS") or "").split(os.pathsep):
+        add(part.strip())
+    # Every document the human already has open. This is the root that makes
+    # the common case work without configuration: "open the other half of this
+    # assembly" is a sibling of a file they opened themselves.
+    for name in App.listDocuments():
+        try:
+            fn = App.getDocument(name).FileName
+        except Exception:
+            continue
+        if fn:
+            add(os.path.dirname(fn))
+    return roots
+
+
+def _resolve_in_roots(path, allowed_ext, must_exist=True, what="path"):
+    """Resolve a caller-supplied path under an allowed root, or refuse it."""
+    import os
+    raw = str(path or "").strip()
+    if not raw:
+        raise KoiOpError("%s is empty" % what)
+    roots = _open_roots()
+    base = roots[0] if roots else EXPORT_DIR
+    real = _real(raw if os.path.isabs(raw) else os.path.join(base, raw))
+    if real is None:
+        raise KoiOpError("%s %r cannot be resolved" % (what, raw))
+
+    for bad in _banned_roots():
+        if real == bad or real.startswith(bad + os.sep):
+            raise KoiOpError(
+                "%r is inside FreeCAD's own configuration directory (%s). "
+                "That directory is refused for reading and for writing: "
+                "files under it are executed at every FreeCAD start."
+                % (raw, bad))
+
+    inside = any(real == r or real.startswith(r + os.sep) for r in roots)
+    if not inside:
+        raise KoiOpError(
+            "%r resolves to %r, which is not under any directory this session "
+            "may read. Allowed right now: %s. To add one, start the bridge "
+            "with KOI_OPEN_DIRS set (colon-separated), or have the human open "
+            "one file from that directory in FreeCAD first -- its folder then "
+            "counts as theirs."
+            % (raw, real, ", ".join(roots) or "(none)"))
+
+    ext = os.path.splitext(real)[1].lower()
+    allowed = tuple(e.lower() for e in allowed_ext)
+    if ext not in allowed:
+        raise KoiOpError(
+            "%s must end in %s, not %r" % (what, " or ".join(allowed), ext))
+    if must_exist:
+        if not os.path.isfile(real):
+            raise KoiOpError("no file at %s" % real)
+    else:
+        parent = os.path.dirname(real)
+        if not os.path.isdir(parent):
+            raise KoiOpError("%s does not exist" % parent)
+    return real
+
+
 def export_doc(fmt="FCStd", targets=None, doc=None):
     import os
     doc = doc or App.ActiveDocument
@@ -5979,9 +7616,29 @@ def export_doc(fmt="FCStd", targets=None, doc=None):
     ext = {"FCSTD": "FCStd", "STEP": "step", "BREP": "brep", "STL": "stl"}[fmt]
     name = "%s.%s" % (_safe_name(doc.Name, "document"), ext)
     path = EXPORT_DIR + "/" + name
+    bound_before = str(getattr(doc, "FileName", "") or "")
 
     if fmt == "FCSTD":
-        doc.saveAs(path)
+        # saveCopy, NOT saveAs.
+        #
+        # saveAs REBINDS doc.FileName to the path it wrote. This function is
+        # documented as a checkpoint that leaves the human's work alone, and
+        # under saveAs it silently moved where their File > Save goes: open
+        # ~/projects/bracket.FCStd, take one FCStd checkpoint, and every save
+        # they make afterwards lands in the export directory instead of their
+        # project file. The title bar changes; nobody reads the title bar.
+        #
+        # saveCopy writes the same bytes and changes nothing about the open
+        # document. If a build has no saveCopy this refuses rather than
+        # falling back to saveAs -- silently rebinding their file is worse
+        # than not having a checkpoint.
+        if not hasattr(doc, "saveCopy"):
+            raise KoiOpError(
+                "this build's Document has no saveCopy, so an FCStd export "
+                "could only be written with saveAs, which would rebind the "
+                "human's file to the export directory. Refusing. Export STEP "
+                "instead, or have them save from FreeCAD.")
+        doc.saveCopy(path)
     else:
         objs = []
         for r in (targets or []):
@@ -6007,8 +7664,21 @@ def export_doc(fmt="FCStd", targets=None, doc=None):
         pass
     if size <= 0:
         raise KoiOpError("the export wrote no bytes to %s" % path)
-    return {"path": path, "name": name, "format": fmt, "bytes": size,
-            "objects": [o.Name for o in (objs if fmt != "FCSTD" else doc.Objects)][:64]}
+    bound_after = str(getattr(doc, "FileName", "") or "")
+    out = {"path": path, "name": name, "format": fmt, "bytes": size,
+           "objects": [o.Name for o in (objs if fmt != "FCSTD" else doc.Objects)][:64],
+           "documentFile": bound_after or None,
+           "rebound": bound_after != bound_before}
+    if out["rebound"]:
+        # Measured, not assumed. If this ever comes back true the checkpoint
+        # has moved the human's save target and they have to hear it now,
+        # not the next time they press Ctrl+S.
+        out["reboundNote"] = (
+            "the export changed which file this document saves to: it was %r "
+            "and is now %r. Tell the user, and have them File > Save As back "
+            "to their own file before doing anything else."
+            % (bound_before or "(unsaved)", bound_after))
+    return out
 
 
 
@@ -6057,9 +7727,13 @@ def _resolve_ref_sub(doc, r, default_owner=None):
 
 
 def _op_datum_plane(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     base = args.get("base")
-    if not base and not args.get("on"):
+    on = args.get("on") or args.get("plane")
+    if base and isinstance(base, str) and base.upper() in ("XY", "XZ", "YZ"):
+        on = base.upper()
+        base = None
+    if not base and not on:
         raise KoiOpError(
             "datum_plane needs on=XY|XZ|YZ (an origin plane) or base=<ref id> "
             "(a face the user picked)")
@@ -6070,7 +7744,7 @@ def _op_datum_plane(doc, args, kid):
         # _origin_plane walks Origin.OriginFeatures. App::Origin has no
         # XY_Plane attribute, so getattr() on it returns None and produces an
         # unattached plane sitting at the global origin.
-        owner, sub, mode = _origin_plane(body, args.get("on")), "", "FlatFace"
+        owner, sub, mode = _origin_plane(body, on), "", "FlatFace"
 
     dp = body.newObject("PartDesign::Plane", _safe_name(kid, "DatumPlane"))
     if not _attach_to(dp, owner, sub, mode):
@@ -6158,8 +7832,14 @@ def _op_datum_plane(doc, args, kid):
 DRESS_PREFIX = "koi.dress."
 
 
-def _dress_query(doc, body, args, what):
-    """Run a caller's edge FILTER and return (refs, the filter as stored).
+def _dress_query(doc, body, args, what, kind="edge"):
+    """Run a caller's element FILTER and return (refs, the filter as stored).
+
+    kind is what the op works on when the caller did not say. It is not
+    cosmetic: draft and shell act on FACES, and a filter that defaults to
+    edges hands them a list of edges, which fails inside BRep with a message
+    about the base rather than about the filter. The default is also what
+    _reheal_dress re-runs later, so getting it wrong here is durable.
 
     The reason this exists is the blast radius. A chamfer holds Edge124, an
     upstream parameter grows by 6 mm, the edges renumber, the chamfer errors,
@@ -6187,7 +7867,7 @@ def _dress_query(doc, body, args, what):
             raise KoiOpError(
                 "%s by query needs something to query: pass base, or use a "
                 "body that has a tip" % what)
-    q.setdefault("kind", "edge")
+    q.setdefault("kind", kind)
     q.setdefault("expect", "many")
     res = query(q, doc)
     refs = list(res.get("refs") or [])
@@ -6212,7 +7892,7 @@ def _dress_query(doc, body, args, what):
     return refs, q
 
 
-def _dress_target(doc, body, args, what):
+def _dress_target(doc, body, args, what, kind="edge"):
     """(owner, [subs], filter) for a dress-up feature, or a refusal.
 
     No default edge. "Edge1", or the last straight edge, is a topological name
@@ -6226,7 +7906,7 @@ def _dress_target(doc, body, args, what):
         refs = [refs]
     qspec = None
     if not refs:
-        refs, qspec = _dress_query(doc, body, args, what)
+        refs, qspec = _dress_query(doc, body, args, what, kind)
     if not refs:
         raise KoiOpError(
             "%s needs refs: the edges to work on, as ref ids captured from a "
@@ -6435,7 +8115,7 @@ def _dress_dropped_note(what, dropped, kept):
 
 
 def _op_fillet(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     owner, subs, qspec = _dress_target(doc, body, args, "fillet")
     before = _vol(owner)
     f = body.newObject("PartDesign::Fillet", _safe_name(kid, "Fillet"))
@@ -6466,7 +8146,7 @@ def _op_fillet(doc, args, kid):
 
 
 def _op_chamfer(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     owner, subs, qspec = _dress_target(doc, body, args, "chamfer")
     before = _vol(owner)
     c = body.newObject("PartDesign::Chamfer", _safe_name(kid, "Chamfer"))
@@ -6600,7 +8280,7 @@ def _rev_axis(sk, which):
 
 
 def _op_revolve(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     sk = _resolve_or_die(doc, _need(args, "sketch"), "sketch")
     rv = body.newObject("PartDesign::Revolution", _safe_name(kid, "Revolution"))
     rv.Profile = sk
@@ -6629,13 +8309,13 @@ def _op_revolve(doc, args, kid):
 
 
 def _op_groove(doc, args, kid):
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     sk = _resolve_or_die(doc, _need(args, "sketch"), "sketch")
     gr = body.newObject("PartDesign::Groove", _safe_name(kid, "Groove"))
     gr.Profile = sk
     gr.ReferenceAxis = _rev_axis(sk, args.get("axis"))
     dim = _set_dim(gr, "Angle", args, "angle", 360.0)
-    told = "reversed" in args
+    told = "reversed" in args and args["reversed"] is not None and str(args["reversed"]).lower() != "auto"
     if told:
         _set_if(gr, "Reversed", bool(args["reversed"]))
     hidden = _tidy_construction(doc, sk)
@@ -6655,6 +8335,272 @@ def _op_groove(doc, args, kid):
     if note:
         out["note"] = note
     return out
+
+
+
+# ---------- swept and lofted features ----------
+#
+# Loft and pipe are the two shapes pad/pocket/revolve/groove cannot say: a
+# transition between sections, and a profile carried along a path. Everything
+# else here -- the profile gate before the feature exists, the measurement
+# after it, the note when a cut removes nothing -- is the same contract the
+# prismatic ops already keep, on purpose.
+
+PIPE_MODES = ("Fixed", "Frenet", "Auxiliary", "Binormal", "Curvilinear")
+PIPE_TRANSITIONS = ("Transformed", "RightCorner", "RoundCorner")
+
+LOFT_SECTION_LIMIT = 32
+
+
+def _enum_arg(args, key, allowed, what):
+    """One of a fixed set, case-insensitively -- or a refusal naming the set.
+
+    The first version silently dropped anything it did not recognise, so
+    transition:'roundcorner' built a Transformed sweep and reported success.
+    A typo that changes the geometry and reports the default is the failure
+    mode this whole module is written against.
+    """
+    if key not in args or args[key] is None:
+        return None
+    want = str(args[key]).strip().lower()
+    for a in allowed:
+        if a.lower() == want:
+            return a
+    raise KoiOpError(
+        "%s %s must be one of %s, not %r"
+        % (what, key, ", ".join(allowed), args[key]))
+
+
+def _loft_sections(doc, args, what):
+    raw = args.get("sketches") or args.get("sections") or args.get("profiles")
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise KoiOpError(
+            "%s requires a list of at least 2 sketch ids under 'sketches'" % what)
+    if len(raw) > LOFT_SECTION_LIMIT:
+        raise KoiOpError(
+            "%s is capped at %d section sketches" % (what, LOFT_SECTION_LIMIT))
+    sks = [_resolve_or_die(doc, s, "sketch") for s in raw]
+    seen = set()
+    for s in sks:
+        if s.Name in seen:
+            raise KoiOpError(
+                "%s lists %s twice: a section repeated in place is a "
+                "zero-length transition and will not solve" % (what, s.Name))
+        seen.add(s.Name)
+        # Before the feature exists, so a refusal leaves no half-built loft.
+        _profile_gate(s, what)
+    return sks
+
+
+def _loft_shape(loft, args):
+    if "ruled" in args:
+        loft.Ruled = bool(args["ruled"])
+    if "closed" in args:
+        loft.Closed = bool(args["closed"])
+
+
+def _spine_of(sk_path, what):
+    """The path edges, named at build time.
+
+    An empty spine is the swept version of an open profile: PartDesign builds
+    it, reports Up-to-date, and adds nothing. Refuse it here rather than
+    measure it later.
+    """
+    shape = getattr(sk_path, "Shape", None)
+    edges = list(getattr(shape, "Edges", []) or [])
+    if not edges:
+        raise KoiOpError(
+            "%s has no edges to sweep along: a path sketch needs at least one "
+            "line, arc or spline" % sk_path.Name)
+    return (sk_path, ["Edge%d" % (i + 1) for i in range(len(edges))])
+
+
+def _pipe_setup(doc, args, kid, typeid, prefix, what):
+    body = _resolve_body(doc, args.get("body"), args)
+    sk_prof = _resolve_or_die(doc, _need(args, "sketch"), "sketch")
+    sk_path = _resolve_or_die(doc, _need(args, "path"), "path")
+    if sk_path.Name == sk_prof.Name:
+        raise KoiOpError(
+            "%s was given %s as both profile and path" % (what, sk_prof.Name))
+    _profile_gate(sk_prof, what)
+    spine = _spine_of(sk_path, what)
+    mode = _enum_arg(args, "mode", PIPE_MODES, what)
+    transition = _enum_arg(args, "transition", PIPE_TRANSITIONS, what)
+    pipe = body.newObject(typeid, _safe_name(kid, prefix))
+    pipe.Profile = sk_prof
+    pipe.Spine = spine
+    if mode:
+        pipe.Mode = mode
+    if transition:
+        pipe.Transition = transition
+    pipe.Label = str(args.get("label") or kid)
+    hidden = _tidy_construction(doc, sk_prof) + _tidy_construction(doc, sk_path)
+    return pipe, sk_prof, sk_path, hidden
+
+
+def _cut_only_note(feat, sk, what):
+    """removed, removedAtProfile, and the note when a cut did nothing.
+
+    Loft and pipe have no Reversed to try, so _ensure_cuts has nothing to
+    flip; the MEASUREMENT it exists for still applies, and a subtractive
+    feature that reports success while removing nothing is the exact bug the
+    pocket/groove path was written to catch.
+    """
+    removed, at = _cut_quality(feat, sk)
+    note = None
+    if removed is not None and removed <= 1e-6:
+        note = ("this %s removes no material -- check that the sections or "
+                "the path actually pass through the solid" % what)
+    elif at is not None and at > AT_PROFILE_TOL:
+        note = ("this %s removed %.3f mm3, and the material it took starts "
+                "%0.2f mm from its own profile. Probe it" % (what, removed, at))
+    return removed, at, note
+
+
+def _op_loft(doc, args, kid):
+    body = _resolve_body(doc, args.get("body"), args)
+    sks = _loft_sections(doc, args, "loft")
+    loft = body.newObject("PartDesign::AdditiveLoft", _safe_name(kid, "Loft"))
+    loft.Profile = sks[0]
+    loft.Sections = sks[1:]
+    _loft_shape(loft, args)
+    loft.Label = str(args.get("label") or kid)
+    hidden = []
+    for s in sks:
+        hidden.extend(_tidy_construction(doc, s))
+    doc.recompute()
+    if not loft.isValid():
+        _dress_failed(loft, sks[0], [], "loft",
+                      "A loft failed to solve -- check that all section sketches are closed and have compatible orientation.")
+    register(doc, kid, loft, args.get("turn"))
+    vol = _vol(loft)
+    out = {"name": loft.Name, "sketches": [s.Name for s in sks],
+           "ruled": bool(getattr(loft, "Ruled", False)),
+           "closed": bool(getattr(loft, "Closed", False)),
+           "volume": vol, "bbox": _bbox_of(loft), "hidden": hidden}
+    if vol is not None and vol <= 1e-6:
+        out["note"] = ("this loft encloses no volume -- check the section "
+                       "order and that the sections do not lie in one plane")
+    return out
+
+
+def _op_subtractive_loft(doc, args, kid):
+    body = _resolve_body(doc, args.get("body"), args)
+    sks = _loft_sections(doc, args, "subtractive_loft")
+    loft = body.newObject("PartDesign::SubtractiveLoft", _safe_name(kid, "SubtractiveLoft"))
+    loft.Profile = sks[0]
+    loft.Sections = sks[1:]
+    _loft_shape(loft, args)
+    loft.Label = str(args.get("label") or kid)
+    hidden = []
+    for s in sks:
+        hidden.extend(_tidy_construction(doc, s))
+    doc.recompute()
+    if not loft.isValid():
+        _dress_failed(loft, sks[0], [], "subtractive_loft",
+                      "A subtractive loft failed to solve -- check that all section sketches are closed and intersect the solid.")
+    removed, at, note = _cut_only_note(loft, sks[0], "subtractive loft")
+    register(doc, kid, loft, args.get("turn"))
+    vol = _vol(loft)
+    out = {"name": loft.Name, "sketches": [s.Name for s in sks],
+           "ruled": bool(getattr(loft, "Ruled", False)),
+           "closed": bool(getattr(loft, "Closed", False)),
+           "removed": removed, "removedAtProfile": at,
+           "volume": vol, "hidden": hidden}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _op_pipe(doc, args, kid):
+    pipe, sk_prof, sk_path, hidden = _pipe_setup(
+        doc, args, kid, "PartDesign::AdditivePipe", "Pipe", "pipe")
+    doc.recompute()
+    if not pipe.isValid():
+        _dress_failed(pipe, sk_prof, [], "pipe",
+                      "A pipe (sweep) failed to solve -- check that the path touches the profile and does not self-intersect.")
+    register(doc, kid, pipe, args.get("turn"))
+    vol = _vol(pipe)
+    out = {"name": pipe.Name, "sketch": sk_prof.Name, "path": sk_path.Name,
+           "mode": getattr(pipe, "Mode", "Fixed"),
+           "transition": getattr(pipe, "Transition", "Transformed"),
+           "volume": vol, "bbox": _bbox_of(pipe), "hidden": hidden}
+    if vol is not None and vol <= 1e-6:
+        out["note"] = ("this sweep encloses no volume -- check that the path "
+                       "starts at the profile and has real length")
+    return out
+
+
+def _op_subtractive_pipe(doc, args, kid):
+    pipe, sk_prof, sk_path, hidden = _pipe_setup(
+        doc, args, kid, "PartDesign::SubtractivePipe", "SubtractivePipe",
+        "subtractive_pipe")
+    doc.recompute()
+    if not pipe.isValid():
+        _dress_failed(pipe, sk_prof, [], "subtractive_pipe",
+                      "A subtractive pipe failed to solve -- check that the path touches the profile and intersects the solid.")
+    removed, at, note = _cut_only_note(pipe, sk_prof, "subtractive sweep")
+    register(doc, kid, pipe, args.get("turn"))
+    vol = _vol(pipe)
+    out = {"name": pipe.Name, "sketch": sk_prof.Name, "path": sk_path.Name,
+           "mode": getattr(pipe, "Mode", "Fixed"),
+           "transition": getattr(pipe, "Transition", "Transformed"),
+           "removed": removed, "removedAtProfile": at,
+           "volume": vol, "hidden": hidden}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _op_draft(doc, args, kid):
+    body = _resolve_body(doc, args.get("body"), args)
+    # "face", not the default edge: a draft acts on faces, and a query that
+    # silently filtered edges handed BRep a list it cannot use and reported
+    # the failure against the base instead of against the filter.
+    owner, subs, qspec = _dress_target(doc, body, args, "draft", "face")
+    before = _vol(owner)
+    np_arg = args.get("neutralPlane") or args.get("plane") or "XY"
+    if str(np_arg).upper() in ("XY", "XZ", "YZ"):
+        np_obj = _origin_plane(body, np_arg)
+        neutral_plane = (np_obj, [""])
+    else:
+        np_owner, np_sub = _resolve_ref_sub(doc, np_arg)
+        if np_owner is None:
+            raise KoiOpError("neutralPlane %r does not resolve" % (np_arg,))
+        neutral_plane = (np_owner, [np_sub] if np_sub else [""])
+    dr = body.newObject("PartDesign::Draft", _safe_name(kid, "Draft"))
+    dr.Base = (owner, subs)
+    dr.NeutralPlane = neutral_plane
+    dim = _set_dim(dr, "Angle", args, "angle", 1.5)
+    angle = dim["value"]
+    if "reversed" in args:
+        dr.Reversed = bool(args["reversed"])
+    dr.Label = str(args.get("label") or kid)
+    register(doc, kid, dr, args.get("turn"))
+    doc.recompute()
+    if not dr.isValid():
+        _dress_failed(dr, owner, subs, "draft",
+                      "A draft angle failed to solve -- check that the neutral plane and drafted faces are valid.")
+    after = _vol(dr)
+    delta = None if (before is None or after is None) else round(after - before, 6)
+    out = {"name": dr.Name, "angle": angle, "faces": subs,
+           "neutralPlane": neutral_plane[0].Name,
+           "reversed": bool(getattr(dr, "Reversed", False)),
+           "base": owner.Name, "volume": after, "volumeBefore": before,
+           "volumeDelta": delta,
+           "taper": None if delta is None else
+                    ("inward" if delta < -1e-6 else
+                     "outward" if delta > 1e-6 else "none")}
+    if delta is not None and abs(delta) <= 1e-6:
+        # A draft that recomputes clean and changes nothing is the mould-tool
+        # version of a pocket that cuts nothing: the part ships without the
+        # release angle it was drawn to have.
+        out["note"] = ("this draft changed no volume -- the faces may already "
+                       "lie in the neutral plane, or none of the refs are "
+                       "faces this draft can pull")
+    if dim.get("expression"):
+        out["dimension"] = dim
+    return _dress_out(doc, out, owner, qspec, "draft")
 
 
 # ---------- patterns ----------
@@ -6962,7 +8908,7 @@ def _op_pattern(doc, args, kid):
     Measured like every other feature here: a pattern that fused nothing, or
     cut nothing, recomputes clean and reports isValid().
     """
-    body = _resolve_body(doc, args.get("body"))
+    body = _resolve_body(doc, args.get("body"), args)
     kind = str(args.get("kind") or "polar").strip().lower()
     tid = PATTERN_TYPES.get(kind)
     if tid is None:
@@ -7303,8 +9249,8 @@ def _op_shell(doc, args, kid):
     topological name, and one authored here renumbers under the next upstream
     edit into a different face of the same housing.
     """
-    body = _resolve_body(doc, args.get("body"))
-    owner, subs, _q = _dress_target(doc, body, args, "shell")
+    body = _resolve_body(doc, args.get("body"), args)
+    owner, subs, _q = _dress_target(doc, body, args, "shell", "face")
     before = _vol(owner)
     th = body.newObject("PartDesign::Thickness", _safe_name(kid, "Thickness"))
     th.Base = (owner, subs)
@@ -7397,6 +9343,185 @@ def _op_place(doc, args, kid):
 # ---------- the bill of materials ----------
 
 
+# ---------- material and mass ----------
+#
+# The BOM reported a mass for every purchased part, because the catalog
+# carries one, and NOTHING for the bodies the design is actually made of --
+# so the one column somebody asked for had a hole in it exactly where the
+# machined parts were, and the honest note that said so was the whole answer.
+#
+# Mass is not an exotic property. It is volume, which is already measured
+# exactly, times a density, which is a number off a datasheet. What was
+# missing was somewhere to put the density.
+#
+# g/cm3, which is what datasheets quote and what makes the arithmetic
+# checkable by eye: volume in mm3 divided by 1000, times this, is grams.
+
+MATERIALS = {
+    "aluminium-6061": {"density": 2.70, "note": "6061-T6, the default shop aluminium"},
+    "aluminium-7075": {"density": 2.81, "note": "7075-T6, stronger, poor to weld"},
+    "aluminium-cast": {"density": 2.66, "note": "A356 / LM25 casting alloy"},
+    "steel-1018": {"density": 7.87, "note": "mild steel bar and plate"},
+    "steel-4140": {"density": 7.85, "note": "alloy steel, shafts and fixtures"},
+    "stainless-304": {"density": 7.90, "note": "austenitic, general corrosion service"},
+    "stainless-316": {"density": 7.98, "note": "austenitic, marine and chemical"},
+    "stainless-17-4": {"density": 7.75, "note": "precipitation hardening"},
+    "cast-iron": {"density": 7.20, "note": "grey iron, machine bases"},
+    "brass-360": {"density": 8.49, "note": "free-machining brass"},
+    "bronze-932": {"density": 8.80, "note": "bearing bronze"},
+    "copper": {"density": 8.96, "note": "electrical and thermal"},
+    "titanium-6al4v": {"density": 4.43, "note": "grade 5"},
+    "magnesium-az31": {"density": 1.77, "note": "light, flammable in chip form"},
+    "zinc-zamak3": {"density": 6.60, "note": "die casting"},
+    "abs": {"density": 1.04, "note": "printed or moulded"},
+    "asa": {"density": 1.07, "note": "ABS with UV resistance"},
+    "pla": {"density": 1.24, "note": "printed prototypes only"},
+    "petg": {"density": 1.27, "note": "printed, tougher than PLA"},
+    "nylon-pa12": {"density": 1.01, "note": "SLS and MJF"},
+    "nylon-pa6": {"density": 1.14, "note": "cast and machined stock"},
+    "polycarbonate": {"density": 1.20, "note": "guards and windows"},
+    "acrylic": {"density": 1.18, "note": "PMMA, laser cut"},
+    "pom-acetal": {"density": 1.41, "note": "Delrin, gears and bushings"},
+    "ptfe": {"density": 2.20, "note": "seals, low friction"},
+    "peek": {"density": 1.32, "note": "high temperature"},
+    "hdpe": {"density": 0.95, "note": "tanks, wear strips"},
+    "uhmw": {"density": 0.93, "note": "wear strips, chain guides"},
+    "rubber-nbr": {"density": 1.20, "note": "gaskets and O-rings"},
+    "epoxy-g10": {"density": 1.85, "note": "FR4 / G10 laminate"},
+    "plywood": {"density": 0.60, "note": "birch, varies with species"},
+    "glass": {"density": 2.50, "note": "soda-lime"},
+}
+
+MATERIAL_PREFIX = "koi.material."
+
+
+def material_of(doc, obj):
+    """The material record on an object, or None. Stored per object NAME.
+
+    Per name rather than per koi id on purpose: an imported solid and a body
+    the user made themselves both have a name and neither necessarily has an
+    id, and a mass that only works for objects this session created is a mass
+    that is missing exactly where a human would go looking for it.
+    """
+    if doc is None or obj is None:
+        return None
+    raw = _meta(doc).get(MATERIAL_PREFIX + obj.Name)
+    if not raw:
+        return None
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return None
+
+
+def mass_of(doc, obj):
+    """Grams, or None. mm3 / 1000 * g/cm3."""
+    rec = material_of(doc, obj)
+    if not rec:
+        return None
+    vol = _vol(obj)
+    if vol is None:
+        return None
+    try:
+        return round(vol / 1000.0 * float(rec["density"]), 3)
+    except Exception:
+        return None
+
+
+def _op_material(doc, args, kid):
+    """Assign a density so a part has a mass.
+
+    With no target it returns the table and writes nothing -- 'what densities
+    do you know' is a question worth asking before deciding, and it should not
+    cost a transaction.
+
+    What this is NOT: a FreeCAD material assignment with appearance, thermal
+    and structural cards. It is the one property that makes a BOM add up. If
+    a session needs the rest, that is FreeCAD's own material editor and the
+    human drives it.
+    """
+    if not args.get("target") and not args.get("targets") and not args.get("all"):
+        return {"materials": MATERIALS, "count": len(MATERIALS),
+                "note": "g/cm3. Pass target (or targets, or all:true) with "
+                        "name, or with density for something not in this list."}
+
+    raw = args.get("targets")
+    if raw is None:
+        raw = [args["target"]] if args.get("target") else []
+    if not isinstance(raw, list):
+        raise KoiOpError("targets must be a list")
+    if args.get("all"):
+        raw = [o.Name for o in doc.Objects[:2000]
+               if o.TypeId == "PartDesign::Body" or _is_solidish(o)]
+    if not raw:
+        raise KoiOpError("nothing to assign a material to")
+    if len(raw) > 200:
+        raise KoiOpError("materials are capped at 200 objects per call")
+
+    clearing = bool(args.get("clear")) or str(args.get("name") or "").lower() == "none"
+    density = None
+    name = None
+    if not clearing:
+        if args.get("density") is not None:
+            density = float(args["density"])
+            name = str(args.get("name") or "custom")
+            if density <= 0 or density > 25:
+                raise KoiOpError(
+                    "density is g/cm3 and %r is not a material anybody has: "
+                    "aluminium is 2.7, steel 7.87, and the densest thing on "
+                    "this planet is under 23." % density)
+        else:
+            name = str(_need(args, "name")).strip().lower()
+            rec = MATERIALS.get(name)
+            if rec is None:
+                near = [k for k in sorted(MATERIALS) if name.split("-")[0] in k]
+                raise KoiOpError(
+                    "no material %r. %s Pass density (g/cm3) for anything not "
+                    "in the table -- and quote the datasheet rather than "
+                    "recalling it."
+                    % (name,
+                       ("Did you mean: " + ", ".join(near) + ".") if near
+                       else "Call fn 'material' with no target for the list."))
+            density = float(rec["density"])
+
+    rows = []
+    total = 0.0
+    for r in raw:
+        o = _resolve_or_die(doc, r, "object")
+        if clearing:
+            _meta_set(doc, MATERIAL_PREFIX + o.Name, "")
+            rows.append({"object": o.Name, "id": _id_of(doc, o.Name),
+                         "material": None, "massG": None})
+            continue
+        _meta_set(doc, MATERIAL_PREFIX + o.Name,
+                  _json.dumps({"name": name, "density": density}))
+        vol = _vol(o)
+        mass = mass_of(doc, o)
+        row = {"object": o.Name, "id": _id_of(doc, o.Name), "label": o.Label,
+               "material": name, "density": density,
+               "volumeMm3": vol, "massG": mass}
+        try:
+            row["centerOfMass"] = _v3(o.Shape.CenterOfMass)
+        except Exception:
+            pass
+        if mass is None:
+            row["note"] = (
+                "no volume to weigh: this object has no solid, so the density "
+                "is stored and the mass is not a number yet")
+        else:
+            total += mass
+        rows.append(row)
+
+    out = {"assigned": rows, "count": len(rows),
+           "totalMassG": round(total, 3) if not clearing else None}
+    if not clearing:
+        out["note"] = (
+            "mass is volume times density and nothing else -- no fillet is "
+            "estimated, no fastener is included, and a body that was never "
+            "given a material still weighs nothing in the BOM.")
+    return out
+
+
 def bom(doc=None):
     """What this design is made of: bought parts with quantities, made parts.
 
@@ -7456,7 +9581,9 @@ def bom(doc=None):
     sources = _split_sources(doc)
     fabricated = []
     omitted = []
+    no_material = []
     fab_total = 0.0
+    fab_mass = 0.0
     for o in doc.Objects[:2000]:
         if o.TypeId != "PartDesign::Body":
             continue
@@ -7466,6 +9593,10 @@ def bom(doc=None):
                "id": _id_of(doc, o.Name),
                "qty": inst.get(o.Name, 0) or 1,
                "role": "part", "volumeMm3": _vol(o)}
+        # The column that used to be empty for every part anybody makes.
+        mrec = material_of(doc, o)
+        row["material"] = (mrec or {}).get("name")
+        row["massEachG"] = mass_of(doc, o)
         if o.Name in sources:
             # The solid the halves were cut out of. Still needed to re-split,
             # never made, and the same material as both halves: listing it as
@@ -7475,12 +9606,27 @@ def bom(doc=None):
             omitted.append(o.Name)
         else:
             fab_total += (row["volumeMm3"] or 0.0) * (row["qty"] or 1)
+            if row["massEachG"] is None:
+                no_material.append(row["id"] or o.Name)
+            else:
+                row["massTotalG"] = round(row["massEachG"] * (row["qty"] or 1), 3)
+                fab_mass += row["massTotalG"]
         fabricated.append(row)
 
     out = {"purchased": purchased, "fabricated": fabricated,
            "fabricatedVolumeMm3": round(fab_total, 3),
-           "totalMassG": round(total, 3) if purchased else 0.0}
+           "fabricatedMassG": round(fab_mass, 3),
+           "purchasedMassG": round(total, 3) if purchased else 0.0,
+           "totalMassG": round(total + fab_mass, 3)}
     notes = []
+    if no_material:
+        # The honest version of the hole this used to have. A part with no
+        # density is not a part that weighs nothing.
+        out["noMaterialFor"] = no_material
+        notes.append(
+            "%s have no material, so they contribute NOTHING to the mass "
+            "total -- that total is not the weight of this design until they "
+            "do. fn 'material' assigns one" % ", ".join(no_material[:12]))
     if unknown:
         # Said rather than silently summed: a total that quietly omits three
         # parts is worse than no total.
@@ -7494,6 +9640,217 @@ def bom(doc=None):
                      "in fabricatedVolumeMm3" % ", ".join(omitted))
     if notes:
         out["note"] = " ".join(notes)
+    return out
+
+
+def _op_recompute(doc, args, kid):
+    """Force a rebuild, and optionally refine what the booleans left behind.
+
+    Two things nothing else could ask for. A document can sit touched-but-not
+    -rebuilt, or land in an error state that a plain edit will not clear, and
+    the only move available was delete-and-rebuild -- which throws away the
+    DAG to fix a stale flag.
+
+    refine:true sets Refine on every feature that has the property and rebuilds.
+    That is what removes the coplanar splitter edges a boolean leaves across a
+    face: deepLint reports them as sliver faces, exports carry them into the
+    next CAD, and nothing in this file could do anything about them.
+
+    Refining must not change the volume -- it removes edges, not material --
+    so the volume before and after are both reported and a difference is
+    called out rather than left for somebody to notice.
+    """
+    targets = args.get("targets")
+    if targets is not None and not isinstance(targets, list):
+        raise KoiOpError("targets must be a list")
+    objs = None
+    if targets:
+        objs = [_resolve_or_die(doc, t, "object") for t in targets[:200]]
+
+    def snapshot(items):
+        rows = {}
+        for o in items:
+            try:
+                rows[o.Name] = {
+                    "volume": _vol(o),
+                    "faces": len(o.Shape.Faces) if getattr(o, "Shape", None) else None,
+                    "edges": len(o.Shape.Edges) if getattr(o, "Shape", None) else None,
+                }
+            except Exception:
+                rows[o.Name] = {"volume": None, "faces": None, "edges": None}
+        return rows
+
+    watched = objs if objs is not None else [
+        o for o in doc.Objects[:2000] if _is_solidish(o)]
+    before = snapshot(watched)
+    errs_before = [o.Name for o in doc.Objects[:2000]
+                   if "Invalid" in (getattr(o, "State", None) or [])]
+    touched_before = [o.Name for o in doc.Objects[:2000]
+                      if "Touched" in (getattr(o, "State", None) or [])]
+
+    refined = []
+    if args.get("refine"):
+        scope = objs if objs is not None else list(doc.Objects[:2000])
+        expanded = []
+        for o in scope:
+            expanded.append(o)
+            # A Body's features are where Refine actually lives; naming the
+            # body and having nothing happen is the silent no-op this file
+            # exists to stop shipping.
+            for c in (getattr(o, "Group", None) or []):
+                expanded.append(c)
+        for o in expanded[:2000]:
+            if not hasattr(o, "Refine"):
+                continue
+            try:
+                if o.Refine is not True:
+                    o.Refine = True
+                    refined.append(o.Name)
+            except Exception:
+                continue
+        if not refined:
+            # Reported, not raised: everything already refined is a fine
+            # state to be in, and it is not the same as the property not
+            # existing on this build.
+            pass
+
+    if args.get("touch"):
+        for o in (objs if objs is not None else doc.Objects[:2000]):
+            try:
+                o.touch()
+            except Exception:
+                continue
+
+    force = bool(args.get("force"))
+    try:
+        doc.recompute(objs, force)
+    except TypeError:
+        doc.recompute()
+
+    after = snapshot(watched)
+    errs_after = [o.Name for o in doc.Objects[:2000]
+                  if "Invalid" in (getattr(o, "State", None) or [])]
+    touched_after = [o.Name for o in doc.Objects[:2000]
+                     if "Touched" in (getattr(o, "State", None) or [])]
+
+    changed = []
+    volume_moved = []
+    for name, b in before.items():
+        a = after.get(name) or {}
+        if b.get("faces") != a.get("faces") or b.get("edges") != a.get("edges"):
+            changed.append({"object": name,
+                            "faces": [b.get("faces"), a.get("faces")],
+                            "edges": [b.get("edges"), a.get("edges")]})
+        bv, av = b.get("volume"), a.get("volume")
+        if bv is not None and av is not None and abs(bv - av) > 1e-6:
+            volume_moved.append({"object": name, "volume": [bv, av],
+                                 "delta": round(av - bv, 6)})
+
+    out = {"recomputed": True, "force": force,
+           "scope": [o.Name for o in objs] if objs is not None else "document",
+           "errorsBefore": errs_before, "errorsAfter": errs_after,
+           "touchedBefore": len(touched_before), "touchedAfter": len(touched_after),
+           "topologyChanged": changed[:32]}
+    if refined:
+        out["refined"] = refined[:64]
+        out["refinedCount"] = len(refined)
+        removed = sum((c["faces"][0] or 0) - (c["faces"][1] or 0)
+                      for c in changed if c["faces"][0] and c["faces"][1])
+        out["facesRemoved"] = removed
+        out["refineNote"] = (
+            "Refine removes the coplanar splitter edges a boolean leaves "
+            "behind. It is a property on the features, so it stays on and "
+            "applies to every later rebuild -- this is not a one-off cleanup.")
+    if volume_moved:
+        # The measurement that makes refine safe to run. Refining changes
+        # topology, never material; if the volume moved, something else did.
+        out["volumeChanged"] = volume_moved[:16]
+        out["volumeChangedNote"] = (
+            "the volume moved during this recompute. A refine cannot do that "
+            "-- it removes edges, not material -- so something else rebuilt "
+            "differently. Do not report this as a clean cleanup; measure "
+            "before trusting the model.")
+    fixed = [n for n in errs_before if n not in errs_after]
+    broke = [n for n in errs_after if n not in errs_before]
+    if fixed:
+        out["errorsCleared"] = fixed
+    if broke:
+        out["errorsIntroduced"] = broke
+        out["errorsIntroducedNote"] = (
+            "these were healthy before the recompute and are in error after "
+            "it. A forced rebuild does not create geometry problems; it "
+            "reveals ones the stale flags were hiding.")
+    return out
+
+
+CAP_MODULES = (
+    "Part", "PartDesign", "Sketcher", "Spreadsheet", "Import", "Mesh",
+    "Draft", "Assembly", "TechDraw", "Material", "BOPTools", "importDXF",
+    "importSVG", "MeshPart", "Fem", "Path",
+)
+
+
+def _op_capabilities(doc, args, kid):
+    """What this FreeCAD can actually do, asked rather than assumed.
+
+    K0 says every claim this skill makes is a claim about one build. This is
+    the op that lets a session check one before making it -- and it exists
+    right now for a specific reason: the Assembly workbench in 1.0+ carries a
+    real constraint solver, this skill positions parts instead, and wiring
+    joints means writing against an API whose spelling is not the same in
+    every build. Nothing here guesses at that spelling. It reports what the
+    interpreter exposes so the next patch can be written against a fact.
+    """
+    import importlib
+    mods = {}
+    for name in CAP_MODULES:
+        row = {"available": False}
+        try:
+            m = importlib.import_module(name)
+            row["available"] = True
+            v = getattr(m, "__version__", None) or getattr(m, "Version", None)
+            if isinstance(v, str):
+                row["version"] = v
+            f = getattr(m, "__file__", None)
+            if f:
+                row["file"] = str(f)
+        except Exception as e:
+            row["error"] = type(e).__name__
+        mods[name] = row
+
+    out = {"modules": mods, "gui": Gui is not None,
+           "freecad": App.ConfigGet("ExeVersion"),
+           "build": App.ConfigGet("BuildRevisionHash")}
+
+    if mods.get("Assembly", {}).get("available"):
+        try:
+            import Assembly
+            names = sorted(n for n in dir(Assembly) if not n.startswith("_"))
+            out["assemblyApi"] = names[:64]
+        except Exception:
+            pass
+        for extra in ("JointObject", "UtilsAssembly"):
+            try:
+                m = __import__(extra)
+                out.setdefault("assemblyHelpers", {})[extra] = sorted(
+                    n for n in dir(m) if not n.startswith("_"))[:48]
+            except Exception:
+                out.setdefault("assemblyHelpers", {})[extra] = None
+    if doc is not None:
+        try:
+            types = [t for t in doc.supportedTypes()
+                     if t.startswith("Assembly::") or t.startswith("TechDraw::")]
+            out["documentTypes"] = sorted(types)[:48]
+        except Exception:
+            out["documentTypes"] = None
+
+    out["note"] = (
+        "available means importable in THIS interpreter, which is the only "
+        "thing that matters and is not the same as installed. A module that "
+        "imports is still not a scripted workflow: assembly joints and "
+        "TechDraw drawings are NOT wired into this skill, and importing "
+        "Assembly does not make them so. Say what is here rather than what "
+        "the workbench menu shows.")
     return out
 
 
@@ -7530,6 +9887,26 @@ def _op_new_document(args, kid):
         App.setActiveDocument(doc.Name)
     except Exception:
         pass
+    if Gui is not None:
+        # A new document is the one moment the camera is nobody's yet, so
+        # framing it here is not taking it off the human. The window-raising
+        # and the redraw are the shared helpers: the hand-rolled version this
+        # replaces tested 'QtGui' in globals(), which is never true in this
+        # module, so its MDI branch never ran.
+        try:
+            Gui.setActiveDocument(doc.Name)
+        except Exception:
+            pass
+        _raise_document_window(doc)
+        try:
+            gdoc = Gui.activeDocument()
+            view = gdoc.activeView() if gdoc is not None else None
+            if _is_3d_view(view):
+                view.viewAxonometric()
+                view.fitAll()
+        except Exception:
+            pass
+        _gui_sync(doc)
     if args.get("label"):
         doc.Label = str(args["label"])
     observe(doc)
@@ -7540,6 +9917,260 @@ def _op_new_document(args, kid):
     return {"name": doc.Name, "label": doc.Label, "created": not existed,
             "reused": existed, "undoMode": _plain(getattr(doc, "UndoMode", None)),
             "documents": sorted(App.listDocuments())}
+
+
+def _bbox_union(boxes):
+    """One box around several. An App::Part has no Shape of its own, so the
+    bbox of a grouped import has to come from what is inside it -- and
+    reporting None there reads as "no geometry", which is the one thing an
+    import must never say when it worked."""
+    live = [b for b in boxes if b]
+    if not live:
+        return None
+    lo = [min(b[0][i] for b in live) for i in range(3)]
+    hi = [max(b[1][i] for b in live) for i in range(3)]
+    return [[round(v, 3) for v in lo], [round(v, 3) for v in hi]]
+
+
+def _op_open_document(args, kid):
+    """Open an FCStd from disk and adopt it.
+
+    Outside the envelope for the same reason new_document is: a transaction
+    belongs to a document, and there is not one to open it on yet. It takes
+    the baseline too -- a document opened this turn has by definition not been
+    changed behind our back since we read it.
+
+    The koi ids come back with it. register() writes into doc.Meta, which is
+    saved inside the FCStd, so reopening a file this skill built restores every
+    id: turn 7 of a session next week can still edit what turn 3 built. A
+    document that was NOT built here has no ids at all, and the reply says so
+    rather than letting a later call fail one reference at a time.
+    """
+    import os
+    path = _resolve_in_roots(_need(args, "path"), (".fcstd",), True, "path")
+
+    doc = None
+    reused = False
+    for name in App.listDocuments():
+        d = App.getDocument(name)
+        try:
+            fn = _real(str(d.FileName)) if d.FileName else None
+        except Exception:
+            fn = None
+        if fn and fn == path:
+            # Already open. Opening it twice gives two documents holding one
+            # design and a human who cannot tell which window is real.
+            doc = d
+            reused = True
+            break
+    if doc is None:
+        doc = App.openDocument(path)
+
+    try:
+        doc.UndoMode = 1
+    except Exception:
+        pass
+    try:
+        App.setActiveDocument(doc.Name)
+    except Exception:
+        pass
+    if Gui is not None:
+        try:
+            Gui.setActiveDocument(doc.Name)
+        except Exception:
+            pass
+        _raise_document_window(doc)
+        try:
+            gdoc = Gui.activeDocument()
+            view = gdoc.activeView() if gdoc is not None else None
+            if _is_3d_view(view) and args.get("fit") is not False:
+                view.viewAxonometric()
+                view.fitAll()
+        except Exception:
+            pass
+        _gui_sync(doc)
+    observe(doc)
+
+    known = ids(doc)
+    errors = [o.Name for o in doc.Objects
+              if getattr(o, "State", None) and "Invalid" in o.State][:16]
+    out = {"name": doc.Name, "label": doc.Label,
+           "fileName": str(getattr(doc, "FileName", "") or "") or None,
+           "opened": not reused, "reused": reused,
+           "objects": len(doc.Objects),
+           "idCount": len(known["ids"]),
+           "ids": known["ids"][:64],
+           "revertedAiObjects": known["revertedAiObjects"],
+           "documents": sorted(App.listDocuments()),
+           "sizeBytes": (os.path.getsize(path) if os.path.isfile(path) else None)}
+    if errors:
+        out["recomputeErrors"] = errors
+        out["recomputeNote"] = (
+            "%d object(s) came off disk in an error state. That is how the "
+            "file was saved, not something this session did -- say so before "
+            "editing, and do not report the document as healthy."
+            % len(errors))
+    if not known["ids"]:
+        out["idNote"] = (
+            "nothing in this document carries a koi id: it was not built "
+            "through this skill. Address objects by Name or Label, and note "
+            "that an id only exists for what this session creates."
+        )
+    return out
+
+
+def _op_save(args, kid):
+    """Write the human's document to its own file.
+
+    This is the one op that touches the file the human opened, so it is not
+    something to do on a hunch: ask, or do it because they asked. It exists
+    because the alternative was worse -- before it, forty AI-authored
+    transactions lived only in RAM and the FCStd on disk was whatever it was
+    an hour ago, with export as the only way out and export deliberately
+    writing somewhere else.
+
+    With no path it saves in place, which needs the document to have a file
+    already. With a path it is Save As, and Save As REBINDS the document: every
+    later save goes to the new file. That is what the caller asked for, and the
+    reply says it happened in those words.
+    """
+    import os
+    doc = (App.getDocument(str(args["document"])) if args.get("document")
+           else App.ActiveDocument)
+    if doc is None:
+        raise KoiOpError("no document to save")
+    before = str(getattr(doc, "FileName", "") or "")
+
+    if args.get("path"):
+        path = _resolve_in_roots(args["path"], (".fcstd",), False, "path")
+        if os.path.isfile(path) and args.get("overwrite") is not True:
+            raise KoiOpError(
+                "%s already exists. Pass overwrite:true if replacing it is "
+                "what you meant -- this is the human's filesystem, and a save "
+                "that lands on an existing file is not recoverable from here."
+                % path)
+        doc.saveAs(path)
+        did = "saveAs"
+    else:
+        if not before:
+            raise KoiOpError(
+                "this document has never been saved, so there is no file to "
+                "save it to. Pass path (a .FCStd under a directory this "
+                "session may write), or ask the human to File > Save As once.")
+        doc.save()
+        path = before
+        did = "save"
+
+    after = str(getattr(doc, "FileName", "") or "")
+    size = 0
+    try:
+        size = os.path.getsize(after or path)
+    except Exception:
+        pass
+    if size <= 0:
+        raise KoiOpError("the save wrote no bytes to %s" % (after or path))
+    out = {"path": after or path, "bytes": size, "action": did,
+           "name": doc.Name, "touched": bool(getattr(doc, "Modified", False)),
+           "rebound": after != before,
+           "previousFile": before or None}
+    if out["rebound"]:
+        out["reboundNote"] = (
+            "this document now saves to %r instead of %r. Every File > Save "
+            "the human makes from here goes to the new file. Say so."
+            % (after, before or "(nowhere -- it was unsaved)"))
+    return out
+
+
+def _op_import(doc, args, kid):
+    """Bring foreign geometry in: a supplier STEP, a customer IGES, a BREP.
+
+    What arrives is a SHAPE, and this is honest about that rather than
+    pretending the tree came with it. There are no features, no sketches, no
+    parameters and nothing to bind an expression to. It is exactly as editable
+    as a casting somebody handed you: you can measure it, interfere against it,
+    cut with it and place it, and to change it you go back to whoever made it.
+
+    Which is also why it is worth having. The purchased-part model in this
+    skill is an interface and an envelope, and that is the right thing to
+    DESIGN against -- but at some point somebody has to check that the real
+    connector shell clears the real boss, and no envelope answers that.
+    """
+    import os
+    path = _resolve_in_roots(_need(args, "path"), IMPORT_EXTS, True, "path")
+    fmt = OPEN_FORMATS[os.path.splitext(path)[1].lower()]
+
+    before = set(o.Name for o in doc.Objects)
+    if fmt in ("STEP", "IGES"):
+        import Import
+        Import.insert(path, doc.Name)
+    else:
+        import Part
+        shape = Part.Shape()
+        shape.read(path)
+        obj = doc.addObject("Part::Feature", _safe_name(kid, "Imported"))
+        obj.Shape = shape
+    doc.recompute()
+    added = [o for o in doc.Objects if o.Name not in before]
+    if not added:
+        raise KoiOpError(
+            "%s imported without adding a single object. The file parsed and "
+            "contained nothing this build could turn into geometry." % fmt)
+
+    # More than one object is the normal case for a STEP assembly, and a
+    # loose handful of solids in the document root is not addressable as the
+    # one thing the caller asked for. An App::Part holds them, carries a
+    # Placement so 'place' can move the lot, and is what the tree already
+    # understands as a container.
+    holder = added[0]
+    grouped = False
+    if len(added) > 1:
+        holder = doc.addObject("App::Part", _safe_name(kid, "Imported"))
+        for o in added:
+            holder.addObject(o)
+        grouped = True
+        doc.recompute()
+
+    holder.Label = str(args.get("label") or kid or os.path.basename(path))
+    at = args.get("at")
+    if at is not None:
+        if not (isinstance(at, list) and len(at) == 3):
+            raise KoiOpError("at must be [x, y, z]")
+        holder.Placement.Base = App.Vector(float(at[0]), float(at[1]),
+                                           float(at[2]))
+
+    solids = 0
+    volume = 0.0
+    for o in added:
+        try:
+            solids += len(o.Shape.Solids)
+            volume += o.Shape.Volume
+        except Exception:
+            continue
+
+    _meta_set(doc, "koi.import." + str(kid), _json.dumps({
+        "path": path, "format": fmt,
+        "objects": [o.Name for o in added][:64],
+        "grouped": grouped, "solids": solids,
+    }))
+    register(doc, kid, holder, args.get("turn"))
+    doc.recompute()
+
+    out = {"name": holder.Name, "format": fmt, "path": path,
+           "objects": [o.Name for o in added][:64],
+           "objectCount": len(added), "grouped": grouped,
+           "solids": solids, "volume": round(volume, 6),
+           "bbox": _bbox_union([_bbox_of(o) for o in added]),
+           "note": (
+               "imported geometry: a shape, not a feature tree. It has no "
+               "sketches, no parameters and nothing to bind an expression "
+               "to, so a change means a new file from whoever made it. "
+               "Measure it and cut with it; do not try to edit it.")}
+    if not solids:
+        out["solidNote"] = (
+            "this file arrived as surfaces or shells, with no closed solid. "
+            "It will not boolean and it has no volume to interfere against -- "
+            "say that rather than treating it as a part.")
+    return out
 
 
 def _id_of(doc, name):
@@ -8336,25 +10967,8 @@ def _op_split_body(doc, args, kid):
     # the fabricated volume roughly doubled. Cleanup was a hand delete of an
     # unnamed pair. A recovery path that forks the assembly is not one.
     prior = [o for o in _prior_split(doc, kid, kids) if o.Name != src.Name]
-    carrying = [(o.Name, _split_half_work(o)) for o in prior]
-    carrying = [(n, w) for n, w in carrying if w]
+    recreate = bool(args.get("recreate"))
     forced = bool(args.get("force"))
-    if carrying and not forced:
-        raise KoiOpError(
-            "this split has already been run and its halves carry work: %s. "
-            "Re-splitting REPLACES them, and those features were built on the "
-            "old shape -- they are not re-derived onto the new halves and "
-            "nothing here can move them. Suppress or delete them first, or "
-            "pass force:true to drop them along with the halves. If the "
-            "halves are what you are still editing, edit the SOURCE and split "
-            "last: a split is a snapshot, and everything downstream of one "
-            "has to be rebuilt by hand."
-            % "; ".join("%s (%s)" % (n, ", ".join(w[:6])) for n, w in carrying))
-    replaced = []
-    for o in prior:
-        _remove_subtree(doc, o, replaced)
-    if replaced:
-        doc.recompute()
 
     v0 = round(shape.Volume, 6)
     pieces = []
@@ -8380,16 +10994,65 @@ def _op_split_body(doc, args, kid):
         out["offsetExpression"] = offset_expr
     if gap_expr:
         out["gapExpression"] = gap_expr
+
+    replaced = []
+    if recreate and prior:
+        carrying = [(o.Name, _split_half_work(o)) for o in prior]
+        carrying = [(n, w) for n, w in carrying if w]
+        if carrying and not forced:
+            raise KoiOpError(
+                "this split has already been run and its halves carry work: %s. "
+                "Recreating drops them. Pass force:true or omit recreate to update in-place."
+                % "; ".join("%s (%s)" % (n, ", ".join(w[:6])) for n, w in carrying))
+        for o in prior:
+            _remove_subtree(doc, o, replaced)
+        if replaced:
+            doc.recompute()
+        prior = []
+
     total = 0.0
     for (side, piece), skid, lbl in zip(pieces, kids, labels):
-        obj, is_body, why = _body_from_shape(doc, skid, piece, lbl)
-        register(doc, skid, obj, args.get("turn"))
+        existing = doc.getObject(str(skid)) or resolve(doc, str(skid))
+        is_body = True
+        why = None
+        obj = None
+        if existing is not None and not recreate:
+            obj = existing
+            if "PartDesign::Body" in str(getattr(obj, "TypeId", "")):
+                base = getattr(obj, "BaseFeature", None)
+                if base is None or "FeatureBase" not in str(getattr(base, "TypeId", "")):
+                    for g in list(getattr(obj, "Group", []) or []):
+                        if "FeatureBase" in str(getattr(g, "TypeId", "")):
+                            base = g
+                            break
+                if base is not None:
+                    base.Shape = piece
+                    if lbl:
+                        obj.Label = str(lbl)
+                    doc.recompute()
+                    try:
+                        base.purgeTouched()
+                    except Exception:
+                        pass
+                    is_body = True
+                else:
+                    is_body = False
+                    why = "existing body has no FeatureBase"
+            elif hasattr(obj, "Shape"):
+                obj.Shape = piece
+                if lbl:
+                    obj.Label = str(lbl)
+                doc.recompute()
+                is_body = False
+            else:
+                is_body = False
+                why = "existing object is not a Body or Shape"
+        else:
+            obj, is_body, why = _body_from_shape(doc, skid, piece, lbl)
+            register(doc, skid, obj, args.get("turn"))
+
         v = _vol(obj)
         total += v or 0.0
-        # "a" and "b" say nothing. Which half is which was guessed from
-        # memory of the last session and there was no way to check it in the
-        # reply, so the halves are also reported by the side of the plane
-        # they are on, with the box that proves it.
         which = "positive" if side == "a" else "negative"
         drawn_info = _drawn(doc, obj)
         row = {"side": side, "of": which, "id": skid, "name": obj.Name,
@@ -8461,17 +11124,20 @@ def _op_split_body(doc, args, kid):
     out["volumeRemovedByCut"] = round(v0 - total, 6)
     if replaced:
         out["replaced"] = replaced
-        if forced and carrying:
-            out["droppedWork"] = sorted(
-                set(n for _, w in carrying for n in w))
+    out["updated"] = bool(prior and not recreate)
     notes = ["ids[0] (%s) is the half on the POSITIVE side of the plane "
              "normal %s; ids[1] (%s) is the negative side -- read sides.* "
              "rather than assuming an order"
-             % (kids[0], _vec3(normal), kids[1]),
-             "these halves are snapshots of %s, not features of it: an "
-             "upstream edit does not reach them and the split has to be "
-             "made again -- so split LAST, and treat anything you build on a "
-             "half as frozen" % src.Name]
+             % (kids[0], _vec3(normal), kids[1])]
+    notes.append(
+        "these halves are snapshots of %s, not features of it: an "
+        "upstream edit does not reach them and the split has to be "
+        "made again -- so split LAST, and treat anything you build on a "
+        "half as frozen" % src.Name)
+    if out["updated"]:
+        notes.append(
+            "the existing halves were updated in place: their FeatureBase shapes "
+            "were refreshed and downstream features were preserved and recomputed.")
     if replaced:
         notes.append(
             "this REPLACED the halves an earlier run of the same split left "
@@ -8499,11 +11165,237 @@ BATCH_LIMIT = 24
 # Which ops bring an object into being, and therefore need an id of their own
 # inside a batch. The dispatcher enforces this per call; a batch step never
 # reaches the dispatcher.
+# ---------- dimensional inspection between two things ----------
+#
+# freecad_measure answers questions about OBJECTS: volume, bbox, centre of
+# mass, and the minimum distance between one part and another. The question an
+# engineer actually asks all day is a level down from that and was not
+# answerable at all: how far is this hole from that edge, are these two faces
+# parallel, what is the angle of that chamfer, is this bore coaxial with that
+# one. All of those are WITHIN a part, where the pair walk never looks.
+#
+# The whole argument of this skill is measure rather than look, and a
+# screenshot cannot tell 12.0 from 12.4. So this is the missing instrument,
+# and it is deliberately built on the two things that already exist: query
+# finds the entity, ref captures it, and this measures between them.
+
+ANGLE_TOL_DEG = 0.05
+COAX_TOL = 1e-4
+
+
+def _shape_of_ref(doc, r, what):
+    """A ref id, an object:Sub pair or an object id -> (owner, sub, shape)."""
+    owner, sub_name = _resolve_ref_sub(doc, r)
+    if owner is None:
+        raise KoiOpError("%s %r does not resolve to anything" % (what, r))
+    shape = getattr(owner, "Shape", None)
+    if shape is None:
+        raise KoiOpError(
+            "%s (%s) has no shape to measure. Datums and sketches are not "
+            "measurable this way; measure the feature they made."
+            % (owner.Name, owner.TypeId))
+    if not sub_name:
+        return owner, "", shape
+    try:
+        el = shape.getElement(sub_name)
+    except Exception as e:
+        raise KoiOpError(
+            "%s has no element %r on this recompute (%s). Element names "
+            "renumber -- re-run the query, or ask the user to pick it again."
+            % (owner.Name, sub_name, type(e).__name__))
+    return owner, sub_name, el
+
+
+def _v3(v):
+    return [round(v.x, 4), round(v.y, 4), round(v.z, 4)]
+
+
+def _entity_geometry(shape):
+    """What KIND of thing this is, and the numbers that define it.
+
+    Reported for its own sake as well as for the pair: 'what is that circle'
+    is a question with an exact answer, and reading a diameter off a render is
+    how a 6.2 becomes a 6.
+    """
+    out = {}
+    kind = shape.ShapeType if hasattr(shape, "ShapeType") else "?"
+    out["shapeType"] = kind
+    try:
+        if kind == "Face":
+            surf = shape.Surface
+            sname = type(surf).__name__
+            out["surface"] = sname
+            out["area"] = round(shape.Area, 4)
+            if sname == "Plane":
+                out["normal"] = _v3(surf.Axis)
+                out["position"] = _v3(surf.Position)
+                out["direction"] = _v3(surf.Axis)
+            elif sname in ("Cylinder", "Cone"):
+                out["axis"] = _v3(surf.Axis)
+                out["position"] = _v3(surf.Center)
+                out["direction"] = _v3(surf.Axis)
+                out["radius"] = round(float(surf.Radius), 4)
+                out["diameter"] = round(float(surf.Radius) * 2.0, 4)
+            elif sname == "Sphere":
+                out["position"] = _v3(surf.Center)
+                out["radius"] = round(float(surf.Radius), 4)
+        elif kind == "Edge":
+            curve = shape.Curve
+            cname = type(curve).__name__
+            out["curve"] = cname
+            out["length"] = round(shape.Length, 4)
+            if cname in ("Line", "LineSegment"):
+                out["direction"] = _v3(curve.Direction)
+                out["from"] = _v3(shape.Vertexes[0].Point)
+                out["to"] = _v3(shape.Vertexes[-1].Point)
+            elif cname in ("Circle", "ArcOfCircle"):
+                c = curve.Center if hasattr(curve, "Center") else curve.Circle.Center
+                ax = curve.Axis if hasattr(curve, "Axis") else curve.Circle.Axis
+                rad = curve.Radius if hasattr(curve, "Radius") else curve.Circle.Radius
+                out["center"] = _v3(c)
+                out["position"] = _v3(c)
+                out["axis"] = _v3(ax)
+                out["direction"] = _v3(ax)
+                out["radius"] = round(float(rad), 4)
+                out["diameter"] = round(float(rad) * 2.0, 4)
+        elif kind == "Vertex":
+            out["point"] = _v3(shape.Point)
+            out["position"] = _v3(shape.Point)
+        else:
+            if getattr(shape, "Volume", 0):
+                out["volume"] = round(shape.Volume, 4)
+            out["area"] = round(shape.Area, 4)
+    except Exception:
+        pass
+    try:
+        out["centerOfMass"] = _v3(shape.CenterOfMass)
+    except Exception:
+        pass
+    return out
+
+
+def _as_vec(seq):
+    return App.Vector(float(seq[0]), float(seq[1]), float(seq[2]))
+
+
+def _axis_distance(p1, d1, p2, d2):
+    """Distance between two infinite lines: parallel, or skew, or crossing.
+
+    This is the number a bore-to-bore dimension actually is. The minimum
+    distance between the two cylindrical FACES is that number minus both
+    radii, which is a different question and is also reported -- confusing
+    them is how a wall thickness gets called a hole spacing.
+    """
+    delta = p2.sub(p1)
+    cross = d1.cross(d2)
+    if cross.Length < 1e-9:
+        along = delta.dot(d1)
+        perp = delta.sub(App.Vector(d1.x * along, d1.y * along, d1.z * along))
+        return round(perp.Length, 4), True
+    return round(abs(delta.dot(cross)) / cross.Length, 4), False
+
+
+def _op_measure_between(doc, args, kid):
+    """Measure between two entities, or report one exactly.
+
+    Reads its refs the way fillet and chamfer do: a ref id captured from a
+    user pick, an object:Sub pair from query, or a whole object. It never
+    authors an index, and it says which recompute the numbers came from by
+    failing loudly when an element name no longer resolves.
+    """
+    a_ref = _need(args, "a")
+    owner_a, sub_a, sh_a = _shape_of_ref(doc, a_ref, "a")
+    geo_a = _entity_geometry(sh_a)
+    out = {"a": {"ref": str(a_ref), "object": owner_a.Name,
+                 "element": sub_a or None, "geometry": geo_a}}
+    stale_a = _tip_warning(owner_a)
+    if stale_a:
+        out["a"]["notTip"] = stale_a
+
+    if args.get("b") is None:
+        # One entity is a legitimate question: what IS that. A diameter read
+        # off a picture is a diameter nobody should machine to.
+        out["note"] = (
+            "one entity measured. Pass b to get the distance, the angle and "
+            "the axis relationship between two.")
+        return out
+
+    owner_b, sub_b, sh_b = _shape_of_ref(doc, args["b"], "b")
+    geo_b = _entity_geometry(sh_b)
+    out["b"] = {"ref": str(args["b"]), "object": owner_b.Name,
+                "element": sub_b or None, "geometry": geo_b}
+    stale_b = _tip_warning(owner_b)
+    if stale_b:
+        out["b"]["notTip"] = stale_b
+    if stale_a or stale_b:
+        out["notTipNote"] = (
+            "at least one of these is a mid-tree feature rather than the "
+            "finished solid, so the distance is between geometry as it was "
+            "part-way through the build. Measure the body.")
+    out["sameObject"] = owner_a.Name == owner_b.Name
+
+    # -- the minimum gap. This is what a feeler gauge would read.
+    try:
+        dist, pts, _info = sh_a.distToShape(sh_b)
+        out["minDistance"] = round(float(dist), 4)
+        if pts:
+            p1, p2 = pts[0][0], pts[0][1]
+            out["closestPoints"] = [_v3(p1), _v3(p2)]
+        out["touching"] = float(dist) <= 1e-7
+    except Exception as e:
+        out["minDistanceError"] = "%s: %s" % (type(e).__name__, e)
+
+    # -- centre to centre, which is the dimension a drawing carries.
+    ca = geo_a.get("center") or geo_a.get("position") or geo_a.get("centerOfMass")
+    cb = geo_b.get("center") or geo_b.get("position") or geo_b.get("centerOfMass")
+    if ca and cb:
+        d = _as_vec(cb).sub(_as_vec(ca))
+        out["centerDistance"] = round(d.Length, 4)
+        out["centerDelta"] = [round(d.x, 4), round(d.y, 4), round(d.z, 4)]
+
+    # -- direction: angle, parallel, perpendicular, coaxial.
+    da, db = geo_a.get("direction"), geo_b.get("direction")
+    if da and db:
+        va, vb = _as_vec(da), _as_vec(db)
+        try:
+            ang = _math.degrees(va.getAngle(vb))
+        except Exception:
+            ang = None
+        if ang is not None:
+            out["angleDeg"] = round(ang, 4)
+            # 179.97 degrees between two normals is two parallel faces
+            # pointing away from each other, which is the normal way for a
+            # plate's top and bottom to be reported. Saying "not parallel"
+            # there would be true about the normals and wrong about the part.
+            acute = min(ang, 180.0 - ang)
+            out["angleBetweenDeg"] = round(acute, 4)
+            out["parallel"] = acute <= ANGLE_TOL_DEG
+            out["perpendicular"] = abs(acute - 90.0) <= ANGLE_TOL_DEG
+        if ca and cb:
+            axd, par = _axis_distance(_as_vec(ca), va, _as_vec(cb), vb)
+            out["axisDistance"] = axd
+            out["axesParallel"] = par
+            out["coaxial"] = bool(par and axd <= COAX_TOL)
+            ra, rb = geo_a.get("radius"), geo_b.get("radius")
+            if ra is not None and rb is not None and par:
+                out["wallBetween"] = round(axd - float(ra) - float(rb), 4)
+                out["wallNote"] = (
+                    "wallBetween is axisDistance minus both radii: the "
+                    "material left between the two bores. Negative means they "
+                    "break into each other.")
+    if out.get("parallel") and out.get("minDistance") is not None:
+        out["offset"] = out["minDistance"]
+        out["offsetNote"] = (
+            "these are parallel, so minDistance is the offset between them -- "
+            "the number to quote for a wall thickness or a plate gap.")
+    return out
+
+
 CREATING_OPS = frozenset((
     "body", "sketch", "pad", "pocket", "hole", "bolt_sketch", "datum_plane",
     "fillet", "chamfer", "shell", "revolve", "groove", "mirror", "boolean",
     "primitive", "pattern", "polar_array", "link_array", "insert", "ref",
-    "split_body", "fastener_pattern",
+    "split_body", "fastener_pattern", "import_geometry",
 ))
 
 
@@ -8571,6 +11463,11 @@ def _op_batch(doc, args, kid):
 
 OPS = {
     "new_document": {"fn": _op_new_document, "mode": "document"},
+    "open_document": {"fn": _op_open_document, "mode": "document"},
+    "save": {"fn": _op_save, "mode": "document"},
+    "import_geometry": {"fn": _op_import, "mode": "write"},
+    "sketch_get": {"fn": _op_sketch_get, "mode": "read"},
+    "sketch_edit": {"fn": _op_sketch_edit, "mode": "write"},
     "datum_plane": {"fn": _op_datum_plane, "mode": "write"},
     "fillet": {"fn": _op_fillet, "mode": "write"},
     "chamfer": {"fn": _op_chamfer, "mode": "write"},
@@ -8598,12 +11495,21 @@ OPS = {
     # still runs; it is not advertised.
     "library": {"fn": _op_library, "mode": "read"},
     "view_set": {"fn": _op_view_set, "mode": "read"},
+    "render": {"fn": _op_render, "mode": "read"},
     "isolate": {"fn": _op_isolate, "mode": "write"},
     "show": {"fn": _op_show, "mode": "write"},
     "view_restore": {"fn": _op_view_restore, "mode": "write"},
     "ids": {"fn": _op_ids, "mode": "read"},
+    "bind": {"fn": _op_bind, "mode": "write"},
     "revolve": {"fn": _op_revolve, "mode": "write"},
     "groove": {"fn": _op_groove, "mode": "write"},
+    "loft": {"fn": _op_loft, "mode": "write"},
+    "subtractive_loft": {"fn": _op_subtractive_loft, "mode": "write"},
+    "pipe": {"fn": _op_pipe, "mode": "write"},
+    "subtractive_pipe": {"fn": _op_subtractive_pipe, "mode": "write"},
+    "sweep": {"fn": _op_pipe, "mode": "write"},
+    "subtractive_sweep": {"fn": _op_subtractive_pipe, "mode": "write"},
+    "draft": {"fn": _op_draft, "mode": "write"},
     "polar_array": {"fn": _op_polar_array, "mode": "write"},
     "pattern": {"fn": _op_pattern, "mode": "write"},
     "mirror": {"fn": _op_mirror, "mode": "write"},
@@ -8617,7 +11523,12 @@ OPS = {
     "split_body": {"fn": _op_split_body, "mode": "write"},
     "batch": {"fn": _op_batch, "mode": "write"},
     "view_fit": {"fn": _op_view_fit, "mode": "read"},
+    "view_section": {"fn": _op_view_section, "mode": "read"},
     "bom": {"fn": _op_bom, "mode": "read"},
+    "measure_between": {"fn": _op_measure_between, "mode": "read"},
+    "material": {"fn": _op_material, "mode": "write"},
+    "recompute": {"fn": _op_recompute, "mode": "write"},
+    "capabilities": {"fn": _op_capabilities, "mode": "read"},
 }
 
 OP_NAMES = sorted(OPS)
@@ -8629,7 +11540,7 @@ OP_NAMES = sorted(OPS)
 # document made "what size is an M5 clearance hole" answer "No active
 # document. Call new_document". That is the one question a session asks BEFORE
 # it has decided what to build.
-DOCLESS_OPS = frozenset(("lookup", "library"))
+DOCLESS_OPS = frozenset(("lookup", "library", "capabilities"))
 
 
 # ---------- measurement (6.4) ----------
@@ -8701,6 +11612,9 @@ def _presentation_parts(doc):
 def _metrics(o):
     m = _shape_metrics(o) or {}
     m["name"] = o.Name
+    stale = _tip_warning(o)
+    if stale:
+        m["notTip"] = stale
     m["label"] = o.Label
     m["type"] = o.TypeId
     m["state"] = list(o.State)
@@ -9000,6 +11914,7 @@ def envelope(label, apply_fn, dry_run=False):
     new_errors = []
     applied_proj = None
     rehealed = []
+    rehealed_ext = []
 
     _open(label)
     try:
@@ -9012,7 +11927,11 @@ def envelope(label, apply_fn, dry_run=False):
         # thirteen steps of manual recovery. Re-resolve, recompute, re-check.
         if new_errors:
             rehealed = _reheal_dress(doc, new_errors)
-            if rehealed:
+            # A broken projection breaks the SKETCH, and every feature built on
+            # it errors with it -- so the names to try are the errors plus the
+            # sketches they lead back to, not the errors alone.
+            rehealed_ext = _reheal_external(doc, new_errors)
+            if rehealed or rehealed_ext:
                 doc.recompute()
                 new_errors = sorted(_error_set(doc) - before_errors)
         # Captured HERE, while the edit is still in the document. A dry run is
@@ -9033,6 +11952,7 @@ def envelope(label, apply_fn, dry_run=False):
         aborted, reason = True, "exception"
         err = "%s: %s" % (type(e).__name__, e)
         new_errors = []
+        rehealed_ext = []
 
     _close(aborted)
     # Aborting the data layer alone can leave orphaned view providers.
@@ -9053,6 +11973,10 @@ def envelope(label, apply_fn, dry_run=False):
             after_proj = project(doc)
 
     fit = None if aborted else _auto_fit(doc, span_before)
+    # Always, and after the fit: moving the camera is a scene change that
+    # itself needs a redraw, and _auto_fit only redraws on the turns it
+    # decides to move.
+    gui_sync = None if aborted else _gui_sync(doc)
 
     u1 = len(doc.UndoNames)
     booked = u1 - u0
@@ -9101,6 +12025,17 @@ def envelope(label, apply_fn, dry_run=False):
         # The camera is theirs, so a move of it is reported like any other
         # change to what they see.
         res["viewFit"] = fit
+    # Only when it did NOT work. A successful repaint is the expected case and
+    # says nothing worth a line in every reply; a failed one means the human
+    # is looking at a stale window while the reply says the edit landed, and
+    # that has to reach the model in the same breath as the edit.
+    if gui_sync is not None and not gui_sync.get("redrawn"):
+        res["guiSync"] = gui_sync
+        res["guiSyncNote"] = (
+            "the edit is in the document but the 3D view was not refreshed. "
+            "What the human can see may be the model as it was BEFORE this "
+            "change -- say so rather than describing the viewport, and use "
+            "freecad_render for a picture that is definitely current.")
     if rehealed:
         res["rehealed"] = rehealed
         res["rehealedNote"] = (
@@ -9109,6 +12044,19 @@ def envelope(label, apply_fn, dry_run=False):
             "not be the same edges -- check the result before reporting it"
             % (", ".join(r["feature"] for r in rehealed),
                "its" if len(rehealed) == 1 else "their"))
+    if rehealed_ext:
+        res["rehealedExternal"] = rehealed_ext
+        lost = sum(r.get("lostConstraints") or 0 for r in rehealed_ext)
+        res["rehealedExternalNote"] = (
+            "%s had its projected geometry re-resolved from the filter stored "
+            "with it. %s"
+            % (", ".join(r["sketch"] for r in rehealed_ext),
+               ("This cost %d constraint(s) -- FreeCAD deletes what "
+                "referenced the old projection, so the sketch may solve and "
+                "be the WRONG SHAPE. Check it before reporting this edit."
+                % lost) if lost else
+               "No constraints were lost, but these may not be the same "
+               "edges -- check the result."))
     if aborted and reason == "dry-run" and applied_lint is not None:
         res["lintNote"] = ("lint describes the previewed state, not the "
                            "document: the change has been rolled back")
@@ -9470,6 +12418,147 @@ async function ensureKoiCad(force) {
 //           `id` mandatory: an object nobody can name in turn 7 is an object
 //           the next edit has to rebuild rather than edit (§8.5).
 const OP_SPECS = {
+  open_document: {
+    mode: "document", creates: false,
+    summary:
+      "Open an existing .FCStd from disk and adopt it. The path has to sit " +
+      "under a directory this session may read: the export directory, " +
+      "anything KOI_OPEN_DIRS names, or the folder of a document the human " +
+      "already has open. koi ids come back with the file — they live in " +
+      "doc.Meta, which is saved inside the FCStd — so a document this skill " +
+      "built last week is still editable by id rather than by rebuild. A " +
+      "document built elsewhere has none, and the reply says so.",
+    props: { path: "string", fit: "boolean" },
+    required: ["path"],
+  },
+  save: {
+    mode: "document", creates: false,
+    summary:
+      "Save the human's document to its own file. With no path it saves in " +
+      "place and needs the document to have been saved once already; with a " +
+      "path it is Save As, which REBINDS the document so every later save " +
+      "goes to the new file — the reply says which happened in those words. " +
+      "This writes to the user's filesystem: do it because they asked, not " +
+      "on a hunch. It is not freecad_export, which writes a copy elsewhere " +
+      "and leaves their file alone.",
+    props: { path: "string", document: "string", overwrite: "boolean" },
+  },
+  import_geometry: {
+    mode: "write", creates: true,
+    summary:
+      "Import a STEP, IGES or BREP file as geometry: a supplier's connector, " +
+      "a customer's mating part, a casting. What arrives is a SHAPE — no " +
+      "features, no sketches, no parameters, nothing to bind an expression " +
+      "to — and it is reported that way rather than dressed up as a model " +
+      "you can edit. Use it to measure against, interfere against and cut " +
+      "with; for a part you are DESIGNING against, 'insert' and its " +
+      "interface is still the right thing. Several objects come in under one " +
+      "App::Part so 'place' can move the lot. Same path rules as " +
+      "open_document.",
+    props: { path: "string", at: "array", label: "string" },
+    required: ["path"],
+  },
+  sketch_get: {
+    mode: "read", creates: false,
+    summary:
+      "Read a sketch back: every geoId with the numbers that identify it, " +
+      "every constraint with its index, name, value and expression, the " +
+      "degrees of freedom, the conflicts and what the profile encloses. This " +
+      "is how you learn the geoId sketch_edit needs — indices shift when " +
+      "geometry is deleted, so read them in the same turn you use them, and " +
+      "never author one from memory.",
+    props: { target: "string" },
+    required: ["target"],
+  },
+  sketch_edit: {
+    mode: "write", creates: false,
+    summary:
+      "Change a sketch in place instead of rebuilding it — add geometry, " +
+      "remove geoIds, add or drop constraints, bind a dimension to the " +
+      "parameter sheet, flip an element to construction. This is to sketches " +
+      "what feature_edit is to features, and for the same reason: deleting a " +
+      "sketch to add one hole deletes the pad, and everything attached to " +
+      "it. Removals happen before adds, so the geoIds you pass are the ones " +
+      "you read. Deleting geometry silently deletes the constraints that " +
+      "used it — the reply counts them as constraintsLost, and a sketch that " +
+      "lost constraints solves fine at the wrong shape.",
+    props: { target: "string", add: "array", remove: "array",
+             constraints: "array", removeConstraints: "array",
+             expressions: "object", construction: "object",
+             visible: "boolean" },
+    required: ["target"],
+  },
+  measure_between: {
+    mode: "read", creates: false,
+    summary:
+      "Measure BETWEEN two entities, or report one exactly: minimum " +
+      "distance, centre-to-centre, axis-to-axis, angle, parallel, " +
+      "perpendicular, coaxial, and the material left between two bores. " +
+      "freecad_measure answers questions about whole objects and cannot " +
+      "reach inside one — how far this hole is from that edge, whether " +
+      "these two faces are parallel, what that chamfer's angle is. Takes " +
+      "refs the way fillet does: a ref id from a user pick, an " +
+      "'object:Face3' pair from query, or a whole object. Pass a alone to " +
+      "ask what one thing IS — a diameter read off a render is a diameter " +
+      "nobody should machine to.",
+    props: { a: "string", b: "string" },
+    required: ["a"],
+  },
+  material: {
+    mode: "write", creates: false,
+    summary:
+      "Give a body a density so it has a mass, and so the BOM adds up. With " +
+      "no target it returns the table (32 materials, g/cm3) and writes " +
+      "nothing. With target or targets and name — 'aluminium-6061', " +
+      "'stainless-304', 'pom-acetal' — or an explicit density for anything " +
+      "not in the table. Mass is volume times density and nothing else: no " +
+      "fasteners, no estimate for the fillets. A body with no material " +
+      "weighs nothing in the BOM and the BOM says which ones those are.",
+    props: { target: "string", targets: "array", name: "string",
+             density: "number", all: "boolean", clear: "boolean" },
+  },
+  recompute: {
+    mode: "write", creates: false,
+    summary:
+      "Force a rebuild, and optionally refine. force:true rebuilds a " +
+      "document sitting touched-but-not-rebuilt or stuck in an error state a " +
+      "plain edit will not clear — before this the only move was " +
+      "delete-and-rebuild, which throws away the DAG to fix a stale flag. " +
+      "refine:true sets Refine on every feature that has it, which removes " +
+      "the coplanar splitter edges a boolean leaves across a face (the " +
+      "sliver faces deepLint reports and nothing could fix). Refining cannot " +
+      "change the volume, so the volume is measured either side and a " +
+      "difference is reported as a problem rather than a result.",
+    props: { targets: "array", force: "boolean", refine: "boolean",
+             touch: "boolean" },
+  },
+  view_section: {
+    mode: "read", creates: false,
+    summary:
+      "Clip the 3D view on a plane so the human can see inside — a pocket " +
+      "in a housing, a bore through a boss. plane 'XY'|'XZ'|'YZ' or " +
+      "normal:[x,y,z], with offset and flip. This clips the VIEW: no " +
+      "geometry changes, nothing recomputes, and the cut face is OPEN " +
+      "rather than capped, so it answers 'does that break through' and not " +
+      "'how thick is that wall' — the second is measure_between. Turn it " +
+      "off with off:true, and view_restore drops it too. Leaving a session's " +
+      "clip on the human's view is the same mistake as leaving their model " +
+      "isolated.",
+    props: { plane: "string", normal: "array", offset: "number",
+             flip: "boolean", off: "boolean", enabled: "boolean" },
+  },
+  capabilities: {
+    mode: "read", creates: false,
+    summary:
+      "What this FreeCAD can actually do: which modules import in THIS " +
+      "interpreter, whether there is a GUI, and what the Assembly API " +
+      "exposes on this build. K0 says every claim this skill makes is a " +
+      "claim about one build; this is how a session checks one instead of " +
+      "assuming it. Importable is not the same as wired: assembly joints " +
+      "and TechDraw drawings are NOT in this skill, and Assembly importing " +
+      "cleanly does not make them available. Needs no document.",
+    props: {},
+  },
   new_document: {
     mode: "document", creates: false,
     summary:
@@ -9489,7 +12578,7 @@ const OP_SPECS = {
       "renumbers Face6. Created INVISIBLE, because a stack of translucent " +
       "planes is what the user sees instead of their model; pass " +
       "visible:true for one they should actually look at.",
-    props: { body: "string", base: "string", on: "string", mode: "string",
+    props: { body: "string", base: "string", on: "string", plane: "string", mode: "string",
              offset: "number|string", visible: "boolean", label: "string" },
   },
   fillet: {
@@ -9529,6 +12618,23 @@ const OP_SPECS = {
     props: { target: "string", count: "number", step: "array", label: "string" },
     required: ["target", "count"],
   },
+  bind: {
+    mode: "write", creates: true,
+    summary:
+      "Bring geometry from ANOTHER body or part into this one, as a " +
+      "PartDesign::SubShapeBinder: bind({of:'pad.housing:Face2'}). This is " +
+      "the case external geometry cannot reach on its own — a cover plate is " +
+      "its own body and the housing it matches is another — and addExternal " +
+      "refuses across that line. The binder is a local object afterwards: " +
+      "sketch({on: <id>}) attaches to it and sketch({external: ['<id>:" +
+      "Edge1']}) projects from it, and it FOLLOWS the source when the source " +
+      "moves, which is the whole point. relative:false pins it to the " +
+      "source's own coordinates instead of tracking its container. Created " +
+      "invisible; visible:true if the user should see it.",
+    props: { body: "string", of: "string", target: "string", source: "string",
+             relative: "boolean", visible: "boolean", label: "string" },
+    required: ["of"],
+  },
   attach: {
     mode: "write", creates: false,
     summary:
@@ -9542,7 +12648,7 @@ const OP_SPECS = {
     mode: "write",
     creates: true,
     summary: "Create a PartDesign Body to hold features.",
-    props: { label: "string" },
+    props: { label: "string", name: "string" },
   },
   // Note: the reply carries `profile` — wires, how many are closed, and the
   // enclosed area. A sketch is allowed to enclose nothing (scaffolding an
@@ -9575,7 +12681,18 @@ const OP_SPECS = {
       "dimension goes in. slot is a rounded slot ({x, y, length, width, " +
       "angle}), length measured tip to tip and x, y the centre: the " +
       "primitive a lightening flute needed, dimensioned and bindable rather " +
-      "than computed polyline points that can never follow a parameter.",
+      "than computed polyline points that can never follow a parameter.\n\n" +
+      "external PROJECTS model geometry into the sketch so a profile can " +
+      "follow the part it mates with instead of repeating its numbers: " +
+      "external:['pad.housing:Edge4'] from a user pick, or query:{...} — the " +
+      "same filter fn 'query' takes, kept with the sketch and re-run when an " +
+      "upstream change renumbers the edges. Prefer query, and not for the " +
+      "reason fillet does: when a projection's reference goes, FreeCAD " +
+      "DELETES every constraint that used it, so the sketch still solves and " +
+      "is quietly the wrong shape. The reply reports a geoId per projection " +
+      "(external geometry starts at -3) — that is the address constraints " +
+      "use. Projecting and then writing the dimension as a literal anyway " +
+      "buys nothing. addExternal refuses across bodies: use fn 'bind' first.",
     required: ["geometry"],
     props: {
       on: "string",
@@ -9584,6 +12701,8 @@ const OP_SPECS = {
       body: "string",
       geometry: "array",
       constraints: "array",
+      external: "array",
+      query: "object",
       visible: "boolean",
     },
   },
@@ -9606,6 +12725,7 @@ const OP_SPECS = {
       length: "number|string",
       reversed: "boolean",
       midplane: "boolean",
+      symmetric: "boolean",
       body: "string",
     },
   },
@@ -9630,6 +12750,7 @@ const OP_SPECS = {
       through: "boolean",
       reversed: "boolean",
       midplane: "boolean",
+      symmetric: "boolean",
       body: "string",
     },
   },
@@ -9862,6 +12983,62 @@ const OP_SPECS = {
       "deleted (revertedAiObjects — a rejection signal, never re-create them).",
     props: {},
   },
+  loft: {
+    mode: "write", creates: true,
+    summary:
+      "Create an additive loft (transition solid) between two or more section sketches. " +
+      "sketches is a list of sketch ids (min 2, max 32). Supports ruled:true for ruled surfaces, " +
+      "closed:true for closed looping lofts.",
+    props: { body: "string", sketches: "array",
+             ruled: "boolean", closed: "boolean", label: "string" },
+    required: ["sketches"],
+  },
+  subtractive_loft: {
+    mode: "write", creates: true,
+    summary:
+      "Cut a subtractive loft between two or more section sketches through the body's material. " +
+      "sketches is a list of sketch ids (min 2, max 32). Measured like pocket and groove: " +
+      "the reply carries removed and removedAtProfile, and a cut that removed nothing says so " +
+      "instead of reporting a clean recompute.",
+    props: { body: "string", sketches: "array",
+             ruled: "boolean", closed: "boolean", label: "string" },
+    required: ["sketches"],
+  },
+  pipe: {
+    mode: "write", creates: true,
+    summary:
+      "Sweep a profile sketch along a spine/path sketch into a solid (AdditivePipe). " +
+      "sketch is the profile, path is the trajectory. mode is 'Fixed'|'Frenet'|'Auxiliary'|'Binormal'|'Curvilinear' " +
+      "(default 'Fixed'). transition is 'Transformed'|'RightCorner'|'RoundCorner' — an unrecognised " +
+      "value is REFUSED, not quietly defaulted. A path sketch with no edges is refused too: an " +
+      "empty spine builds, reports Up-to-date and adds nothing. Alias: sweep.",
+    props: { body: "string", sketch: "string", path: "string",
+             mode: "string", transition: "string", label: "string" },
+    required: ["sketch", "path"],
+  },
+  subtractive_pipe: {
+    mode: "write", creates: true,
+    summary:
+      "Cut a subtractive sweep of a profile sketch along a spine/path sketch through the solid (SubtractivePipe). " +
+      "sketch is the profile, path is the trajectory. Measured like pocket: the reply carries " +
+      "removed and removedAtProfile, and a sweep that cut nothing says so. Alias: subtractive_sweep.",
+    props: { body: "string", sketch: "string", path: "string",
+             mode: "string", transition: "string", label: "string" },
+    required: ["sketch", "path"],
+  },
+  draft: {
+    mode: "write", creates: true,
+    summary:
+      "Draft (taper) faces of a body relative to a neutral plane for mold release and manufacturing. " +
+      "angle is the draft angle in degrees (or expression string). neutralPlane is 'XY'|'XZ'|'YZ', a datum id or a face ref. " +
+      "refs or query specifies the FACES to draft — a query here defaults to kind:'face', and the " +
+      "filter is kept with the feature the same way fillet's is. reversed:true flips the pull " +
+      "direction; the reply reports taper ('inward'|'outward'|'none') and volumeDelta so which way " +
+      "it went is measured rather than assumed.",
+    props: { body: "string", base: "string", angle: "number|string", neutralPlane: "string",
+             plane: "string", refs: "array", query: "object", reversed: "boolean", label: "string" },
+    required: ["angle"],
+  },
   revolve: {
     mode: "write", creates: true,
     summary:
@@ -10058,12 +13235,11 @@ const OP_SPECS = {
       "normal; the reply also returns sides:{positive,negative} with an id, " +
       "volume and bbox each, so read that rather than guessing the order. " +
       "Each half comes back as a PartDesign Body when the build allows it " +
-      "(asBodies says), so features can still be added. The halves are " +
-      "snapshots: an upstream edit does not reach them, and lint reports " +
-      "split-stale on every turn after the source changes until it is re-run.",
+      "(asBodies says), so features can still be added. Re-running split_body " +
+      "updates existing halves in place, preserving downstream features.",
     props: { target: "string", plane: "string", offset: "number|string",
              gap: "number|string", ids: "array", labels: "array",
-             keep: "string" },
+             keep: "string", recreate: "boolean", force: "boolean" },
     required: ["target"],
   },
   view_fit: {
@@ -10075,8 +13251,37 @@ const OP_SPECS = {
       "only: origin planes are infinite and are listed under ignored rather " +
       "than counted, which is why every span used to read 3.46e100. Pass " +
       "auto:false to stop the automatic fit for this document when the user " +
-      "is driving the camera themselves, auto:true to put it back.",
-    props: { auto: "boolean" },
+      "is driving the camera themselves, auto:true to put it back.\n\n" +
+      "Separately: every applied write refreshes the human's 3D viewport, " +
+      "which is NOT the same thing as moving their camera and is not " +
+      "rationed. That only shows up in a reply when it FAILED, as guiSync — " +
+      "which means the window they are watching still shows the model as it " +
+      "was, so describe the change from the reply and reach for " +
+      "freecad_render rather than narrating a viewport you cannot see. " +
+      "sync:false turns the refresh off for this document (a human dragging " +
+      "the view during a long batch), sync:true puts it back.",
+    props: { auto: "boolean", sync: "boolean" },
+  },
+  render: {
+    mode: "read", creates: false,
+    summary:
+      "Write a snapshot of the FreeCAD 3D viewport to disk, through " +
+      "Gui.ActiveDocument.ActiveView.saveImage(). Needs savePath, which must " +
+      "land inside the export directory, and returns " +
+      "the path and dimensions — never the pixels, because a dispatcher " +
+      "result is JSON in a text block and a batch of them is 24 of those. " +
+      "For an image anyone can look at, call the freecad_render tool. The " +
+      "camera is framed for the shot and put back; restore:false leaves it.",
+    props: {
+      width: "number",
+      height: "number",
+      background: "string",
+      view: "string",
+      fit: "boolean",
+      format: "string",
+      savePath: "string",
+      restore: "boolean",
+    },
   },
   bom: {
     mode: "read", creates: false,
@@ -10121,7 +13326,7 @@ const TYPE_OF = (v) => (Array.isArray(v) ? "array" : v === null ? "null" : typeo
  * session transcript written before today. Resolved before validation, so an
  * old call takes the new spec rather than falling through as unknown.
  */
-const OP_ALIASES = { library: "lookup" };
+const OP_ALIASES = { library: "lookup", sweep: "pipe", subtractive_sweep: "subtractive_pipe" };
 
 /**
  * Shallow validation, on this side of the bridge on purpose. A misspelled fn
@@ -10137,7 +13342,7 @@ function validateOpArgs(spec, args) {
   }
   const known = spec.props || {};
   for (const key of Object.keys(args)) {
-    if (key === "turn") continue;
+    if (key === "turn" || key === "id" || key === "name" || key === "comment" || key === "description") continue;
     const want = known[key];
     if (!want) {
       problems.push(
@@ -10173,9 +13378,23 @@ function pyPayload(obj) {
   return JSON.stringify(JSON.stringify(obj));
 }
 
+async function ensureAttached() {
+  if (state.attached) return { attached: true };
+  const att = await toolAttach();
+  if (!att.attached) {
+    return {
+      attached: false,
+      error: att.error || "Not attached. Call freecad_attach first.",
+      detail: att.detail,
+    };
+  }
+  return { attached: true };
+}
+
 async function toolCall(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
 
   const fn = OP_ALIASES[String(args.fn || "")] || String(args.fn || "");
   const spec = OP_SPECS[fn];
@@ -10235,7 +13454,8 @@ async function toolCall(args) {
 
 async function toolScript(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
   if (typeof args.python !== "string" || !args.python.trim()) {
     return { error: "python is required" };
   }
@@ -10361,7 +13581,8 @@ function validateBatch(ops) {
  */
 async function toolMeasure(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
   const refs = Array.isArray(args.refs) ? args.refs.map(String) : null;
   const pairs = Array.isArray(args.pairs) ? args.pairs : null;
   if (pairs) {
@@ -10400,7 +13621,8 @@ async function toolMeasure(args) {
  */
 async function toolResolve(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
   await ensureKoiCad(false);
   const payload = pyPayload({
     ids: Array.isArray(args.ids) ? args.ids.map(String) : null,
@@ -10461,9 +13683,56 @@ async function toolResolve(args) {
  * The URL is there so the user can pull it into their browser's download folder
  * with a click if they want it there. It is not the only copy any more.
  */
+/**
+ * freecad_render — direct, headless-safe snapshot of the FreeCAD 3D viewport.
+ *
+ * Saves an image of the live CAD active view directly via FreeCAD's native
+ * Gui.ActiveDocument.ActiveView.saveImage() API, bypassing browser DOM,
+ * WebRTC stream framing and window focus issues.
+ *
+ * The base64 it returns leaves through the image content block that callTool
+ * builds for this one tool, and through nothing else. In a text block the
+ * bytes are unreadable to the model, unreadable to the human, and cost tens of
+ * thousands of tokens to say so — which is a render that fails at the one job
+ * the tool exists for while every assertion about it passes.
+ */
+async function toolRender(args) {
+  args = args || {};
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
+  if (state.bridge && state.bridge.gui === false) {
+    return {
+      ok: false,
+      error: "This FreeCAD process is headless (no GUI). freecad_render requires a GUI view.",
+    };
+  }
+  await ensureKoiCad(false);
+  const payload = pyPayload({
+    width: Number(args.width) || 800,
+    height: Number(args.height) || 600,
+    background: String(args.background || "Current"),
+    view: args.view ? String(args.view) : null,
+    fit: args.fit !== false,
+    format: String(args.format || "png"),
+    savePath: args.savePath ? String(args.savePath) : null,
+    restore: args.restore !== false,
+  });
+  const res = await execPython(
+    "import koi_cad, json\n" +
+    "a = json.loads(" + payload + ")\n" +
+    "return koi_cad.render_view(width=a['width'], height=a['height'],\n" +
+    "                           background=a['background'], view_preset=a['view'],\n" +
+    "                           fit=a['fit'], img_format=a['format'],\n" +
+    "                           save_path=a['savePath'], restore=a['restore'])\n",
+    args.timeoutMs || 60000
+  );
+  return res.data || {};
+}
+
 async function toolExport(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
 
   // Ask before doing. The directory is checked on every /hello, so this costs
   // one cheap round trip and turns "FreeCADError: filesystem error: cannot
@@ -10502,18 +13771,19 @@ async function toolExport(args) {
   if (d.error || !d.path) return d;
   const cfg = bridgeConfig();
   d.persisted = "disk";
-  d.url =
-    cfg.bridgeUrl + "/file?path=" + encodeURIComponent(d.path) +
-    (state.bridgeToken ? "&token=" + encodeURIComponent(state.bridgeToken) : "");
+  d.url = cfg.bridgeUrl + "/file?path=" + encodeURIComponent(d.path);
   d.note =
     "Written to the user's filesystem at " + d.path + ". It is a real file and " +
-    "it stays there; open the url to pull a copy into the browser's downloads.";
+    "it stays there — it is under the bridge's export directory, which the " +
+    "deployment mounts on the host, so it is already where the human can " +
+    "reach it. No download needed.";
   return d;
 }
 
 async function toolGet(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
   const raw = args.ids != null ? args.ids : args.id;
   const wanted = (Array.isArray(raw) ? raw : [raw])
     .filter((v) => v != null && String(v).trim() !== "")
@@ -10569,7 +13839,8 @@ function trimTree(nodes, budget) {
 
 async function toolSync(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
   await ensureKoiCad(false);
   const res = await execPython(
     // App is a __main__ global in this build rather than something this
@@ -10589,6 +13860,20 @@ async function toolSync(args) {
     60000
   );
   const d = res.data || {};
+  // An exec that failed produces {ok:false, error}. Shaping that into the
+  // report below yields objectCount:0, lint:[], refs:[] — a clean bill of
+  // health for a document this never looked at, handed to the one call whose
+  // entire job is to say what changed while we were not looking. It read
+  // exactly like an empty document. Refuse instead.
+  if (d.ok === false || d.error) {
+    return {
+      error: "the turn check could not run: " + (d.error || "unknown"),
+      detail:
+        "This is NOT an empty or unchanged document — nothing was read. Do " +
+        "not describe the model or report it as healthy. Fix the bridge " +
+        "first: freecad_probe, then freecad_attach.",
+    };
+  }
   const full = String(args.detail || "") === "full";
   const nodeBudget = Math.max(1, Math.min(Number(args.limit) || 60, 400));
   const total = treeCount(d.tree);
@@ -10644,7 +13929,8 @@ async function toolSync(args) {
 
 async function toolEdit(args) {
   args = args || {};
-  if (!state.attached) return { error: "Not attached. Call freecad_attach first." };
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
   if (typeof args.python !== "string" || !args.python.trim()) {
     return { error: "python is required" };
   }
@@ -10681,10 +13967,13 @@ async function toolExec(args) {
   if (typeof args.python !== "string" || !args.python.trim()) {
     return { error: "python is required" };
   }
-  if (!state.attached) {
+  const att = await ensureAttached();
+  if (!att.attached) {
     return {
-      error: "Not attached. Call freecad_attach first — exec needs the bridge " +
+      error:
+        "Not attached. Call freecad_attach first — exec needs the bridge " +
         "and the interpreter, and attach is what proves both are up.",
+      detail: att.detail,
     };
   }
   try {
@@ -11237,6 +14526,68 @@ return {
         },
       },
       {
+        name: "freecad_render",
+        description:
+          "Snapshot the FreeCAD 3D viewport through FreeCAD's own renderer, " +
+          "Gui.ActiveDocument.ActiveView.saveImage(). The image comes back as " +
+          "an image, not as text, and does not depend on browser focus or on " +
+          "the WebRTC stream being visible. Pixels are for the human's sanity " +
+          "check — verify geometry with freecad_measure, and keep to about " +
+          "two views a turn. The camera is framed for the shot and put back " +
+          "where the human left it.",
+        displayMessage:
+          "📷 Rendering FreeCAD viewport" +
+          "{{#view}} · {{view}}{{/view}}" +
+          "{{#width}} ({{width}}x{{height}}){{/width}}",
+        tier: "safe",
+        inputSchema: {
+          type: "object",
+          properties: {
+            width: {
+              type: "number",
+              description: "Image width in pixels (default 800, max 3840).",
+            },
+            height: {
+              type: "number",
+              description: "Image height in pixels (default 600, max 2160).",
+            },
+            background: {
+              type: "string",
+              enum: ["Current", "White", "Black", "Transparent"],
+              description: "Viewport background color. Default 'Current'.",
+            },
+            view: {
+              type: "string",
+              enum: ["iso", "front", "rear", "top", "bottom", "left", "right"],
+              description: "Optional camera angle preset to frame before rendering.",
+            },
+            fit: {
+              type: "boolean",
+              description: "Whether to re-centre and fit all visible objects (default true).",
+            },
+            format: {
+              type: "string",
+              enum: ["png", "jpeg"],
+              description: "Image format: 'png' (default) or 'jpeg'.",
+            },
+            savePath: {
+              type: "string",
+              description:
+                "Optional. Also write the image to disk, as a bare filename " +
+                "or a path inside the bridge's export directory — anywhere " +
+                "else is refused, and the extension must match the format.",
+            },
+            restore: {
+              type: "boolean",
+              description:
+                "Put the camera back where the human had it once the shot is " +
+                "taken (default true). Pass false to leave the view framed.",
+            },
+            timeoutMs: { type: "number", description: "Default 60000." },
+          },
+        },
+      },
+      {
         name: "freecad_measure",
         description:
           "Measure the model: volume, area, bounding box, centre of mass, " +
@@ -11572,6 +14923,24 @@ return {
         case "freecad_export":
           result = await toolExport(args);
           break;
+        case "freecad_render": {
+          // The one tool whose payload is not text. Everything else in this
+          // switch falls through to JSON.stringify below, and a PNG that goes
+          // out that way is a wall of base64: invisible to the model, useless
+          // to the human, and ~100k tokens for the pair of them.
+          const shot = await toolRender(args);
+          if (shot && shot.ok && shot.imageData) {
+            const { imageData, ...meta } = shot;
+            return {
+              content: [
+                { type: "image", data: imageData, mimeType: shot.mimeType || "image/png" },
+                { type: "text", text: JSON.stringify(meta) },
+              ],
+            };
+          }
+          result = shot;
+          break;
+        }
         case "freecad_resolve":
           result = await toolResolve(args);
           break;

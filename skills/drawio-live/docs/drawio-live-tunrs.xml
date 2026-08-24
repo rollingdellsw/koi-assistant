@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="embed.diagrams.net">
+  <diagram name="Page-1" id="page-1">
+    <mxGraphModel dx="1037" dy="770" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="n.title" parent="1" style="text;html=1;strokeColor=#666666;fillColor=#f5f5f5;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=18;fontStyle=1;fontColor=#2C3E50;" value="&lt;b&gt;Turn-Based Human/AI Co-Editing Workflow&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:12px;font-weight:normal;color:#555;&quot;&gt;drawio-live sync → edit → verify loop&lt;/span&gt;" vertex="1">
+          <mxGeometry height="50" width="560" x="120" y="30" as="geometry" />
+        </mxCell>
+        <mxCell id="n.container_human" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3e5f5;strokeColor=#ab47bc;strokeWidth=2;verticalAlign=top;spacingTop=12;dashed=0;" value="&lt;b&gt;HUMAN TURN&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:11px;font-weight:normal;color:#6A1B9A;&quot;&gt;(unbounded edits)&lt;/span&gt;" vertex="1">
+          <mxGeometry height="320" width="260" x="50" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="n.human_edit" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ab47bc;fontSize=12;align=left;spacingLeft=10;shadow=1;" value="&lt;b&gt;User Edits Canvas Freely&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:10px;color:#444;&quot;&gt;• Drag, style, add, delete, resize&lt;br&gt;• Undo, redo, history revert&lt;/span&gt;" vertex="1">
+          <mxGeometry height="70" width="220" x="70" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="n.human_truth" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff9c4;strokeColor=#fbc02d;strokeWidth=1.5;fontSize=12;align=center;shadow=1;" value="&lt;b&gt;Canvas = Ground Truth&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:10px;color:#555;&quot;&gt;Authoritative diagram XML&lt;br&gt;stored locally in browser&lt;/span&gt;" vertex="1">
+          <mxGeometry height="60" width="220" x="70" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="n.human_view" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ab47bc;fontSize=12;align=left;spacingLeft=10;shadow=1;" value="&lt;b&gt;User Views Updated Canvas&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:10px;color:#444;&quot;&gt;• Synchronized GUI render&lt;br&gt;• Preserved user undo stack&lt;/span&gt;" vertex="1">
+          <mxGeometry height="70" width="220" x="70" y="330" as="geometry" />
+        </mxCell>
+        <mxCell id="n.container_ai" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e3f2fd;strokeColor=#1e88e5;strokeWidth=2;verticalAlign=top;spacingTop=12;dashed=0;" value="&lt;b&gt;AI TURN&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:11px;font-weight:normal;color:#1565C0;&quot;&gt;(one prompt execution)&lt;/span&gt;" vertex="1">
+          <mxGeometry height="320" width="260" x="470" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="n.ai_sync" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#1e88e5;fontSize=12;align=left;spacingLeft=10;shadow=1;" value="&lt;b&gt;1. SYNC: drawio_sync()&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:10px;color:#333;&quot;&gt;• Mandatory turn opener&lt;br&gt;• Adopts canvas &amp; computes userDiff&lt;/span&gt;" vertex="1">
+          <mxGeometry height="70" width="220" x="490" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="n.ai_edit" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#1e88e5;fontSize=12;align=left;spacingLeft=10;shadow=1;" value="&lt;b&gt;2. EDIT: drawio_ops()&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:10px;color:#333;&quot;&gt;• Targeted XML batch mutations&lt;br&gt;• drawio_apply() for full rebuilds&lt;/span&gt;" vertex="1">
+          <mxGeometry height="60" width="220" x="490" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="n.ai_verify" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#1e88e5;fontSize=12;align=left;spacingLeft=10;shadow=1;" value="&lt;b&gt;3. VERIFY: lint → route → screen&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:10px;color:#333;&quot;&gt;• Lint checks (overlaps, bounds)&lt;br&gt;• drawio_route() &amp; takeScreenshot()&lt;/span&gt;" vertex="1">
+          <mxGeometry height="70" width="220" x="490" y="330" as="geometry" />
+        </mxCell>
+        <mxCell id="e.h1" edge="1" parent="1" source="n.human_edit" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#ab47bc;strokeWidth=1.5;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="n.human_truth" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e.h2" edge="1" parent="1" source="n.human_truth" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#ab47bc;strokeWidth=1.5;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="n.human_view" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e.a1" edge="1" parent="1" source="n.ai_sync" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#1e88e5;strokeWidth=1.5;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="n.ai_edit" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e.a2" edge="1" parent="1" source="n.ai_edit" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#1e88e5;strokeWidth=1.5;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="n.ai_verify" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e.prompt" edge="1" parent="1" source="n.human_edit" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#1565C0;strokeWidth=2.5;fontStyle=1;fontSize=11;fontColor=#0D47A1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="n.ai_sync" value="prompt (text ± annotated capture)">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e.reply" edge="1" parent="1" source="n.ai_verify" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#2E7D32;strokeWidth=2.5;fontStyle=1;fontSize=11;fontColor=#1B5E20;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" target="n.human_view" value="reply + canvas">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

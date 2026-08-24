@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="embed.diagrams.net">
+  <diagram id="arch" name="FreeCAD Live Architecture">
+    <mxGraphModel dx="899" dy="770" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="ws" parent="1" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;strokeColor=#6c8ebf;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;fontStyle=1;fontSize=13;fontColor=#33608c;container=1;collapsible=0;movable=1;resizable=1;" value="&lt;font style=&quot;font-size: 14px;&quot;&gt;Your Workstation&lt;/font&gt;" vertex="1">
+          <mxGeometry height="280" width="320" x="40" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="tab" parent="ws" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;arcSize=8;" value="&lt;b&gt;Browser tab&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;the FreeCAD desktop&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="260" x="30" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="koi" parent="ws" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;arcSize=8;" value="&lt;b&gt;Chrome + Koi Assistant&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;freecad-live skill&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="260" x="30" y="181" as="geometry" />
+        </mxCell>
+        <mxCell id="host" parent="1" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;strokeColor=#82b366;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;fontStyle=1;fontSize=13;fontColor=#4d7a3a;container=1;collapsible=0;movable=1;resizable=1;" value="&lt;font style=&quot;font-size: 14px;&quot;&gt;Linux host&amp;nbsp; (WSL2 or remote)&lt;/font&gt;" vertex="1">
+          <mxGeometry height="280" width="460" x="460" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="srv" parent="host" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;spacingTop=8;arcSize=6;container=1;collapsible=0;movable=1;resizable=1;" value="&lt;b&gt;FreeCAD WebRTC server&lt;/b&gt; (container)&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;from official FreeCAD release, streamed&lt;/font&gt;" vertex="1">
+          <mxGeometry height="215" width="400" x="30" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="bridge" parent="srv" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;arcSize=10;" value="&lt;b&gt;koi_bridge.py&lt;/b&gt;&amp;nbsp; (in-process)" vertex="1">
+          <mxGeometry height="54" width="320" x="40" y="137" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="srv" style="endArrow=block;startArrow=block;html=1;rounded=0;strokeColor=#6c8ebf;strokeWidth=2;fontSize=11;fontStyle=1;exitX=0;exitY=0.2;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" target="tab" value="3001&amp;nbsp; TLS">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="bridge" style="endArrow=block;startArrow=block;html=1;rounded=0;strokeColor=#d79b00;strokeWidth=2;fontSize=11;fontStyle=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" target="koi" value="8765&amp;nbsp; HTTP">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

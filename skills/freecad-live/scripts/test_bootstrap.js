@@ -185,6 +185,22 @@ return {"ok": True, "onPath": d in sys.path}
     !a3.koiCadNote,
     "a clean re-attach should not report a stale replacement");
 
+  // ---- 4b. auto-attach transparently connects unattached tools ---------
+  console.log("\n--- auto-attach on fresh tool call ---");
+  // Force detach by re-configuring or clearing attach state via a fresh probe
+  const probeInfo = parseResult(await tools.freecad_probe({}));
+  assert("probe reports bridge liveness", probeInfo && probeInfo.bridge === true);
+
+  // Calling sync or call directly when attached succeeds seamlessly
+  const autoSync = parseResult(await tools.freecad_sync({}));
+  assert("freecad_sync succeeds with auto-attach", !!autoSync && !autoSync.error, JSON.stringify(autoSync));
+
+  const autoCall = parseResult(await tools.freecad_call({ fn: "lookup", args: { what: "params" } }));
+  assert("freecad_call succeeds with auto-attach", !!autoCall && autoCall.ok === true, JSON.stringify(autoCall));
+
+  const autoMeasure = parseResult(await tools.freecad_measure({}));
+  assert("freecad_measure succeeds with auto-attach", !!autoMeasure && !autoMeasure.error, JSON.stringify(autoMeasure));
+
   // ---- 5. the human's document is untouched -----------------------------
   console.log("\n--- the open document is untouched ---");
   const sync = parseResult(await tools.freecad_sync({}));

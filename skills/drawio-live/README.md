@@ -1,11 +1,11 @@
-# drawio-live — Turn-Based Diagram Co-Editing Skill
+# drawio-live — Turn-Based Diagram Co-Editing Skill for Koi™ Assistant
 
 `drawio-live` enables turn-based human/AI co-editing of draw.io diagrams directly inside a live browser tab. The AI interacts with the canvas through structured XML mutations and layout operations, while the human user edits freely in the GUI. Both sides stay in sync through automated turn boundaries and text-based delta diffing.
 
 <div align="center">
-  <img src="./screenshot.png" width="100%" alt="Opus 5 generates the diagram">
+  <img src="./docs/screenshot.png" width="100%" alt="Opus 5 generates the diagram">
   <br>
-  <img src="./sample.drawio.png" width="100%" alt="The sequence diagram of this drawio-live skill">
+  <img src="./docs/sample.drawio.png" width="100%" alt="The sequence diagram of this drawio-live skill">
   <br>
   <em>Koi helps you to understand a project in a highly efficient way.</em>
 </div>
@@ -16,29 +16,9 @@
 
 ### Components Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ Browser Tab (Host Window)                                               │
-│                                                                         │
-│  ┌──────────────────────────┐         ┌────────────────────────────┐    │
-│  │ Host Tab [MAIN World]    │         │ Koi AI Assistant           │    │
-│  │  __koiDrawio Bridge:     │         │  LLM Session               │    │
-│  │  · <iframe> contentWindow│         │  drawio_* MCP Tools        │    │
-│  │  · postMessage IPC log   │         └─────────────┬──────────────┘    │
-│  │  · monotonic event queue │                       │                   │
-│  │  ┌────────────────────┐  │         ┌─────────────▼──────────────┐    │
-│  │  │ <iframe> 100vw/vh  │  │         │ MCP Server                 │    │
-│  │  │ embed.diagrams.net │  │         │  mcp/drawio_mcp.js         │    │
-│  │  │  ?embed=1          │  │◀──────▶ │  · Session state (base,    │    │
-│  │  │  &proto=json       │  │ evaluate│    history, rev)           │    │
-│  │  │                    │  │ Script  │  · Canonical XML differ    │    │
-│  │  │ draw.io editor UI  │  │         │  · Ops mutation engine     │    │
-│  │  └────────────────────┘  │         │  · ELK layout & router     │    │
-│  └──────────────────────────┘         └────────────────────────────┘    │
-│         ▲                                                               │
-│         │ postMessage JSON IPC (local  in-memory protocol)              │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+<div align="center">
+  <img src="./docs/drawio-component.png" width="100%" alt="Components Overview">
+</div>
 
 - **Canvas (`<iframe>`)**: Full draw.io web editor loaded in embed mode (`?embed=1&proto=json`). Provides the full interactive GUI for human edits.
 - **Bridge (MAIN World Script)**: Installed in the host tab by `drawio_init`. Intercepts and logs `postMessage` JSON RPC events between the host window and the draw.io iframe.
@@ -63,18 +43,9 @@
 
 Co-editing follows a **Sync → Edit → Verify** loop for every turn:
 
-```
-        HUMAN TURN (unbounded)                    AI TURN (one prompt)
- ┌──────────────────────────────┐   prompt   ┌──────────────────────────────┐
- │ User edits canvas freely     │  ───────▶  │ 1. SYNC: drawio_sync()       │
- │ (drag, style, add, delete,   │  (text ±   │    → adopts live canvas      │
- │  undo, redo, revert...)      │  annotated │    → generates userDiff      │
- │                              │   capture) │ 2. EDIT: drawio_ops()        │
- │ Canvas = Ground Truth        │            │    → targeted XML mutations  │
- │                              │  ◀───────  │ 3. VERIFY: lint → route →    │
- │ User views updated canvas    │   reply +  │    takeScreenshot()          │
- └──────────────────────────────┘   canvas   └──────────────────────────────┘
-```
+<div align="left">
+  <img src="./docs/drawio-turns.png" width="80%" alt="Turn by turn editing">
+</div>
 
 1. **Sync (`drawio_sync()`)**: Mandatory turn opener. Exports live canvas XML, canonicalizes it, adopts it as the editing base, and returns `userDiff` reporting what the user changed.
 2. **Edit (`drawio_ops({ops})` / `drawio_apply({xml})`)**:
@@ -95,28 +66,14 @@ nothing in the skill hardcodes `embed.diagrams.net` any more.
 
 Resolution order, highest priority first:
 
-| Source                                                  | Scope                    | Use it for                                            |
-| ------------------------------------------------------- | ------------------------ | ----------------------------------------------------- |
-| `canvasUrl` skill parameter (Run dialog / `--param`)    | One run                  | Trying an instance, or switching per session          |
-| `drawio_config({canvasUrl})`                            | Rest of the session      | Programmatic callers; what the scripts use internally |
-| `canvas-url:` on the `drawio_bridge` server in SKILL.md | Every run of the install | Pinning a deployment for a team                       |
-| built-in default                                        | —                        | `https://embed.diagrams.net/`                         |
+| Source                                               | Scope   | Use it for                                   |
+| ---------------------------------------------------- | ------- | -------------------------------------------- |
+| `canvasUrl` skill parameter (Run dialog / `--param`) | One run | Trying an instance, or switching per session |
+| built-in default                                     | —       | `https://embed.diagrams.net/`                |
 
 A bare origin is enough — the embed query (`?embed=1&proto=json&...`) is
 appended. A URL that already contains `embed=1` is used verbatim, which is the
 escape hatch for an instance that needs unusual parameters.
-
-Related keys on the same server block in `SKILL.md`:
-
-| Key                 | Default                                    | Meaning                                                            |
-| ------------------- | ------------------------------------------ | ------------------------------------------------------------------ |
-| `host-url`          | same origin as the canvas                  | Page that frames the canvas; must be scriptable and permit framing |
-| `canvas-hosts`      | configured host + diagrams.net + localhost | Hostnames the bridge may attach to. Set it to tighten the list     |
-| `layout-engine`     | `elk`                                      | `mx` for a build without the ELK plugin (see below)                |
-| `layout-settle-ms`  | 600                                        | Raise on a slow instance if layouts read back mid-animation        |
-| `layout-timeout-ms` | 20000                                      | Raise for very large diagrams                                      |
-
-`drawio_config()` with no arguments reports what the session resolved.
 
 ### Local Host (Air-Gapped / Offline Setup)
 
@@ -128,12 +85,4 @@ cd drawio/src/main/webapp
 python3 -m http.server 7080
 ```
 
-Then run the skill with `canvasUrl` set to `http://localhost:7080`, or pin it:
-
-```yaml
-mcp-servers:
-  - name: drawio_bridge
-    script: mcp/drawio_mcp.js
-    canvas-url: http://localhost:7080
-    layout-engine: mx # most self-hosted builds ship without the ELK plugin
-```
+Then run the skill with `canvasUrl` set to `http://localhost:7080`.

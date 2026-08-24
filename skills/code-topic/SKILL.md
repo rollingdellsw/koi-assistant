@@ -18,6 +18,7 @@ prerequisites:
 parameters:
   - name: goal
     description: The engineering task, in plain language. Say what "done" looks like — build/tests green, which pages or behaviors must work. The directory goes in `project_path`, not here. The planner will ask about anything genuinely ambiguous (scope, fidelity bar, data source) before work starts.
+    prompt: true
     required: true
   - name: budget_cap
     description: Maximum total tokens to spend across all worker/judge/curator sessions before pausing to ask whether to continue. Plain integer (e.g. 10000000 for 10M). Defaults to 10000000.

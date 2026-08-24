@@ -7,6 +7,7 @@ allowed-tools:
 parameters:
   - name: goal
     description: The task to run, in plain language. Be as specific as you like about what "done" looks like and what to collect — the judge uses it to decide when to stop.
+    prompt: true
     required: true
   - name: budget_cap
     description: Maximum total tokens to spend across all worker/judge/curator sessions before pausing to ask whether to continue. Plain integer (e.g. 10000000 for 10M). Defaults to 10000000. On reaching the cap the runner asks the user whether to extend.

@@ -643,7 +643,32 @@ return {"ok": True, "visible": None if o is None else bool(o.Visibility)}
     assert("and the half really has not moved: it is still the old volume",
       halfNow && halfNow.shape && near(halfNow.shape.volume, wantHalf, 1e-3),
       JSON.stringify((halfNow || {}).shape));
+
+    // Re-running split_body updates FeatureBase shapes in place and preserves downstream DAG
+    const resplit = await call("split_body", {
+      target: "body.bar", plane: "XZ", offset: CUT_AT, gap: KERF,
+      ids: ["bar.a", "bar.b"], labels: ["BarLower", "BarUpper"],
+    }, "split.bar");
+    assert("re-running split_body updates existing halves in place",
+      resplit && resplit.ok === true && (resplit.result || {}).updated === true,
+      JSON.stringify({ ok: (resplit || {}).ok, error: (resplit || {}).error, res: resplit.result }));
+
+    const staleAfter = ((resplit || {}).lint || [])
+      .filter((w) => w.code === "split-stale");
+    assert("and re-running split_body clears the split-stale lint",
+      staleAfter.length === 0, JSON.stringify(staleAfter));
+
+    const halfGrown = await get("bar.a");
+    const wantHalfGrown = BAR_W * (BAR_T + 6) * (BAR_H - CUT_AT - KERF / 2);
+    assert("and the updated half reflects the new source volume",
+      halfGrown && halfGrown.shape && near(halfGrown.shape.volume, wantHalfGrown, 1e-3),
+      JSON.stringify({ got: (halfGrown || {}).shape, want: wantHalfGrown }));
+
     await call("feature_edit", { target: "pad.bar", props: { Length: BAR_T } });
+    await call("split_body", {
+      target: "body.bar", plane: "XZ", offset: CUT_AT, gap: KERF,
+      ids: ["bar.a", "bar.b"], labels: ["BarLower", "BarUpper"],
+    }, "split.bar");
   }
 
   // ======================================================================

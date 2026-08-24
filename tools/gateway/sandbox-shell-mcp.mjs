@@ -839,14 +839,53 @@ function overlayPressureMeta() {
   };
 }
 
+
+/**
+ * Look up the directory hierarchy starting from startPath to find the root
+ * containing a .git directory (or file for worktrees/submodules).
+ * If no .git is found, returns null.
+ */
+function findGitRoot(startPath) {
+  if (!startPath) return null;
+  let curr = path.resolve(startPath);
+  try {
+    const st = fs.statSync(curr);
+    if (!st.isDirectory()) curr = path.dirname(curr);
+  } catch {
+    curr = path.dirname(curr);
+  }
+
+  while (curr && curr !== path.dirname(curr)) {
+    const gitPath = path.join(curr, '.git');
+    try {
+      if (fs.existsSync(gitPath)) {
+        return curr;
+      }
+    } catch { /* ignore */ }
+    const parent = path.dirname(curr);
+    if (parent === curr) break;
+    curr = parent;
+  }
+  return null;
+}
+
 function setProject(projectPath, { resume = null, fresh = false, label = null } = {}) {
   let expandedPath = projectPath;
-  if (expandedPath === '~') {
+  if (!expandedPath || expandedPath.trim() === '') {
+    expandedPath = findGitRoot(process.cwd()) || process.cwd() || os.homedir();
+  } else if (expandedPath === '~') {
     expandedPath = os.homedir();
   } else if (expandedPath.startsWith('~/')) {
     expandedPath = path.join(os.homedir(), expandedPath.slice(2));
   }
-  const p = path.resolve(expandedPath);
+  let p = path.resolve(expandedPath);
+  const gitRoot = findGitRoot(p);
+  if (gitRoot) {
+    if (gitRoot !== p) {
+      log(`resolved project path ${p} up to git root: ${gitRoot}`);
+    }
+    p = gitRoot;
+  }
   // Whether the project already exists on the host decides two things WITHOUT
   // ever mutating the host tree:
   //   hostAbsent  -> the path does not exist. We must NOT create it on the host

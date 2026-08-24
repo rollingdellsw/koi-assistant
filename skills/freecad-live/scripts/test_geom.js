@@ -707,11 +707,17 @@ return {"ok": True, "present": doc.getObject("${doomedName}") is not None}
 
   const vs = await call("view_set", { preset: "iso", fit: true }, null);
   assert("view_set reports whether the camera actually moved",
-    vs && vs.ok === true && (vs.result || {}).applied !== undefined,
+    vs && vs.ok === true && (vs.result || {}).applied === true,
     JSON.stringify(vs.result || vs).slice(0, 200));
   if ((vs.result || {}).applied !== true) {
     note("the camera did not move", (vs.result || {}).error);
   }
+
+  for (const preset of ["front", "top", "right", "left", "rear", "bottom", "iso"]) {
+    const v = await call("view_set", { preset, fit: true }, null);
+    assert(`view_set applies preset '${preset}'`, v && v.ok === true && (v.result || {}).applied === true);
+  }
+
   await refused("view_set refuses an unknown preset",
     "view_set", { preset: "sideways" }, null, "preset must be");
 

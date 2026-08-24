@@ -47,6 +47,13 @@ const BLOCKED_EXEC_COMMANDS = [
     message:
       'Do not run long-lived dev servers or watchers using sandbox_exec (the process will die). Use sandbox_start_service instead',
   },
+  // Unresolved placeholder strings like <base> or <sha> in git format-patch / git diff.
+  {
+    pattern: /(?:^|[;&|]\s*)git\s+(?:format-patch|diff)\b.*<[a-zA-Z_-]+>/,
+    message:
+      'Do not use literal placeholder strings like <base> or <sha> in git format-patch / diff. ' +
+      'Resolve the exact base commit SHA (e.g. via git rev-parse HEAD at session start) first',
+  },
   // Piping the network straight into a shell defeats the point of the sandbox.
   {
     pattern: /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b/,
