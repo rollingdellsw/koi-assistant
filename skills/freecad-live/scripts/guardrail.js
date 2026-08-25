@@ -57,12 +57,25 @@ const seenRefs = new Set();
 const WRITE_TOOLS = new Set([
   "freecad_call",
   "freecad_script",
+  // Both run through the same envelope as freecad_call -- they are writes
+  // that happen to be spelled as their own tool -- so they carry `applied`,
+  // guiSync and lint, and they carry the two verdicts most likely to be
+  // skimmed past: an operation that generated no toolpath, and a solve whose
+  // peak stress is a property of the mesh rather than of the part.
+  "freecad_cam",
+  "freecad_fem",
   // Probe-stage only (probe-exec: on). Still runs inside the envelope, so it
   // still reports guiSync and lint and is still worth hoisting.
   "freecad_edit",
   // freecad_exec is deliberately NOT here: it runs OUTSIDE the envelope, so
   // its result carries no `applied` and envelopeOf() could never match it.
 ]);
+
+// Read-only tools whose reply is a REPORT rather than an envelope: no
+// `applied`, no lint, no undo. They still carry a verdict that decides whether
+// a part is fit to hand to anybody, so they are hoisted through the same
+// single field -- just without the applied gate.
+const REPORT_TOOLS = new Set(["freecad_dfm"]);
 
 // Results worth harvesting refs from. freecad_resolve is included only when
 // the caller asked for the user's selection: its `refs` argument is documented
@@ -158,13 +171,44 @@ function lintCodes(env) {
 }
 
 const LOUD_LINT =
-  /^(removed-nothing|removed-at-profile|split-stale|non-stock|thread-engagement|modelled-thread|added-nothing|empty-intersection)/;
+  /^(removed-nothing|removed-at-profile|split-stale|fem-stale|fem-target-gone|non-stock|thread-engagement|modelled-thread|added-nothing|empty-intersection)/;
+
+// Where a finding actually sits.
+//
+// This is the bug that made half of the branches below dead code. The envelope
+// puts the op's own return value under `result`, so guiSync, lint, refsBroken
+// and undoEntries are top-level while bindingNote, constraintsLost, notDrawn
+// and every cam or fem verdict are one or two levels down. Reading only the
+// top level meant the loudest hoists in this file never fired once.
+function roots(env) {
+  const out = [env];
+  const r = env && env.result;
+  if (r && typeof r === "object" && !Array.isArray(r)) {
+    out.push(r);
+    // cam mode 'op' reports under `operation`; fem reports the stress field
+    // under `field`. One more level, named rather than walked: a generic deep
+    // scan would start matching the word "stale" inside prose.
+    for (const k of ["operation", "field", "refined"]) {
+      const v = r[k];
+      if (v && typeof v === "object" && !Array.isArray(v)) out.push(v);
+    }
+  }
+  return out;
+}
+
+function pick(env, key) {
+  for (const r of roots(env)) {
+    if (r && Object.prototype.hasOwnProperty.call(r, key)) return r[key];
+  }
+  return undefined;
+}
 
 function findings(env) {
   const out = [];
   const push = (what) => {
     if (out.indexOf(what) === -1) out.push(what);
   };
+  const at = (k) => pick(env, k);
 
   for (const code of lintCodes(env)) {
     if (LOUD_LINT.test(code)) {
@@ -176,64 +220,158 @@ function findings(env) {
     }
   }
 
-  if (env.bindingNote) {
+  if (at("bindingNote")) {
     push(
       "bindingNote — at least one dimension stayed a LITERAL and will not " +
       "follow the parameter. Do not report this as parametric."
     );
   }
-  if (env.bindingVerified === false) {
+  if (at("bindingVerified") === false) {
     push(
       "bindingVerified:false — the positions are literals, so a swap will " +
       "not move them. Say so instead of reporting a parametric pattern."
     );
   }
-  if (env.constraintsLost) {
+  if (at("constraintsLost")) {
     push(
-      "constraintsLost:" + env.constraintsLost + " — deleting geometry also " +
+      "constraintsLost:" + at("constraintsLost") + " — deleting geometry also " +
       "deleted the constraints that used it. The sketch still solves, at the " +
       "wrong shape."
     );
   }
-  if (env.rehealedExternal) {
+  if (at("rehealedExternal")) {
     push(
       "rehealedExternal — a projection's reference moved and was re-derived. " +
       "Compare the constraint count before and after; if constraints were " +
       "lost, the sketch is the wrong shape until somebody looks at it."
     );
   }
-  if (env.rehealed) {
+  if (at("rehealed")) {
     push(
       "rehealed — a stored query was re-run and the edges were RE-DERIVED, " +
       "not preserved. Check what the feature now touches before reporting it."
     );
   }
-  if (Array.isArray(env.refsBroken) && env.refsBroken.length) {
+  if (Array.isArray(at("refsBroken")) && at("refsBroken").length) {
     push(
-      "refsBroken:" + env.refsBroken.join(", ") + " — this edit broke a " +
+      "refsBroken:" + at("refsBroken").join(", ") + " — this edit broke a " +
       "reference the USER picked. Name it and ask them to re-pick. Do not " +
       "choose a replacement."
     );
   }
-  if (Array.isArray(env.unregisteredObjects) && env.unregisteredObjects.length) {
+  if (Array.isArray(at("unregisteredObjects")) && at("unregisteredObjects").length) {
     push(
-      "unregisteredObjects:" + env.unregisteredObjects.length + " — a script " +
+      "unregisteredObjects:" + at("unregisteredObjects").length + " — a script " +
       "created objects with no id. A later turn cannot address them and will " +
       "have to rebuild rather than edit. Register them: " +
       "koi.register(doc, '<id>', obj)."
     );
   }
-  if (Array.isArray(env.notDrawn) && env.notDrawn.length) {
+  if (Array.isArray(at("notDrawn")) && at("notDrawn").length) {
     push(
-      "notDrawn:" + env.notDrawn.join(", ") + " — these are NOT on screen, " +
+      "notDrawn:" + at("notDrawn").join(", ") + " — these are NOT on screen, " +
       "whatever `already` or Visibility says. Do not describe what the model " +
       "looks like until they are drawn."
     );
   }
-  if (env.singleUndo === false) {
+  if (at("singleUndo") === false) {
     push(
       "singleUndo:false — one Ctrl+Z will not put this back. Tell the user " +
       "the undo cost rather than letting them discover it."
+    );
+  }
+
+  // ---- can it be made -----------------------------------------------------
+  const mfg = at("manufacturable");
+  if (mfg === false) {
+    push(
+      "manufacturable:false — this is a refusal, not a tolerance to " +
+      "negotiate. Name the finding, say what it costs, and say what change " +
+      "clears it before building anything else on the part."
+    );
+  } else if (mfg === null) {
+    push(
+      "manufacturable:null — a check did NOT run. Report it as unfinished. " +
+      "A check that did not run is not a pass."
+    );
+  }
+  const empties = at("emptyOperations");
+  if (Array.isArray(empties) && empties.length) {
+    push(
+      "emptyOperations:" + empties.join(", ") + " — these generated ZERO " +
+      "path commands. They recompute clean and show nothing on screen, and " +
+      "they mean the workbench could not machine that feature with that " +
+      "tool. Do not report the job as verified."
+    );
+  }
+  if (at("machinable") === false) {
+    push(
+      "machinable:false — the CAM workbench could not cut this. Believe it " +
+      "over the state flags and over any render."
+    );
+  }
+  if (at("rapidsBelowClearance")) {
+    push(
+      "rapidsBelowClearance — a lateral G0 under the clearance height is a " +
+      "rapid THROUGH stock. That G-code does not go to a machine."
+    );
+  }
+
+  // ---- does it survive the load ------------------------------------------
+  if (at("solved") === false) {
+    push(
+      "solved:false — the solver produced no readable field. Report a failed " +
+      "solve; do not describe the part as passing."
+    );
+  }
+  if (at("singularitySuspect") === true) {
+    push(
+      "singularitySuspect — the peak stress sits on a SHARP internal corner, " +
+      "where the linear elastic stress is unbounded: refine the mesh and it " +
+      "rises forever. That peak is a property of the mesh, not of the part. " +
+      "Quote the p99 instead, say the peak was discarded and why, and offer " +
+      "the fillet."
+    );
+  }
+  if (at("solved") === true && at("converged") === null) {
+    push(
+      "converged:null — this was solved ONCE, so whether the answer depends " +
+      "on the mesh is unknown. Report it as an unfinished check, the same " +
+      "way manufacturable:null is reported, or run mode 'converge'."
+    );
+  }
+  if (at("converged") === false) {
+    push(
+      "converged:false — the field moved between the two meshes, so the " +
+      "number depends on the mesh. Quote it as an estimate or refine again."
+    );
+  }
+  if (at("solved") === true && at("factorOfSafety") === null) {
+    push(
+      "factorOfSafety:null — this is a refusal with a reason attached, never " +
+      "a pass. Say which reason: a singular peak, or a material whose yield " +
+      "is not one number."
+    );
+  }
+  if (at("yields") === true) {
+    push(
+      "yields — the peak von Mises stress EXCEEDS yield: the part yields " +
+      "under the load as modelled. Say so plainly."
+    );
+  }
+  if (at("displacementImplausible")) {
+    push(
+      "displacementImplausible — the deflection is a large fraction of the " +
+      "part's own size, so this is outside the small-displacement assumption " +
+      "the solve is built on. The usual cause is a MISSING RESTRAINT, not a " +
+      "bendy part. Check the restraints before reading anything else."
+    );
+  }
+  if (at("stale") === true) {
+    push(
+      "stale:true — the geometry changed after this was solved. These " +
+      "numbers describe the OLD shape. Re-mesh and re-solve before " +
+      "repeating any of them."
     );
   }
 
@@ -266,8 +404,13 @@ module.exports = {
       const wanted = refsIn(text);
       if (!wanted.size) return { allowed: true };
 
+      const isKnown = (r) =>
+        seenRefs.has(r) ||
+        seenRefs.has(r.replace(/\./g, "_")) ||
+        seenRefs.has(r.replace(/_/g, "."));
+
       const invented = [];
-      for (const r of wanted) if (!seenRefs.has(r)) invented.push(r);
+      for (const r of wanted) if (!isKnown(r)) invented.push(r);
       if (!invented.length) return { allowed: true };
 
       return {
@@ -307,27 +450,36 @@ module.exports = {
         echoed = refsIn(JSON.stringify((ctx.tool && ctx.tool.args) || {}));
       } catch (_) {}
       for (const r of refsIn(rawText(ctx.result.content))) {
-        if (!echoed.has(r)) seenRefs.add(r);
+        if (!echoed.has(r)) {
+          seenRefs.add(r);
+          if (r.includes("_")) seenRefs.add(r.replace(/_/g, "."));
+          if (r.includes(".")) seenRefs.add(r.replace(/\./g, "_"));
+        }
       }
     }
 
     if (ctx.result.isError) return { override: false };
 
     const tool = ctx.tool && ctx.tool.name;
-    if (!WRITE_TOOLS.has(tool)) return { override: false };
+    const isReport = REPORT_TOOLS.has(tool);
+    if (!WRITE_TOOLS.has(tool) && !isReport) return { override: false };
 
     const res = parseResult(ctx);
-    const env = envelopeOf(res);
+    // A report tool has no envelope by design, so it is scanned as itself.
+    const env = isReport
+      ? (res && typeof res === "object" ? res : null)
+      : envelopeOf(res);
     if (!env) return { override: false };
 
     // An aborted edit changed nothing, so a stale view is not a lie about it,
     // and its lint describes a document state that was rolled back.
-    if (env.applied !== true) return { override: false };
+    if (!isReport && env.applied !== true) return { override: false };
 
     const notes = findings(env);
 
-    // guiSync is present ONLY when the refresh failed. Absent is healthy.
-    if (env.guiSync) {
+    // guiSync is present ONLY when the refresh failed. Absent is healthy, and
+    // a read-only report has no viewport claim to be stale about.
+    if (!isReport && env.guiSync) {
       staleRun += 1;
       env.guiStale = true;
       env.guiStaleNote = STALE_NOTE;
@@ -342,7 +494,7 @@ module.exports = {
           "referring to the stream at all until it recovers.";
         notes.unshift(env.guiStaleEscalation);
       }
-    } else {
+    } else if (!isReport) {
       staleRun = 0;
     }
 

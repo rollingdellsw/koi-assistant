@@ -6,7 +6,36 @@ Human/AI co-design on **one** live FreeCAD document: you drive the GUI in a
 browser tab, the agent drives the same document through a bridge, in the same
 interpreter, on the same undo stack.
 
-This skill provides a minimal yet complete toolset for AI to perform pure CAD work, omitting CAE/FEM and CAM modules.
+This skill provides a minimal yet complete toolset for AI to perform CAD work,
+plus enough CAM to answer the question CAD cannot: **can this actually be
+made?** A part can be dimensionally perfect, recompute clean, pass interference
+and weigh exactly what the bill of materials says, and still be a shape no
+cutter can produce — an internal corner with a zero radius is valid geometry
+and does not exist in metal. So the skill measures manufacturability rather
+than asserting it: corner radii against real cutter sizes, tool reach per setup
+direction, undercuts, enclosed voids, and the volume of material no cutter can
+reach. Where the FreeCAD CAM workbench is available it will also build a real
+machining Job and generate the toolpaths, because an operation that produces
+zero path commands is the workbench saying it could not cut that feature — and
+that is a fact no language model can supply.
+
+It answers the other question CAD cannot, on the same terms. Asked whether a
+3 mm wall is strong enough, a language model will produce a confident sentence,
+and the user cannot tell that apart from a number. So where gmsh and CalculiX
+are installed the skill runs a real **linear static solve** and reports a
+measured stress — or refuses. A model with no restraint, no load or no volume
+elements is rejected before the solver runs, because each of those returns a
+plausible number that means nothing. A peak stress sitting on a sharp internal
+corner is reported as the singularity it is rather than as a stress, and no
+factor of safety is divided out of it. Solved once, `converged` comes back
+`null`: one mesh is one number with no error bar.
+
+Most of CAM is still out of scope: no simulation of material removal, no work
+holding or fixtures, no speeds, feeds or cycle time, and the G-code that comes
+out is machine-specific and unverified. The FEM is linear static and nothing
+else — no contact, plasticity, buckling, fatigue, dynamics or thermal — so what
+it produces is evidence, never a certificate. See §12 of `SKILL.md` for the
+full list of what is deliberately absent.
 
 Click to watch a 30s demo:
 [![Watch a 30s demo](./docs/demo.png)](https://www.youtube.com/watch?v=4SxjvQZKdXU)
@@ -42,8 +71,9 @@ a directory bind-mounted onto the host.
 
 **The freecad-live skill.** The Koi side. It speaks to the bridge, reads the
 document every turn, edits through a validated call whitelist inside a
-transaction envelope, measures results instead of trusting them, and pins the
-exact FreeCAD build it is talking to.
+transaction envelope, measures results instead of trusting them, checks that
+the result can be manufactured before it leaves the session, and pins the exact
+FreeCAD build it is talking to.
 
 **Ports.** All three published on host loopback only. The scheme follows the
 port: `https://` works on 3001 and nowhere else; the bridge on 8765 is plain
@@ -57,7 +87,7 @@ HTTP by design.
 
 **Verified on:** Windows 11 + WSL2 Ubuntu 22.04 (server on the same machine as
 Chrome) **and** a standalone Ubuntu 24.04 server reached over SSH. Both work;
-the only difference is Step 6.
+the only difference is Step 5.
 
 ---
 
@@ -65,6 +95,20 @@ the only difference is Step 6.
 
 Everything below runs **on the Linux host** unless a step says otherwise.
 Requirements: a 64-bit CPU, Podman 4.9.3+ rootless (or Docker). No GPU needed.
+
+### Prerequisites
+
+- Podman 4.9.3+ rootless (or Docker)
+- Configured subuids/subgids for rootless namespace:
+
+```bash
+# Check if subuids/subgids exist for your user:
+grep $USER /etc/subuid /etc/subgid
+
+# If missing, add them and migrate (requires sudo):
+sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
+podman system migrate
+```
 
 ## Step 1: Directories and credentials
 
@@ -117,21 +161,7 @@ Every `podman run` below reads this file with `--env-file`. Do **not** pass
 these with `-e NAME=value`: that puts the secret in the container's argv, where
 any local account reads it out of `ps aux` and `podman inspect`.
 
-## Step 2: Pin the image
-
-Resolve the digest once, and use the digest — not `:latest` — everywhere below.
-
-```bash
-podman image inspect docker.io/linuxserver/freecad:latest --format '{{index .RepoDigests 0}}'
-docker.io/linuxserver/freecad@sha256:13907f44a4425a5847a191eebd492e5ed85001044949b012c7ee70ce91c1aa50
-```
-
-`:latest` plus `Restart=always` means the FreeCAD under your agent can change
-overnight — new OCCT, new toponaming behaviour, a different set of workbenches
-— with no deploy on your side. (The skill pins the build a second time, from
-inside the process; see Part II.)
-
-## Step 3: Start the server
+## Step 2: Start the server
 
 ```bash
 podman run -d \
@@ -167,10 +197,10 @@ Two flags that look wrong and are not:
   the default rootless mapping (UID 0 → host user) to set internal permissions.
 
 **Verify:** `podman logs -f freecad-stream` should settle without errors, then
-continue to Step 4 (if the server is on this machine) or Step 6 first (if it is
+continue to Step 4 (if the server is on this machine) or Step 5 first (if it is
 remote).
 
-## Step 4: Open the stream and verify FreeCAD
+## Step 3: Open the stream and verify FreeCAD
 
 Get the login, then open the page:
 
@@ -184,7 +214,7 @@ PASSWORD=ca83a64e1feee09622b2858966289d4edc57c5e5c4c81b2c
 ```
 
 Browse to **`https://localhost:3001`** and log in with those. (Remote host: set
-up the tunnel in Step 6 first — the URL stays `localhost:3001`.)
+up the tunnel in Step 5 first — the URL stays `localhost:3001`.)
 
 The certificate is self-signed, so the browser warns. Over a loopback tunnel
 that is expected and the traffic is already inside SSH. Do not make a habit of
@@ -208,33 +238,31 @@ WebRTC applies automatic UI scaling by default. For a crisp 1:1 display:
   <br>
 </div>
 
-## Step 5: Install and start the bridge
+## Step 4: Install and start the bridge
 
-### 5.1 Copy `koi_bridge.py` into FreeCAD's macro directory
+### 4.1 Copy `koi_bridge.py` into FreeCAD's macro directory
 
 ```bash
-# Readable by group and others, writable by neither. Everything under this
-# directory is Python that FreeCAD executes on startup — Macro/ and
-# Mod/*/InitGui.py both — so o+w here hands code execution as you to any local
-# account on the host. (An earlier version of this guide used
-# `u+rwX,g+rwX,o+rwX`. If you ran it, run this to undo it.)
-podman unshare chmod -R u+rwX,go+rX ~/freecad-stream/config/.local/share/FreeCAD
-mkdir -p ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro
+podman unshare mkdir -p ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro
 ```
 
-Copy it out of the skill (adjust the host if the server is remote):
+Copy it out of the skill:
 
 ```bash
+# Local host (from repo root):
+podman unshare cp skills/freecad-live/tools/koi_bridge.py ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro/
+
+# Remote host:
 rsync -av skills/freecad-live/tools/koi_bridge.py \
   $USER@192.168.68.113:~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro/
 ```
 
-### 5.2 Start it manually first
+### 4.2 Start it manually first
 
 Create a wrapper macro on the server:
 
 ```bash
-cat << 'EOF' >  ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro/koi_start.FCMacro
+cat << 'EOF' | podman unshare tee ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro/koi_start.FCMacro > /dev/null
 import os
 os.environ.setdefault("KOI_BRIDGE_HOST", "0.0.0.0")
 os.environ.setdefault("KOI_EXPORT_DIR", "/workspace/koi_export")
@@ -249,6 +277,10 @@ EOF
 ```
 
 In the streamed FreeCAD GUI: **Macro → Macros… → `koi_start` → Execute**.
+
+> **Tip for debugging in FreeCAD**:
+> If nothing happens or the curl test fails, enable the output panels in FreeCAD to see macro errors:
+> **View** -> **Panels** -> check **Report view** and **Python console**.
 
 **Verify from the server:**
 
@@ -288,13 +320,13 @@ curl -s -H "X-Koi-Token: $KOI_BRIDGE_TOKEN" http://127.0.0.1:8765/hello | jq
 `"gui": true` is the field that matters: the bridge is inside the process you
 are watching, not a headless second one.
 
-### 5.3 Start it automatically (once 5.2 works)
+### 4.3 Start it automatically (once 5.2 works)
 
 ```bash
 MODDIR=~/freecad-stream/config/.local/share/FreeCAD/v1-1/Mod/koi_bridge
-mkdir -p "$MODDIR"
+podman unshare mkdir -p "$MODDIR"
 
-cat << 'EOF' > "$MODDIR/InitGui.py"
+cat << 'EOF' | podman unshare tee "$MODDIR/InitGui.py" > /dev/null
 import os
 
 os.environ.setdefault("KOI_BRIDGE_HOST", "0.0.0.0")
@@ -327,7 +359,9 @@ except ImportError:
 QtCore.QTimer.singleShot(4000, _start_koi_bridge)
 EOF
 
-podman unshare chmod -R u+rwX,go+rX "$MODDIR"
+# Ensure correct ownership and permissions for container user 1000
+podman unshare chown -R 1000:1000 ~/freecad-stream/config ~/freecad-stream/workspace
+podman unshare chmod -R u+rwX,go+rX ~/freecad-stream/config
 ```
 
 Restart the container (or the systemd service from Step 8). Watch the streamed
@@ -338,7 +372,7 @@ koi_bridge: listening on http://0.0.0.0:8765 (protocol 1, gui, dispatch qtimer/1
 koi_bridge: FreeCAD 1.1.x ..., exports to /workspace/koi_export
 ```
 
-## Step 6: Reach the server from your workstation
+## Step 5: Reach the server from your workstation
 
 **Skip this entirely if the server runs on the same machine as Chrome** — e.g.
 Windows 11 workstation with the server in WSL2. Loopback already reaches it.
@@ -367,13 +401,13 @@ curl -s -H "X-Koi-Token: $KOI_BRIDGE_TOKEN" http://127.0.0.1:8765/hello | jq
 
 You should see the same JSON as in 5.2.
 
-## Step 7: Point the skill at it
+## Step 6: Point the skill at it
 
 Open **Skills → freecad-live → Run**, fill in three fields, press **Run Skill**.
 
 | Field         | Value                    | Notes                                                                                                                           |
 | :------------ | :----------------------- | :------------------------------------------------------------------------------------------------------------------------------ |
-| `bridgeUrl`   | `http://localhost:8765`  | Plain HTTP. `https://` fails at the TLS handshake before it can authenticate. Safe here: loopback, or inside the Step 6 tunnel. |
+| `bridgeUrl`   | `http://localhost:8765`  | Plain HTTP. `https://` fails at the TLS handshake before it can authenticate. Safe here: loopback, or inside the Step 5 tunnel. |
 | `bridgeToken` | from `bridge.env`        | `grep KOI_BRIDGE_TOKEN ~/freecad-stream/bridge.env` on the FreeCAD host.                                                        |
 | `streamUrl`   | `https://localhost:3001` | Optional. 3001 is TLS, 3000 is plaintext. Nothing in the skill fetches this; it is the link you open to watch.                  |
 
@@ -389,12 +423,12 @@ If not, review the Koi extension's console log:
 | `401 Unauthorized` on `/exec`              | Token missing or stale. This is the guard working — the bridge is up.   |
 | Connection refused / TLS error on 8765     | `https://` in `bridgeUrl`, or the tunnel is down.                       |
 | `No FreeCAD bridge is answering`           | The macro was never run — Step 5.2, or check the autostart in 5.3.      |
-| Warning that the transport is in the clear | `bridgeUrl` points at a remote host over `http://`. Tunnel it (Step 6). |
+| Warning that the transport is in the clear | `bridgeUrl` points at a remote host over `http://`. Tunnel it (Step 5). |
 
 At this point you have a working environment. Everything below is optional or
 explanatory.
 
-## Step 8: Run it as a service (recommended)
+## Step 7: Run it as a service (recommended)
 
 So FreeCAD comes back on boot and after a crash.
 
@@ -574,6 +608,30 @@ Add to the `podman run` from Step 3 (or to `ExecStart` in Step 8):
   --group-add keep-groups \
 ```
 
+## Optional: gmsh and CalculiX for FEM
+
+`freecad_fem` needs two **separate programs**. They are not part of FreeCAD's
+Python, and an image that carries the FEM workbench menu very often carries
+neither — which is why the skill probes for them and reports what it found
+under `binaries` rather than assuming. Everything else in the skill works
+without them.
+
+```bash
+# Inside the FreeCAD container (or on the host, for a native install):
+apt-get update && apt-get install -y gmsh calculix-ccx
+```
+
+FreeCAD finds them on `PATH`. If yours are somewhere else, set the paths in
+Edit → Preferences → FEM → Gmsh / CalculiX; the skill reads those preferences
+first and falls back to `PATH`.
+
+Two things worth knowing before the first solve. CalculiX is **single
+threaded** and runs on the thread that owns the document, so the FreeCAD window
+in your browser tab stops responding for the whole solve — a fine mesh is
+minutes of that, and nothing can preempt it. And a solve is only as good as its
+load case: the skill will not invent a modulus, a load or a restraint, and it
+refuses rather than defaulting one.
+
 ## Verified environment
 
 | Component            | Tested spec                                                                |
@@ -591,7 +649,6 @@ The skill is maintained with a full test suite, you can run them in batch from K
 ```
 /skill freecad-live/scripts/test_native.js --full-auto
 /skill freecad-live/scripts/test_build_contract.js --full-auto
-/skill freecad-live/scripts/test_probes.js --full-auto
 /skill freecad-live/scripts/test_probes.js --full-auto
 /skill freecad-live/scripts/test_koi_cad.js --full-auto
 /skill freecad-live/scripts/test_koi_call.js --full-auto
@@ -613,7 +670,19 @@ The skill is maintained with a full test suite, you can run them in batch from K
 /skill freecad-live/scripts/test_render.js --full-auto
 /skill freecad-live/scripts/test_io.js --full-auto
 /skill freecad-live/scripts/test_inspect.js --full-auto
+/skill freecad-live/scripts/test_cam.js --full-auto
+/skill freecad-live/scripts/test_fem.js --full-auto
 ```
+
+`test_fem.js` is the one suite that is mostly about **refusals**, because that
+is where the value is: an analysis with no restraint, one with no load, a mesh
+with zero volume elements, a material with no `E`/`nu`, a boundary condition on
+something other than the meshed solid, a peak stress planted on a sharp corner
+(which must come back with a null factor of safety and a reason), and a solve
+followed by a geometry edit (which must raise `fem-stale` on the next lint). Its
+first two sections need neither gmsh nor CalculiX and run everywhere; the solve
+sections skip with a warning where the binaries are absent. A suite that only
+proves a bracket solves proves the part of this that was never in doubt.
 
 You need to turn on the `probe-exec` switch, and reinstall the freecad-live skill, so it can run these scripts.
 
@@ -704,13 +773,32 @@ H. Fasteners:
    and one section render. Then turn the clip OFF and `view_restore`.
    Confirm `drawn` per target; if anything is in `notDrawn`, say so instead of
    describing the model.
+6. `freecad_dfm({targets:["part.body","part.face"], process:"mill3axis",
+tool:6})`. This is a CNC part and the design has to survive a cutter, not
+   just a recompute. You should be able to predict two of the findings before
+   you read the reply: `PinchGap` is 2 mm, and a 2 mm slot admits a 2 mm
+   cutter and nothing wider; `FluteDepth` is 3.5 mm. Quote `manufacturable`,
+   the residual `method`, and `maxToolDiameter` per body.
+   If it comes back `obstructed`, name the FEATURE and say what dimension
+   would clear it. Do not quietly shrink the `tool` argument until the check
+   passes — that is fitting the test to the answer. Then re-run at `tool:2`
+   and report what changed and what it costs (a 2 mm cutter in aluminium is a
+   different machining plan, not a smaller number).
+7. `freecad_cam({mode:"job", target:"part.face", id:"cam.face"})`, then
+   `{mode:"op", job:"cam.face", op:"profile", id:"camop.face_profile"}`, then
+   `{mode:"verify", job:"cam.face"}`. Quote `api` — which spelling of the CAM
+   modules this build actually has — and the command count. An operation that
+   generated ZERO commands recomputes clean and looks like nothing on screen;
+   it is the workbench saying it could not cut that feature with that tool, so
+   report it as that rather than as a tool error. Finish with
+   `{mode:"clear", job:"cam.face"}` and leave the tree the way you found it.
 ```
 
 ---
 
 #### Prompt 2 — NEMA housing + associative cover: Multi-Body Parametric Motor Drive & Associative Enclosure
 
-**Focus**: _Catalog components, parametric swap propagation, cross-body SubShapeBinder (`bind`), multi-body assembly BOM._
+**Focus**: _Catalog components, parametric swap propagation, cross-body SubShapeBinder (`bind`), multi-body assembly BOM, manufacturability across a parametric change._
 
 ```markdown
 Design a modular NEMA stepper reducer housing with an associatively-bound cover
@@ -756,13 +844,28 @@ id:"bind.housing_rim"})`.
 6. `freecad_measure({interference:true, partsOnly:true})` — motor envelope vs
    housing must be 0 mm³, or `allow` it with a stated reason.
 7. `bom` with masses for both bodies plus the motor's catalog mass.
+8. `freecad_dfm({targets:["body.housing","body.cover"], tool:6})`, run BOTH
+   before and after the swap in step 5.
+   - Before: the gearbox cavity as specified is a rectangle, so expect
+     `dfm-sharp-corner`. A rotating cutter leaves its own radius; a square
+     internal corner is not a case for a smaller tool, it is a corner relief,
+     EDM, or a radius. Fix it the way the rest of this test is built — a new
+     `CornerR` parameter and `sketch_edit` on the cavity sketch to add fillets
+     bound to it. Do not delete and rebuild the sketch, and do not "fix" it by
+     changing `process`.
+   - After: say whether the swap changed the verdict. A NEMA23 bolt circle is
+     47.14 mm against 31.0 mm, so a mount hole may now sit close enough to a
+     cavity wall to matter. If it does, that is precisely the failure this
+     whole design exists to catch, and it has to be caught by the number
+     rather than by looking at the render — the render will look fine either
+     way.
 ```
 
 ---
 
 #### Prompt 3 — Drone arm: loft / sweep / draft / shell (Lofts, Sweeps, Shell & Draft)
 
-**Focus**: _Advanced 3D modeling (`loft`, `pipe`, `shell`, `draft`), mold release verification, sliver face linting._
+**Focus**: _Advanced 3D modeling (`loft`, `pipe`, `shell`, `draft`), mold release verification, sliver face linting, and knowing when a manufacturability check is the wrong question._
 
 ```markdown
 Design a lightweight drone motor arm with an internal wire conduit and mould
@@ -809,6 +912,20 @@ query:{kind:"face", normal:"+Y"}})`. Report `taper` and `volumeDelta` —
    it cannot tell you the thickness.
 3. `view_section({plane:"YZ", offset:0})` + `freecad_render` from two angles,
    then clip OFF and `view_restore`.
+4. `freecad_dfm({targets:["body.arm"], process:"mill_any", tool:4})`.
+   Expect this to FAIL, and expect the swept conduit to be why: an internal
+   channel that opens only at its two ends is not reachable by a cutter from
+   any direction, and `residual.obstructed` should say so with a volume.
+   **That finding is correct.** The right response is that this part is
+   moulded or printed and a milling check is the wrong question — NOT to
+   change the geometry until the check goes green. Say which, in those terms.
+   Every other prompt in this set rewards fixing the model when a measurement
+   complains; this one is here to see whether that reflex has a brake on it.
+   If instead it comes back manufacturable, the check is not measuring what it
+   claims and THAT is the defect to report.
+   The `draft` in step 6 is the mould-release half of the same question, and
+   nothing in this skill verifies a mould — no parting line, no slide, no
+   ejection. Say that too.
 ```
 
 ---
@@ -870,7 +987,7 @@ At each step:
 
 #### Prompt 5 — I/O roundtrip and ID durability
 
-**Focus**: _`open_document`, `save`, `import_geometry`, `freecad_export`, metadata ID persistence across sessions._
+**Focus**: _`open_document`, `save`, `import_geometry`, `freecad_export`, metadata ID persistence across sessions, and which checks survive the loss of the feature tree._
 
 ```markdown
 Verify file interchange and koi-id durability across a save/reopen boundary.
@@ -908,6 +1025,12 @@ and confirm you picked the right one.
 
 ### Phase 3 — Export
 
+Before either export, run `freecad_dfm({targets:["body.bracket"]})` and quote
+the verdict alongside the paths. Export is the moment the question stops being
+"is the model what I meant" and becomes "can this be made", because whoever
+receives the STEP cannot ask the model anything. Note whether the skill
+prompted you to do this or whether you remembered on your own.
+
 `freecad_export({format:"STEP", targets:["body.bracket"]})` and
 `freecad_export({format:"STL", targets:["body.bracket"]})`.
 Quote both paths and confirm they are inside the export directory.
@@ -925,6 +1048,14 @@ Quote both paths and confirm they are inside the export directory.
    container with `freecad_script`.
    Read `removed`: a cut that removed nothing must be reported as such.
 3. `freecad_measure({deepLint:true})` on the result.
+4. `freecad_dfm({targets:["<the imported shape>"]})`. This is the one check in
+   the skill that does not degrade on imported geometry. `ids`, `sketch_get`,
+   `feature_edit`, every expression binding and every stored `query` have
+   nothing to work with once the tree is gone — but a corner radius, a tool
+   reach and a residual are facts about a SHAPE, and the importer brought a
+   shape. Confirm it answers, and set that against what step 1 said about the
+   import being non-parametric: those two statements are both true and it is
+   worth being precise about why.
 
 ### Acceptance
 
@@ -932,6 +1063,11 @@ Quote both paths and confirm they are inside the export directory.
 - The `query`-driven chamfer survived a dimensional change.
 - The imported shape is correctly described as non-parametric.
 - The boolean's `removed` is non-zero and stated.
+- The DFM verdict on the imported shape MATCHES the verdict on the body it was
+  exported from. A roundtrip through STEP does not change what a cutter can
+  reach, so if the two disagree, either the export dropped geometry or the
+  check is reading something other than the shape. Either one is a defect and
+  the two are distinguishable — say which.
 ```
 
 ## References

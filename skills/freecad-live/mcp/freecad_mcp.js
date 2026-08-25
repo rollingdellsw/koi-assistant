@@ -889,7 +889,7 @@ function protocolStatus() {
 //                window freeze while it runs.
 
 const KOI_CAD_PY = String.raw`
-VERSION = "0.7.3"
+VERSION = "0.9.0"
 
 import json as _json
 import math as _math
@@ -1584,6 +1584,11 @@ def lint(doc=None, deep=False):
     except Exception as e:
         out.append({"level": "warn", "object": "?", "code": "lint-failed",
                     "message": "split check: %s" % e})
+    try:
+        out.extend(_fem_lint(doc))
+    except Exception as e:
+        out.append({"level": "warn", "object": "?", "code": "lint-failed",
+                    "message": "fem check: %s" % e})
     return out
 
 
@@ -5547,8 +5552,11 @@ def query(args, doc=None):
         sub = "%s%d" % (kind, idx + 1)
         inv = _invariants(ss, kind)
         r = _sub_radius(ss, kind)
-        if want_surface and want_surface not in str(inv.get("surface", "")).lower():
-            continue
+        if want_surface:
+            surf = str(inv.get("surface", "")).lower()
+            surf_base = surf.replace("surface", "").replace("curve", "").replace("geom", "")
+            if want_surface != surf and want_surface != surf_base:
+                continue
         # Direction is compared with the caller's tolerance, not DIR_TOL: a
         # near-planar face off by a thousandth of a degree is still the top.
         if want_dir is not None:
@@ -9787,6 +9795,20 @@ CAP_MODULES = (
     "Part", "PartDesign", "Sketcher", "Spreadsheet", "Import", "Mesh",
     "Draft", "Assembly", "TechDraw", "Material", "BOPTools", "importDXF",
     "importSVG", "MeshPart", "Fem", "Path",
+    # CAM. Listed as the dotted paths rather than as "Path", because "Path
+    # imports" and "the CAM operations import" are different facts and the
+    # second one is the one a cam call depends on. The workbench was
+    # PathScripts before 1.0 and the operation modules moved with it, so both
+    # spellings are asked about and the answer says which one this build has.
+    "Path.Main.Job", "Path.Op.Profile", "Path.Op.Pocket", "Path.Op.Drilling",
+    "Path.Op.Adaptive", "Path.Tool.Controller", "Path.Post.Command",
+    "PathScripts.PathJob",
+    # FEM. Same reasoning: "Fem imports" and "a solve can run here" are
+    # different facts. ObjectsFem builds the objects, gmshtools meshes and
+    # ccxtools solves -- and the last two shell out to gmsh and ccx, which are
+    # separate programs that a container carrying the workbench often does not
+    # have. fn 'fem' reports the binaries; this reports the Python side.
+    "ObjectsFem", "femmesh.gmshtools", "femtools.ccxtools",
 )
 
 
@@ -10718,7 +10740,7 @@ def _op_fastener_pattern(doc, args, kid):
 
 
 def _split_plane(doc, args):
-    """(point, unit normal, name, offset, expression) for the cutting plane.
+    """(point, unit normal, name, offset, expression, datum) for the cutting plane.
 
     offset takes an expression like every other dimension on this surface. It
     cannot be BOUND -- the halves are snapshots and there is no feature to
@@ -10734,7 +10756,7 @@ def _split_plane(doc, args):
     if word in ("XY", "XZ", "YZ"):
         n = {"XY": App.Vector(0, 0, 1), "XZ": App.Vector(0, 1, 0),
              "YZ": App.Vector(1, 0, 0)}[word]
-        return _scaled(n, offset), n, word, offset, offset_expr
+        return _scaled(n, offset), n, word, offset, offset_expr, None
     owner, _sub = _resolve_ref_sub(doc, plane)
     if owner is None:
         raise KoiOpError(
@@ -10744,10 +10766,34 @@ def _split_plane(doc, args):
     n = pl.Rotation.multVec(App.Vector(0, 0, 1))
     b = pl.Base
     return (App.Vector(b.x + n.x * offset, b.y + n.y * offset,
-                       b.z + n.z * offset), n, owner.Name, offset, offset_expr)
+                       b.z + n.z * offset), n, owner.Name, offset, offset_expr, owner)
 
 
-def _half_space(shape, point, normal, sign, gap):
+def _half_space_span(shape):
+    bb = shape.BoundBox
+    return max(bb.XLength, bb.YLength, bb.ZLength, 1.0) * 4.0 + 10.0
+
+
+def _half_space_placement(shape, point, normal, sign, gap, span=None):
+    if span is None:
+        span = _half_space_span(shape)
+    bb = shape.BoundBox
+    try:
+        u = App.Vector(normal.x, normal.y, normal.z).normalize()
+    except Exception:
+        raise KoiOpError("the split plane has no usable normal")
+    n = _scaled(u, sign)
+    c = bb.Center
+    d = (c.x - point.x) * u.x + (c.y - point.y) * u.y + (c.z - point.z) * u.z
+    on_plane = App.Vector(c.x - u.x * d, c.y - u.y * d, c.z - u.z * d)
+    base = App.Vector(on_plane.x + n.x * (gap / 2.0),
+                      on_plane.y + n.y * (gap / 2.0),
+                      on_plane.z + n.z * (gap / 2.0))
+    box = App.Placement(App.Vector(-span / 2.0, -span / 2.0, 0.0), App.Rotation())
+    return App.Placement(base, _rot_from_z(n)).multiply(box)
+
+
+def _half_space(shape, point, normal, sign, gap, span=None):
     """A box big enough to be a half-space for this shape, on one side.
 
     Centred on the SOLID and not on the plane's own origin. The first version
@@ -10914,6 +10960,13 @@ def _purge_stale_split_records(doc, kid, src_name, names, ids):
         theirs |= set(str(i) for i in (rec.get("ids") or []))
         if not (theirs & mine):
             continue
+        for nm in list(rec.get("cuts") or []) + list(rec.get("tools") or []):
+            o = doc.getObject(str(nm))
+            if o is not None:
+                try:
+                    _remove_subtree(doc, o)
+                except Exception:
+                    pass
         d = _meta(doc)
         d.pop(k, None)
         try:
@@ -10934,15 +10987,29 @@ def _op_split_body(doc, args, kid):
     parts. So the split happens at document level and each half comes back as
     something features can be added to.
 
-    The halves are snapshots. Nothing binds them to the solid they came from,
-    so an upstream change means splitting again; that is said in the result
-    rather than left to be discovered.
+    The halves used to be snapshots, and that was the expensive part. Nothing
+    bound them to the solid they came from, so a bolt clearance hole added to
+    the main body three turns later did not reach them: lint said split-stale,
+    the recovery was to split again, and the working rule became "split LAST"
+    -- a scheduling constraint invented by this tool and obeyed by the human.
+
+    They are live now. Each half is a Part::MultiCommon of the source and a
+    half-space box, wrapped in a Body through PartDesign::FeatureBase, so the
+    source is a LINK and the DAG recomputes both halves on every upstream
+    edit. What that buys is the ordinary CAD expectation: edit the sketch,
+    both halves follow. What it costs is said in the reply rather than
+    discovered -- the source has to stay in the document, and a sketch on a
+    FACE of a half is still attached by topological name and can still break
+    when that face moves.
+
+    live:false asks for the old snapshot, and a build that will not make the
+    chain falls back to one and says which of the two you got.
     """
     src = _resolve_or_die(doc, _need(args, "target"), "solid")
     shape = getattr(src, "Shape", None)
     if shape is None or shape.isNull() or shape.Volume <= 1e-9:
         raise KoiOpError("%s has no solid shape to split" % src.Name)
-    point, normal, plane_name, offset, offset_expr = _split_plane(doc, args)
+    point, normal, plane_name, offset, offset_expr, datum = _split_plane(doc, args)
     gap, gap_expr = (0.0, None)
     if args.get("gap") is not None:
         gap, gap_expr = _numx(args, "gap")
@@ -10970,10 +11037,27 @@ def _op_split_body(doc, args, kid):
     recreate = bool(args.get("recreate"))
     forced = bool(args.get("force"))
 
+    prec = {}
+    try:
+        prec = _json.loads(_meta(doc).get(SPLIT_PREFIX + str(kid)) or "{}") or {}
+    except Exception:
+        prec = {}
+    ptools = [str(x) for x in (prec.get("tools") or [])] + [None, None]
+    pcuts = [str(x) for x in (prec.get("cuts") or [])] + [None, None]
+
     v0 = round(shape.Volume, 6)
+    want_live = args.get("live") is None or bool(args.get("live"))
+    span = _half_space_span(shape)
+    # An expression can be BOUND to the cut only when the plane is one of the
+    # three world planes, because then the offset is exactly one component of
+    # the box's own Placement. A datum plane carries the offset inside its own
+    # attachment and the box would have to be attached to it to follow; that
+    # is not done, so lint watches the datum instead (split-plane-moved).
+    axis = {"XY": "z", "XZ": "y", "YZ": "x"}.get(plane_name)
+    off_s, gap_s = _expr_of(offset, offset_expr), _expr_of(gap, gap_expr)
     pieces = []
     for sign, side in ((1.0, "a"), (-1.0, "b")):
-        piece = shape.common(_half_space(shape, point, normal, sign, gap))
+        piece = shape.common(_half_space(shape, point, normal, sign, gap, span))
         vol = 0.0
         try:
             vol = piece.Volume
@@ -10985,11 +11069,20 @@ def _op_split_body(doc, args, kid):
                 "%s does not pass through it. Move it with offset."
                 % (side, src.Name, _vec3(shape.BoundBox.Center),
                    _vec3(point)))
-        pieces.append((side, piece))
+        expr = None
+        if offset_expr or gap_expr:
+            expr = off_s
+            if gap > 0 or gap_expr:
+                expr = off_s + (" + " if sign > 0 else " - ") + gap_s + " / 2"
+        pieces.append((side, piece,
+                       _half_space_placement(shape, point, normal, sign, gap,
+                                             span),
+                       expr))
 
     out = {"plane": plane_name, "gap": gap, "offset": offset,
            "source": src.Name, "normal": _vec3(normal),
-           "sourceVolume": v0, "asBodies": True, "halves": [], "sides": {}}
+           "sourceVolume": v0, "asBodies": True, "live": want_live,
+           "halves": [], "sides": {}}
     if offset_expr:
         out["offsetExpression"] = offset_expr
     if gap_expr:
@@ -11006,12 +11099,19 @@ def _op_split_body(doc, args, kid):
                 % "; ".join("%s (%s)" % (n, ", ".join(w[:6])) for n, w in carrying))
         for o in prior:
             _remove_subtree(doc, o, replaced)
+        for nm in list(pcuts[:2]) + list(ptools[:2]):
+            o = doc.getObject(str(nm)) if nm else None
+            if o is not None:
+                _remove_subtree(doc, o, replaced)
+        ptools, pcuts = [None, None], [None, None]
         if replaced:
             doc.recompute()
         prior = []
 
     total = 0.0
-    for (side, piece), skid, lbl in zip(pieces, kids, labels):
+    tools_created = []
+    cuts_created = []
+    for (side, piece, plc, expr), skid, lbl, ptool, pcut in zip(pieces, kids, labels, ptools, pcuts):
         existing = doc.getObject(str(skid)) or resolve(doc, str(skid))
         is_body = True
         why = None
@@ -11461,6 +11561,2916 @@ def _op_batch(doc, args, kid):
                     "steps" % len(done)}
 
 
+# ---------- 15. manufacturability: DFM and CAM ----------
+#
+# Everything above this line answers "is the model what I meant". Nothing
+# above it answers "can this be MADE", and those are different questions with
+# different failure modes. A part can be dimensionally perfect, recompute
+# clean, pass interference, and weigh exactly what the BOM says, and still be
+# a shape no rotating cutter can produce. The internal corner with a zero
+# radius is the canonical case: trivially valid geometry, and it does not
+# exist in metal.
+#
+# Two layers, and the split is the one lint/deepLint already makes:
+#
+#   dfm()   Pure OCC. No CAM workbench, no toolpath, no post processor, and
+#           therefore no dependency on how THIS build spells Path.Main.Job.
+#           Internal corner radii, tool reach per setup direction, undercuts,
+#           enclosed voids, hole depth ratios -- and the residual: the volume
+#           of material a cutter of radius r cannot reach NO MATTER how many
+#           axes the machine has. That last number is a lower bound on
+#           unmachinability, and it is the definitive one.
+#
+#   cam     The real CAM workbench: a Job, a stock, a tool controller, the
+#           operations, and the toolpaths they generate. An operation that
+#           generates ZERO path commands is the workbench saying it could not
+#           machine that feature with that tool -- feedback nothing in this
+#           module could have derived on its own. Version-fragile by nature,
+#           so the API is PROBED and the spelling it found is reported, the
+#           same way capabilities does it.
+#
+# Neither is a substitute for a machinist. Both are things a tool can run,
+# which is the whole point: a manufacturability claim that came out of a
+# language model is a guess, and one that came out of an offset operation is
+# a measurement.
+
+CAM_AXES = {
+    "+Z": (0.0, 0.0, 1.0), "-Z": (0.0, 0.0, -1.0),
+    "+X": (1.0, 0.0, 0.0), "-X": (-1.0, 0.0, 0.0),
+    "+Y": (0.0, 1.0, 0.0), "-Y": (0.0, -1.0, 0.0),
+}
+
+# Stock end mill diameters, mm. Same argument as drill_sizes(): a 4.7 mm
+# corner radius is not a matter of taste, it is a tool nobody has.
+ENDMILL_SIZES = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0,
+                 10.0, 12.0, 16.0, 20.0, 25.0)
+
+# Depth-to-diameter ratios past which a cut stops being routine. 3xD is a
+# stock end mill; 5xD needs a long-reach or a necked tool and slower feeds;
+# past that it is a conversation with the shop, not a CAD decision.
+FLUTE_RATIO = 3.0
+LONG_REACH_RATIO = 5.0
+DRILL_DEPTH_RATIO = 5.0
+
+# Budgets. Every check here scales with face count rather than object count,
+# which is the same reason deepLint is opt-in. Exceeding a budget is reported
+# as truncation, never as a pass -- a check that did not run is not a check
+# that succeeded.
+DFM_FACE_BUDGET = 240
+DFM_EDGE_BUDGET = 1200
+DFM_RAY_BUDGET = 900
+
+DFM_PROCESSES = ("mill3axis", "mill5axis", "mill_any", "turn", "print_fdm")
+
+
+def _unit_v(v):
+    L = v.Length
+    if L < 1e-12:
+        return None
+    return App.Vector(v.x / L, v.y / L, v.z / L)
+
+
+def _axis_vec(name):
+    t = CAM_AXES.get(str(name))
+    if t is None:
+        raise KoiOpError(
+            "unknown axis %r; use one of %s"
+            % (name, ", ".join(sorted(CAM_AXES))))
+    return App.Vector(*t)
+
+
+def _dfm_shape(o):
+    try:
+        s = o.Shape
+    except Exception:
+        return None
+    if s is None or s.isNull():
+        return None
+    try:
+        if s.Volume <= 1e-9:
+            return None
+    except Exception:
+        return None
+    return s
+
+
+def _face_probe_point(f):
+    """A point that is actually ON the face.
+
+    CenterOfMass is off the surface for anything annular or L-shaped, and a
+    ray cast from a point that is not on the part is a measurement of
+    nothing that reports cleanly.
+    """
+    try:
+        p = f.CenterOfMass
+        if f.isInside(p, 1e-6, True):
+            return p
+    except Exception:
+        pass
+    try:
+        u0, u1, v0, v1 = f.ParameterRange
+        for du, dv in ((0.5, 0.5), (0.3, 0.3), (0.7, 0.7),
+                       (0.3, 0.7), (0.7, 0.3)):
+            p = f.valueAt(u0 + (u1 - u0) * du, v0 + (v1 - v0) * dv)
+            if f.isInside(p, 1e-6, True):
+                return p
+    except Exception:
+        pass
+    try:
+        return f.Vertexes[0].Point
+    except Exception:
+        return None
+
+
+def _face_normal_at(f, p=None):
+    """The RAW surface normal at a point on the face. Sign not yet decided.
+
+    Deliberately does not touch f.Orientation. The first cut of this module
+    flipped Reversed faces by hand, on the reasonable-sounding theory that
+    normalAt() returns the surface normal rather than the face normal. It does
+    not: normalAt() goes through BRepGProp_Face, which already applies the
+    orientation, so the hand flip inverted every normal on the shape. The
+    symptom was a plain rectangular plate reporting four SHARP INTERNAL
+    CORNERS -- its four convex outside corners, read inside out -- and its top
+    and bottom faces reported as unreachable from any direction.
+
+    A convention that a build could change is a convention this module should
+    not be reading. _outward_normal below measures the sign instead.
+    """
+    try:
+        if p is None:
+            u0, u1, v0, v1 = f.ParameterRange
+            u, v = (u0 + u1) / 2.0, (v0 + v1) / 2.0
+        else:
+            u, v = f.Surface.parameter(p)
+        n = App.Vector(f.normalAt(u, v))
+    except Exception:
+        return None
+    return _unit_v(n)
+
+
+def _step(p, n, d):
+    return App.Vector(p.x + n.x * d, p.y + n.y * d, p.z + n.z * d)
+
+
+def _face_sign(shape, f, p=None):
+    """+1 if normalAt already points OUT of the material here, -1 if in.
+
+    Two isInside calls at a point the face owns. Whichever side of the surface
+    the solid is on is the inside, and that is a fact about this shape rather
+    than a fact about how this build spells an enum. Costs about 0.5 ms a
+    face, which is nothing next to the ray casting it feeds.
+
+    None when both probes agree -- a step that landed inside on both sides is
+    a thin wall or a point too near an edge, and a guess there would be a sign
+    error in exactly the geometry that is hardest to check.
+    """
+    if p is None:
+        p = _face_probe_point(f)
+    if p is None:
+        return None
+    n = _face_normal_at(f, p)
+    if n is None:
+        return None
+    for d in (1e-3, 1e-4, 1e-2):
+        try:
+            a = shape.isInside(_step(p, n, d), 1e-7, True)
+            b = shape.isInside(_step(p, n, -d), 1e-7, True)
+        except Exception:
+            return None
+        if a != b:
+            return -1.0 if a else 1.0
+    return None
+
+
+def _outward_normal(shape, f, p=None):
+    """(outward normal, point on the face, decided) for one face.
+
+    The third element is False when the sign could not be measured. The caller counts
+    those and says so rather than letting an undecided face quietly vote.
+    """
+    if p is None:
+        p = _face_probe_point(f)
+    if p is None:
+        return None, None, False
+    n = _face_normal_at(f, p)
+    if n is None:
+        return None, p, False
+    sg = _face_sign(shape, f, p)
+    if sg is None:
+        return n, p, False
+    if sg < 0:
+        n = App.Vector(-n.x, -n.y, -n.z)
+    return n, p, True
+
+
+def _cyl_concave(shape, f):
+    """Is this cylindrical face a bore, or a boss?
+
+    Decided against the axis rather than against the solid: the outward
+    normal of a bore wall points AWAY from material and so does the outward
+    normal of a boss, so isInside cannot separate them. The radial direction
+    can -- material outside the cylinder means a bore, and a bore is an
+    internal corner that sets a maximum tool diameter.
+    """
+    try:
+        s = f.Surface
+        ax = _unit_v(App.Vector(s.Axis))
+        c = App.Vector(s.Center)
+    except Exception:
+        return None
+    n, p, decided = _outward_normal(shape, f)
+    if p is None or n is None or ax is None or not decided:
+        return None
+    v = App.Vector(p.x - c.x, p.y - c.y, p.z - c.z)
+    d = v.dot(ax)
+    v = _unit_v(App.Vector(v.x - ax.x * d, v.y - ax.y * d, v.z - ax.z * d))
+    if v is None:
+        return None
+    return n.dot(v) < 0.0
+
+
+def _edge_concave(shape, e, fa, fb):
+    """Concave means the material wraps the edge: an inside corner.
+
+    For two faces fa, fb sharing edge e, let va be the inward tangent vector of fa
+    perpendicular to e (pointing into fa), and nb be the outward normal of fb.
+    If va . nb > 0, fa extends into the exterior halfspace of fb (an inside corner).
+    If va . nb < 0, fa extends behind fb into the solid (an outside corner).
+    A tangent join has |va . nb| == 0 and is neither.
+    """
+    try:
+        u0, u1 = e.ParameterRange
+        u = (u0 + u1) / 2.0
+        p = e.valueAt(u)
+        te = e.tangentAt(u)
+    except Exception:
+        return None
+    sa = _face_sign(shape, fa)
+    sb = _face_sign(shape, fb)
+    na = _face_normal_at(fa, p)
+    nb = _face_normal_at(fb, p)
+    if na is None or nb is None or sa is None or sb is None:
+        return None
+    na = App.Vector(na.x * sa, na.y * sa, na.z * sa)
+    nb = App.Vector(nb.x * sb, nb.y * sb, nb.z * sb)
+    v = na.cross(te)
+    if v.Length < 1e-6:
+        return None
+    v.normalize()
+    step = 1e-3
+    p_pos = p + v * step
+    p_neg = p - v * step
+    try:
+        import Part
+        d_pos = fa.distToShape(Part.Vertex(p_pos))[0]
+        d_neg = fa.distToShape(Part.Vertex(p_neg))[0]
+    except Exception:
+        return None
+    va = v if d_pos < d_neg else App.Vector(-v.x, -v.y, -v.z)
+    dot = va.dot(nb)
+    if dot > 1e-3:
+        return True
+    if dot < -1e-3:
+        return False
+    return False
+
+
+def _offset_shape(shape, dist, tol=1e-4):
+    """makeOffsetShape, whatever this build's signature is.
+
+    The first cut passed intersection=True and every residual check on every
+    part came back "erosion offset failed (TypeError)" -- which the honesty
+    path then correctly reported as manufacturable: null, so the bug was loud
+    rather than silent, but the check never ran once. FreeCAD spells the third
+    parameter 'inter' and takes it positionally; the keyword does not exist.
+
+    A compound is offset solid-by-solid and fused, because makeOffsetShape
+    refuses a compound on some builds and a cut between two solids is a
+    compound on more of them than you would expect.
+    """
+    d = float(dist)
+    t = float(tol)
+    last = None
+    # inter=True is the third POSITIONAL parameter. The first cut passed it as
+    # intersection=True, which is not a keyword this method has; the fix then
+    # dropped it altogether, which is worse -- without intersection handling an
+    # outward offset cannot close a slot narrower than twice the offset, which
+    # is exactly the geometry the residual exists to find. Arc join first
+    # because that is the true Minkowski ball; the rest are salvage.
+    for args in ((d, t, True, False, 0, 0, False),
+                 (d, t, True, False, 0, 2, False),
+                 (d, t, False, False, 0, 0, False),
+                 (d, t * 10, True, False, 0, 0, False)):
+        try:
+            r = shape.makeOffsetShape(*args)
+            if r is None or r.isNull():
+                continue
+            v = float(r.Volume)
+            # A "successful" offset that moved the volume the wrong way did
+            # not do what was asked. Checked here rather than believed,
+            # because the caller turns this straight into a verdict.
+            if v <= 0:
+                continue
+            if d > 0 and v < float(shape.Volume) - 1e-6:
+                continue
+            if d < 0 and v > float(shape.Volume) + 1e-6:
+                continue
+            return r
+        except Exception as e:
+            last = e
+    try:
+        solids = list(shape.Solids)
+    except Exception:
+        solids = []
+    if len(solids) > 1:
+        parts = []
+        for sol in solids:
+            try:
+                r = sol.makeOffsetShape(d, t)
+                if r is not None and not r.isNull():
+                    parts.append(r)
+            except Exception as e:
+                last = e
+        if parts:
+            out = parts[0]
+            for extra in parts[1:]:
+                try:
+                    out = out.fuse(extra)
+                except Exception:
+                    pass
+            return out
+    raise KoiOpError("offset failed: %s: %s"
+                     % (type(last).__name__ if last else "Unknown", last))
+
+
+def _blocked_along(shape, start, d, reach, tol=1e-3):
+    """Does a ray from p along d re-enter the solid?
+
+    This is the undercut test and there is no cheaper one. A face whose
+    normal points at the tool is still unmachinable if something else of the
+    part stands in the way, and no property on the face records that.
+    """
+    import Part
+    try:
+        b = _step(start, d, reach)
+        seg = Part.makeLine(start, b)
+    except Exception:
+        return None
+    try:
+        c = shape.common(seg)
+        L = sum(x.Length for x in c.Edges)
+    except Exception:
+        return None
+    return L > tol * 50
+
+
+def _dfm_corners(shape, axis, tool_r):
+    """Internal corners, which is where the maximum tool diameter comes from.
+
+    A concave vertical wall-to-wall join is a corner a rotating cutter has to
+    negotiate, and a cutter of radius r leaves radius r behind. A sharp one
+    (radius zero) cannot be milled at all: not with a smaller tool, not with
+    a slower feed. It is EDM, a corner relief, or a redesign, and saying so
+    is more use than reporting a tool that would "nearly" fit.
+    """
+    out = {"sharp": [], "radii": [], "minRadius": None,
+           "maxToolDiameter": None, "truncated": False}
+    ax = axis
+    seen = 0
+    for f in shape.Faces:
+        seen += 1
+        if seen > DFM_FACE_BUDGET:
+            out["truncated"] = True
+            break
+        try:
+            if type(f.Surface).__name__ != "Cylinder":
+                continue
+            r = float(f.Surface.Radius)
+            fax = _unit_v(App.Vector(f.Surface.Axis))
+        except Exception:
+            continue
+        if fax is None or r <= 1e-9:
+            continue
+        if _cyl_concave(shape, f) is not True:
+            continue
+        # Only a corner whose axis lies along the tool axis constrains the
+        # cutter's radius. A horizontal bore is a hole, drilled or bored, and
+        # it is checked as one.
+        if abs(fax.dot(ax)) < 0.98:
+            continue
+        out["radii"].append({"face": None, "radius": round(r, 4)})
+        if out["minRadius"] is None or r < out["minRadius"]:
+            out["minRadius"] = r
+    # Sharp internal corners: a concave straight edge running along the tool
+    # axis, shared by two planes.
+    import Part
+    idx = 0
+    for e in shape.Edges:
+        idx += 1
+        if idx > DFM_EDGE_BUDGET:
+            out["truncated"] = True
+            break
+        try:
+            if type(e.Curve).__name__ != "Line":
+                continue
+            d = _unit_v(App.Vector(e.Vertexes[-1].Point.sub(e.Vertexes[0].Point)))
+        except Exception:
+            continue
+        if d is None or abs(d.dot(ax)) < 0.98:
+            continue
+        try:
+            fs = shape.ancestorsOfType(e, Part.Face)
+        except Exception:
+            continue
+        if len(fs) != 2:
+            continue
+        if _edge_concave(shape, e, fs[0], fs[1]) is not True:
+            continue
+        try:
+            length = float(e.Length)
+        except Exception:
+            length = None
+        out["sharp"].append({"length": round(length, 3) if length else None})
+    if out["minRadius"] is not None:
+        out["maxToolDiameter"] = round(out["minRadius"] * 2.0, 4)
+    out["sharpCount"] = len(out["sharp"])
+    out["sharp"] = out["sharp"][:12]
+    return out
+
+
+def _dfm_reach(shape, axis_names, budget=DFM_RAY_BUDGET):
+    """Which setup directions cover which faces, and what nothing covers.
+
+    Two findings come out of this and they are not the same severity. A face
+    reachable only from -Z when everything else is +Z is a SECOND SETUP: real
+    money, a re-fixture, and a tolerance stack between the two -- but it can
+    be made. A face reachable from no direction at all is an undercut, and no
+    number of setups fixes it on a 3-axis machine.
+
+    The first cut of this rejected every face with n.a <= 0.02, which threw
+    away every wall PARALLEL to the tool axis -- the sides of a plate, the
+    walls of a pocket, most of the cut surface on most milled parts. Those are
+    cut by the side of the cutter, not its tip, and a plain plate came back
+    with fifteen unreachable faces because of it. The gate is now "not turned
+    AWAY from the tool", and perpendicular counts as reachable.
+    """
+    axes = [(n, _axis_vec(n)) for n in axis_names]
+    try:
+        bb = shape.BoundBox
+        reach = float(bb.DiagonalLength) * 2.0 + 10.0
+    except Exception:
+        reach = 1000.0
+    faces = list(shape.Faces)
+    try:
+        faces.sort(key=lambda f: -float(f.Area))
+    except Exception:
+        pass
+    truncated = len(faces) > DFM_FACE_BUDGET
+    faces = faces[:DFM_FACE_BUDGET]
+    rays = 0
+    undecided = 0
+    cover = dict((n, 0) for n, _ in axes)
+    face_axes = []
+    unreachable = []
+    unreachable_area = 0.0
+    checked = 0
+    for i, f in enumerate(faces):
+        n, p, decided = _outward_normal(shape, f)
+        if p is None or n is None:
+            continue
+        if not decided:
+            # An undecided sign is not a vote. Counted and reported; the
+            # caller turns a material number of them into notDetermined.
+            undecided += 1
+            continue
+        checked += 1
+        hit = set()
+        for name, a in axes:
+            # Turned away from the tool: the tip cannot see it and the flute
+            # cannot either. Perpendicular (dot 0) is a WALL, which is the
+            # most common machined surface there is.
+            if n.dot(a) < -0.02:
+                continue
+            if rays >= budget:
+                truncated = True
+                break
+            rays += 1
+            # Step off the surface along the outward normal FIRST. A ray
+            # started on a wall and sent along the tool axis runs inside that
+            # wall's own face, and the boolean reports the part blocking
+            # itself -- which is how every vertical face used to come back
+            # unreachable even after the normals were right.
+            b = _blocked_along(shape, _step(_step(p, n, 0.02), a, 0.02),
+                               a, reach)
+            if b is False:
+                hit.add(name)
+        if hit:
+            face_axes.append(hit)
+            for name in hit:
+                cover[name] += 1
+        else:
+            try:
+                area = float(f.Area)
+            except Exception:
+                area = 0.0
+            unreachable_area += area
+            if len(unreachable) < 16:
+                unreachable.append({
+                    "index": i,
+                    "surface": type(f.Surface).__name__,
+                    "areaMm2": round(area, 3),
+                    "normal": [round(n.x, 4), round(n.y, 4), round(n.z, 4)],
+                })
+    # Greedy set cover: how few times does this part have to be re-clamped.
+    # The first cut of this walked the axes once in popularity order and never
+    # looked at what was left uncovered, so it reported one setup for a part
+    # that needs three.
+    setups = []
+    left = [t for t in face_axes]
+    while left and len(setups) < len(axes):
+        best, best_n = None, 0
+        for name, _ in axes:
+            if name in setups:
+                continue
+            c = sum(1 for t in left if name in t)
+            if c > best_n:
+                best, best_n = name, c
+        if best is None:
+            break
+        setups.append(best)
+        left = [t for t in left if best not in t]
+    return {
+        "axes": [n for n, _ in axes],
+        "coverage": dict((k, v) for k, v in cover.items()),
+        "setupsSuggested": setups,
+        "setupCount": len(setups),
+        "unreachableFaces": unreachable,
+        "unreachableFaceCount": len(unreachable),
+        "unreachableAreaMm2": round(unreachable_area, 3),
+        "facesChecked": checked,
+        "facesUndecided": undecided,
+        "raysCast": rays,
+        "truncated": bool(truncated),
+    }
+
+
+def _dfm_stock_shape(shape, margin):
+    import Part
+    bb = shape.BoundBox
+    m = float(margin)
+    return Part.makeBox(
+        bb.XLength + 2 * m, bb.YLength + 2 * m, bb.ZLength + 2 * m,
+        App.Vector(bb.XMin - m, bb.YMin - m, bb.ZMin - m))
+
+
+def _rot_to_z(a):
+    """(rotation axis, degrees) that takes the axis onto +Z, or None when it is +Z."""
+    z = App.Vector(0.0, 0.0, 1.0)
+    d = max(-1.0, min(1.0, a.dot(z)))
+    if d > 0.999999:
+        return None
+    if d < -0.999999:
+        return (App.Vector(1.0, 0.0, 0.0), 180.0)
+    ax = a.cross(z)
+    return (ax, _math.degrees(_math.acos(d)))
+
+
+def _rotated(sh, rot, inverse=False):
+    c = sh.copy()
+    if rot is not None:
+        c.rotate(App.Vector(0.0, 0.0, 0.0), rot[0],
+                 -rot[1] if inverse else rot[1])
+    return c
+
+
+def _offset2d(sh, d):
+    """Offset a planar region in its own plane. Returns (shape or None, ok).
+
+    None with ok=True means the region eroded away to nothing, which is a
+    RESULT -- it is what a channel narrower than the tool does. ok=False means
+    the operation could not be performed and nothing may be concluded.
+
+    2D offsetting goes through BRepOffsetAPI_MakeOffset, which is a different
+    and far more forgiving algorithm than the 3D BRepOffsetAPI_MakeOffsetShape
+    that this replaced. That is the whole reason for the change of method: the
+    3D one refuses an inward offset of any solid with a non-trivial cavity,
+    which is every part worth checking.
+    """
+    try:
+        src = list(sh.Faces)
+    except Exception:
+        return None, False
+    if not src:
+        return None, True
+    import Part
+    out = []
+    for f in src:
+        r = None
+        for join, inter in ((0, False), (2, True)):
+            try:
+                r = f.makeOffset2D(float(d), join, False, False, inter)
+                break
+            except Exception:
+                r = None
+        if r is None or r.isNull():
+            # This face did not survive. For an erosion that is the expected
+            # outcome for anything narrower than the tool, so it is normally a
+            # RESULT rather than a failure.
+            #
+            # Except when it cannot be: a region wider than the tool in both
+            # directions does not erode away, so if that one refused, the
+            # operation broke. Without this the caller would read a broken
+            # offset as "the tool reaches nothing here" and invent an
+            # obstruction out of an OCC failure -- the exact substitution this
+            # module is built to refuse.
+            try:
+                fb = f.BoundBox
+                span = 4.0 * abs(float(d))
+                # The two LARGEST extents. A planar region has a zero third
+                # one by definition, so testing all three would have made this
+                # guard unreachable -- which is how a guard becomes a comment.
+                dims = sorted((fb.XLength, fb.YLength, fb.ZLength))[1:]
+                if dims[0] > span and dims[1] > span:
+                    return None, False
+            except Exception:
+                pass
+            continue
+        try:
+            for rf in r.Faces:
+                if rf.Area > 1e-9:
+                    out.append(rf)
+        except Exception:
+            continue
+    if not out:
+        return None, True
+    return Part.makeCompound(out), True
+
+
+def _faces_area(sh):
+    try:
+        return sum(float(f.Area) for f in sh.Faces)
+    except Exception:
+        return 0.0
+
+
+def _residual_slab(shape, stock, r, axis_names, level_cap=32):
+    """Material no cutter of this radius can reach, measured the way a mill works.
+
+    For one tool axis: slice the part perpendicular to it, and at each level
+    erode the free area by the tool radius to get the positions the tool
+    CENTRE may occupy. Carry that down -- a centre position is only usable if
+    it was usable at every level above, because a mill arrives from above and
+    cannot appear inside a cavity. Dilate the surviving centres back to get
+    the area actually swept, and whatever material is left is left.
+
+    This is a better model than the 3D morphological opening it replaces, and
+    not only because OCC will actually perform it. The opening used a SPHERE,
+    so it left the tool's own radius in every internal corner and a perfectly
+    ordinary pocket floor came back with a residual that had to be classified
+    away. An end mill has a flat bottom and a straight flank, and this
+    measures that: a square pocket floor comes back at zero, because that is
+    what it machines to.
+
+    Across several axes it is an intersection, not a sum: material is only
+    unreachable if it is unreachable from EVERY setup direction allowed. A
+    pocket in the underside of a plate is a second setup, not a defect, and
+    summing per-axis residuals would have called it one.
+    """
+    import Part
+    per_axis = {}
+    solids = []
+    levels_used = 0
+    for name in axis_names[:6]:
+        a = _axis_vec(name)
+        rot = _rot_to_z(a)
+        try:
+            part = _rotated(shape, rot)
+            stk = _rotated(stock, rot)
+            bb = stk.BoundBox
+        except Exception:
+            return None
+        if bb.ZLength <= 1e-6:
+            return None
+        n = max(6, min(level_cap, int(bb.ZLength / max(r * 0.5, 0.2)) + 1))
+        h = bb.ZLength / n
+        pad = max(r * 3.0, 5.0)
+        levels_used += n
+        prisms = []
+        vol = 0.0
+        approach = None
+        for k in range(n):
+            z = bb.ZMax - (k + 0.5) * h
+            try:
+                pl = Part.makePlane(
+                    bb.XLength + 2 * pad, bb.YLength + 2 * pad,
+                    App.Vector(bb.XMin - pad, bb.YMin - pad, z))
+                sect = part.common(pl)
+                solid_here = bool(sect and not sect.isNull() and sect.Faces)
+                free = pl.cut(sect) if solid_here else pl
+                stock_sect = stk.common(pl)
+                neg = stock_sect.cut(sect) if solid_here else stock_sect
+            except Exception:
+                return None
+            centres, ok = _offset2d(free, -r)
+            if not ok:
+                return None
+            # Map centres to a common plane (z=0) so that .common(centres) across
+            # slices at different z elevations intersects 2D planar shapes properly.
+            centres_z0 = None
+            if centres is not None:
+                c_copy = centres.copy()
+                c_copy.translate(App.Vector(0.0, 0.0, -z))
+                centres_z0 = c_copy
+
+            if k == 0:
+                # The top slice is open air out to the padding, so its eroded
+                # region cannot legitimately be empty. If it is, the offset
+                # broke rather than the geometry being tight, and every level
+                # below would inherit that as a false obstruction.
+                if centres_z0 is None:
+                    return None
+                approach = centres_z0
+            elif approach is None or centres_z0 is None:
+                approach = None
+            else:
+                try:
+                    approach = approach.common(centres_z0)
+                except Exception:
+                    return None
+                if not _faces_area(approach) > 1e-9:
+                    approach = None
+            reach = None
+            if approach is not None:
+                app_at_z = approach.copy()
+                app_at_z.translate(App.Vector(0.0, 0.0, z))
+                reach, ok2 = _offset2d(app_at_z, r)
+                if not ok2:
+                    return None
+            try:
+                rem = neg.cut(reach) if reach is not None else neg
+            except Exception:
+                return None
+            area = _faces_area(rem)
+            if area > 1e-9:
+                vol += area * h
+                try:
+                    rem.translate(App.Vector(0.0, 0.0, -h / 2.0))
+                    prisms.append(_rotated(rem.extrude(App.Vector(0.0, 0.0, h)),
+                                           rot, inverse=True))
+                except Exception:
+                    pass
+        per_axis[name] = round(vol, 3)
+        solids.append(Part.makeCompound(prisms) if prisms else None)
+
+    if not solids:
+        return None
+    if any(s is None for s in solids):
+        # One axis reaches everything, so nothing is unreachable from all of
+        # them. That axis is the setup; the reach check says how many there
+        # are.
+        return {"volumeMm3": 0.0, "byAxis": per_axis, "levels": levels_used}
+    acc = solids[0]
+    for other in solids[1:]:
+        try:
+            acc = acc.common(other)
+        except Exception:
+            return None
+        if acc is None or acc.isNull():
+            return {"volumeMm3": 0.0, "byAxis": per_axis, "levels": levels_used}
+    try:
+        total = float(acc.Volume)
+    except Exception:
+        return None
+    return {"volumeMm3": round(max(total, 0.0), 3), "byAxis": per_axis,
+            "levels": levels_used}
+
+
+def _residual_closing(shape, stock, r):
+    """The axis-free bound: the morphological closing of the part, minus the part.
+
+    A ball of radius r can occupy a point only if the whole ball misses the
+    part, so material that is inside dilate-then-erode but outside the part is
+    material no ball of that radius reaches from any direction at all. Written
+    as a closing of the PART rather than an opening of the space around it,
+    which matters: the space around a part is a box with a part-shaped hole in
+    it, and OCC will not offset that inward. It offsets a part outward and
+    back reasonably often.
+
+    Kept as the fallback because it is axis-free and therefore a stronger
+    claim than the slab measurement. Its weakness is the structuring element:
+    a ball leaves its own radius in every internal corner, so the leftover has
+    to be classified rather than believed.
+    """
+    try:
+        grown = _offset_shape(shape, float(r))
+        closed = _offset_shape(grown, -float(r))
+        residual = closed.cut(shape).common(stock)
+        rv = float(residual.Volume)
+    except Exception as e:
+        return None, str(e)
+    if rv < 0:
+        rv = 0.0
+    skin = None
+    if rv > 1e-3:
+        probe_r = max(r * 0.3, 0.05)
+        try:
+            core = _offset_shape(residual, -probe_r)
+            skin = (core is None or core.isNull()
+                    or float(core.Volume) <= 1e-9)
+        except Exception:
+            skin = None
+    return {"volumeMm3": round(rv, 3), "skinOnly": skin,
+            "skinProbeRadius": round(max(r * 0.3, 0.05), 4)}, None
+
+
+def _dfm_residual(shape, stock, radius, axis_names):
+    """The volume a cutter of this radius cannot reach. The definitive number.
+
+    Two methods, tried in order, and the reply always says which one answered
+    because they do not mean quite the same thing:
+
+      slab-2d       the mill model. Per setup direction, and a point counts as
+                    unreachable only when every allowed direction fails it.
+                    Flat-bottomed, so a square pocket floor reads zero.
+      ball-closing  axis-free, and therefore the stronger claim when it works:
+                    unreachable by a ball of that radius from ANY direction.
+                    Leaves the tool's own corner radius behind, so its
+                    leftover is classified as a skin or an obstruction.
+
+    Read the obstructed flag. A raw volume is not a verdict under either method, and
+    a leftover that could not be classified stays obstructed on purpose.
+    """
+    r = float(radius)
+    out = {"toolRadius": round(r, 4), "volumeMm3": None, "fraction": None,
+           "method": None, "ok": False, "obstructed": None, "skinOnly": None}
+    try:
+        neg = stock.cut(shape)
+        neg_v = float(neg.Volume)
+    except Exception as e:
+        out["error"] = "stock minus part failed: %s" % type(e).__name__
+        return out
+    out["removeVolumeMm3"] = round(neg_v, 3)
+    if neg_v <= 1e-6:
+        out.update({"ok": True, "volumeMm3": 0.0, "fraction": 0.0,
+                    "obstructed": False, "method": "none",
+                    "note": "stock and part are the same volume; "
+                            "nothing to remove"})
+        return out
+
+    errors = []
+    slab = None
+    try:
+        slab = _residual_slab(shape, stock, r, axis_names)
+    except Exception as e:
+        errors.append("slab-2d: %s: %s" % (type(e).__name__, e))
+    if slab is not None:
+        rv = slab["volumeMm3"]
+        # The slab measurement is sampled, so a thin sliver of numerical
+        # leftover is not a finding. The floor is generous enough to survive
+        # discretisation and far below anything a cutter genuinely misses.
+        floor = max(2.0, 0.005 * neg_v)
+        out.update({
+            "ok": True, "method": "slab-2d", "volumeMm3": rv,
+            "fraction": round(rv / neg_v, 6) if neg_v else None,
+            "byAxis": slab["byAxis"], "levels": slab["levels"],
+            "axes": list(axis_names), "skinOnly": False,
+            "obstructed": bool(rv > floor),
+            "significanceFloorMm3": round(floor, 3),
+            "note": "measured per setup direction and intersected: this is "
+                    "material unreachable from EVERY direction in axes. A flat "
+                    "end mill is assumed, so square pocket floors read zero.",
+        })
+        return out
+    if errors:
+        out["slabError"] = errors[-1]
+
+    closing, err = _residual_closing(shape, stock, r)
+    if closing is None:
+        out["error"] = (
+            "both residual methods failed (slab-2d: %s; ball-closing: %s). "
+            "These are OCC limits, not a verdict: do not report the part as "
+            "machinable on the strength of them."
+            % (errors[-1] if errors else "returned nothing", err))
+        return out
+
+    rv = closing["volumeMm3"]
+    out.update({"ok": True, "method": "ball-closing", "volumeMm3": rv,
+                "fraction": round(rv / neg_v, 6) if neg_v else None,
+                "skinProbeRadius": closing["skinProbeRadius"]})
+    if rv <= 1e-3:
+        out["obstructed"] = False
+        out["skinOnly"] = False
+        return out
+    skin = closing["skinOnly"]
+    if skin is True:
+        out["skinOnly"] = True
+        out["obstructed"] = False
+        out["skinNote"] = (
+            "the leftover is nowhere thicker than %.2f mm: it is the corner "
+            "radius a %.1f mm cutter leaves in an internal corner, not "
+            "material it cannot reach. The corners will be radiused."
+            % (closing["skinProbeRadius"] * 2, r * 2))
+    else:
+        out["skinOnly"] = False if skin is False else None
+        out["obstructed"] = True
+        if skin is None:
+            out["skinNote"] = (
+                "the leftover could not be classified, so it is reported as an "
+                "obstruction. That is the loud direction on purpose.")
+    return out
+
+
+def _dfm_voids(shape):
+    """A cavity with no opening. Subtractive processes cannot make one."""
+    try:
+        shells = len(shape.Shells)
+    except Exception:
+        return None
+    if shells <= 1:
+        return None
+    return {"shells": shells,
+            "message": "the solid has %d shells, so it encloses %d void(s) "
+                       "with no opening to the outside. No milling, turning "
+                       "or drilling operation can produce that; it is casting, "
+                       "additive, or two parts joined." % (shells, shells - 1)}
+
+
+def _dfm_holes(doc, obj):
+    """The hole rules the stock lint does not cover.
+
+    _stock_lint already refuses a non-stock diameter and a thread engagement
+    under 1.5xD. These are the two that are about the DRILL rather than the
+    fastener: how deep a jobber drill goes before it is a peck cycle and a
+    special tool, and the flat bottom that a twist drill physically cannot
+    leave.
+    """
+    out = []
+    for o in doc.Objects:
+        if "PartDesign::Hole" not in o.TypeId:
+            continue
+        if _suppressed(o):
+            continue
+        try:
+            d = float(o.Diameter)
+        except Exception:
+            continue
+        depth_type = str(getattr(o, "DepthType", "") or "")
+        through = "through" in depth_type.lower()
+        depth = None
+        if not through:
+            try:
+                depth = float(o.Depth)
+            except Exception:
+                depth = None
+        if d > 1e-6 and depth and depth / d > DRILL_DEPTH_RATIO:
+            out.append({
+                "level": "warn", "object": o.Name, "code": "dfm-hole-depth",
+                "message": "%.2f mm hole %.1f mm deep is %.1fxD; past %.0fxD "
+                           "it is a peck cycle with a long-series drill, not a "
+                           "stock operation" % (d, depth, depth / d,
+                                                DRILL_DEPTH_RATIO)})
+        try:
+            if not through and str(getattr(o, "DrillPoint", "")).lower() == "flat":
+                out.append({
+                    "level": "warn", "object": o.Name,
+                    "code": "dfm-flat-bottom-hole",
+                    "message": "a blind hole with a flat bottom cannot be "
+                               "drilled -- a twist drill leaves a 118 deg cone. "
+                               "It is an end mill (so the diameter has to be a "
+                               "cutter size) or a second flat-bottom tool"})
+        except Exception:
+            pass
+    return out
+
+
+def _stock_tool_at_or_below(d):
+    best = None
+    for s in ENDMILL_SIZES:
+        if s <= d + 1e-6:
+            best = s
+    return best
+
+
+def dfm(targets=None, process="mill3axis", tool=None, axes=None,
+        stock=None, stockMargin=None, checks=None, doc=None):
+    """Can this be made? Measured, not asserted.
+
+    Read-only: no transaction, no undo entry, nothing added to the document.
+    That is deliberate and it is the same reasoning that makes freecad_measure
+    safe -- a check that costs the user a confirmation is a check that stops
+    being run.
+    """
+    doc = doc or App.ActiveDocument
+    if doc is None:
+        raise KoiOpError("no active document")
+    proc = str(process or "mill3axis")
+    if proc not in DFM_PROCESSES:
+        raise KoiOpError("process must be one of %s"
+                         % ", ".join(DFM_PROCESSES))
+    want = set(checks or ("corners", "reach", "residual", "voids", "holes"))
+    # The bounding box with no allowance. An allowance is real material, and
+    # it is machined in a setup of its own; charging it to the first setup is
+    # what made a plain plate's underside read as unreachable.
+    margin = 0.0 if stockMargin is None else float(stockMargin)
+
+    objs = []
+    if targets:
+        for t in targets:
+            objs.append(_resolve_or_die(doc, t, "object"))
+    else:
+        objs = _presentation_parts(doc)
+    objs = [o for o in objs if _dfm_shape(o) is not None]
+    if not objs:
+        raise KoiOpError(
+            "nothing with a solid to check. Pass targets, or build something "
+            "first -- dfm measures shapes, and a document of sketches has none")
+
+    if axes:
+        axis_names = [str(a) for a in axes]
+        for a in axis_names:
+            _axis_vec(a)
+    elif proc == "mill3axis":
+        axis_names = ["+Z", "-Z"]
+    elif proc in ("mill5axis", "mill_any"):
+        axis_names = ["+Z", "-Z", "+X", "-X", "+Y", "-Y"]
+    else:
+        axis_names = ["+Z"]
+
+    reports = []
+    findings = []
+    verdict_bits = []
+    unknown = []
+
+    for o in objs:
+        shape = _dfm_shape(o)
+        r = {"object": o.Name, "label": o.Label,
+             "volumeMm3": round(float(shape.Volume), 3),
+             "faces": len(shape.Faces)}
+        ax = _axis_vec(axis_names[0])
+
+        if "corners" in want:
+            c = _dfm_corners(shape, ax, None)
+            r["corners"] = c
+            if c.get("sharpCount"):
+                findings.append({
+                    "level": "error", "object": o.Name,
+                    "code": "dfm-sharp-corner",
+                    "message": "%d sharp internal corner(s) run along %s. A "
+                               "rotating cutter leaves its own radius; a zero "
+                               "radius is not a smaller tool, it is EDM, a "
+                               "corner relief, or a redesign"
+                               % (c["sharpCount"], axis_names[0])})
+            if c.get("maxToolDiameter"):
+                mt = c["maxToolDiameter"]
+                st = _stock_tool_at_or_below(mt)
+                r["corners"]["nearestStockTool"] = st
+                if st is None:
+                    findings.append({
+                        "level": "error", "object": o.Name,
+                        "code": "dfm-tool-too-large",
+                        "message": "the tightest internal corner is %.3f mm "
+                                   "diameter and the smallest stock end mill "
+                                   "is %.1f mm" % (mt, ENDMILL_SIZES[0])})
+                elif tool and float(tool) > mt + 1e-6:
+                    findings.append({
+                        "level": "error", "object": o.Name,
+                        "code": "dfm-tool-too-large",
+                        "message": "a %.1f mm cutter does not fit the tightest "
+                                   "internal corner, which is %.3f mm across. "
+                                   "%.1f mm is the largest that goes in"
+                                   % (float(tool), mt, st)})
+                elif abs(st - mt) > 0.01:
+                    findings.append({
+                        "level": "info", "object": o.Name,
+                        "code": "dfm-corner-tool",
+                        "message": "tightest internal corner is R%.3f, so the "
+                                   "largest tool that fits is %.1f mm -- "
+                                   "rounding the corner to R%.1f lets a bigger "
+                                   "cutter in and costs nothing"
+                                   % (mt / 2.0, st, st / 2.0)})
+
+        if "reach" in want:
+            rr = _dfm_reach(shape, axis_names)
+            r["reach"] = rr
+            if rr["unreachableFaceCount"]:
+                findings.append({
+                    "level": "error", "object": o.Name,
+                    "code": "dfm-undercut",
+                    "message": "%d face(s), %.1f mm2, are reachable from none "
+                               "of %s. On a 3-axis machine that is an undercut: "
+                               "no tool, no setup, no feed rate reaches them"
+                               % (rr["unreachableFaceCount"],
+                                  rr["unreachableAreaMm2"],
+                                  ", ".join(axis_names))})
+            if rr["setupCount"] > 1:
+                findings.append({
+                    "level": "warn", "object": o.Name,
+                    "code": "dfm-multi-setup",
+                    "message": "needs %d setups (%s). Each re-fixture is a "
+                               "tolerance stack between the features cut before "
+                               "and after it -- say so before quoting a "
+                               "position tolerance across them"
+                               % (rr["setupCount"],
+                                  ", ".join(rr["setupsSuggested"]))})
+            if rr["truncated"]:
+                unknown.append("reach: budget exhausted on %s" % o.Name)
+            if rr.get("facesUndecided") and rr["facesUndecided"] > max(
+                    2, 0.1 * (rr["facesChecked"] or 1)):
+                unknown.append(
+                    "reach: the material side of %d face(s) on %s could not be "
+                    "measured, so they were not checked"
+                    % (rr["facesUndecided"], o.Name))
+
+        if "residual" in want:
+            if tool:
+                td = float(tool)
+                src = "argument"
+            else:
+                mt = ((r.get("corners") or {}).get("maxToolDiameter"))
+                td = _stock_tool_at_or_below(mt) if mt else 6.0
+                td = td or ENDMILL_SIZES[0]
+                src = "derived from the tightest internal corner"
+            st_shape = None
+            if stock:
+                so = _resolve_or_die(doc, stock, "stock object")
+                st_shape = _dfm_shape(so)
+            if st_shape is None:
+                # The bounding box, with no allowance by default. An
+                # allowance is real material and it is machined in a setup of
+                # its own -- counting it here made the underside of every
+                # plate read as unreachable from the side its top was cut
+                # from, which is a fact about flipping the part, not about the
+                # part.
+                st_shape = _dfm_stock_shape(shape, margin)
+                st_src = ("bounding box" if margin <= 0
+                          else "bounding box + %.1f mm" % margin)
+            else:
+                st_src = stock
+            res = _dfm_residual(shape, st_shape, td / 2.0, axis_names)
+            res["toolDiameter"] = td
+            res["toolSource"] = src
+            res["stock"] = st_src
+            r["residual"] = res
+            if not res.get("ok"):
+                unknown.append("residual: %s" % res.get("error", "did not run"))
+            elif res.get("obstructed"):
+                findings.append({
+                    "level": "error", "object": o.Name,
+                    "code": "dfm-unreachable-volume",
+                    "message": "%.2f mm3 (%.2f%% of the material to remove) "
+                               "cannot be reached by a %.1f mm cutter from any "
+                               "of %s. It is not a setup problem -- the "
+                               "finished part will not be the modelled shape. "
+                               "(measured by %s)"
+                               % (res["volumeMm3"],
+                                  100.0 * (res.get("fraction") or 0.0), td,
+                                  ", ".join(axis_names),
+                                  res.get("method") or "?")})
+            elif res.get("skinOnly") and (res.get("volumeMm3") or 0) > 1e-3:
+                # Reported, never as a failure. An internal corner keeps the
+                # cutter's own radius and that is what the part will have --
+                # worth one line, because a drawing that calls it sharp is
+                # a drawing the shop will phone about.
+                findings.append({
+                    "level": "info", "object": o.Name,
+                    "code": "dfm-corner-leftover",
+                    "message": "%.2f mm3 stays in the internal corners: that "
+                               "is the R%.1f a %.1f mm cutter leaves, not "
+                               "material it cannot reach. The corners will be "
+                               "radiused, not square"
+                               % (res["volumeMm3"], td / 2.0, td)})
+
+        if "voids" in want:
+            v = _dfm_voids(shape)
+            if v:
+                r["voids"] = v
+                findings.append({
+                    "level": "error", "object": o.Name,
+                    "code": "dfm-internal-void", "message": v["message"]})
+
+        reports.append(r)
+
+    if "holes" in want:
+        findings.extend(_dfm_holes(doc, None))
+
+    errors = [f for f in findings if f["level"] == "error"]
+    warns = [f for f in findings if f["level"] == "warn"]
+
+    # Precedence, and it is the other way round from the obvious reading. A
+    # blocking finding is DISPOSITIVE: a check that did not run can only ever
+    # add more findings, never withdraw one, so an unmeasured residual cannot
+    # make a sharp internal corner go away. Reporting "not determined" over a
+    # measured error buried the only answer that mattered.
+    if errors:
+        manufacturable = False
+        verdict = ("NOT MANUFACTURABLE as modelled by %s: %d blocking "
+                   "finding(s). Fix the geometry -- these are not tolerances "
+                   "to negotiate." % (proc, len(errors)))
+        if unknown:
+            verdict += (" %d further check(s) did not run (%s), so there may "
+                        "be more than these."
+                        % (len(unknown), "; ".join(unknown[:2])))
+    elif unknown:
+        manufacturable = None
+        verdict = ("NOT DETERMINED. %d check(s) could not run: %s. Report this "
+                   "as an unfinished check, not as a pass."
+                   % (len(unknown), "; ".join(unknown[:4])))
+    elif warns:
+        manufacturable = True
+        verdict = ("Manufacturable by %s, with %d thing(s) that cost money or "
+                   "tolerance. Say what they are before the user commits."
+                   % (proc, len(warns)))
+    else:
+        manufacturable = True
+        verdict = ("Manufacturable by %s on every check that ran." % proc)
+
+    return {
+        "process": proc,
+        "axes": axis_names,
+        "objects": reports,
+        "findings": findings,
+        "errorCount": len(errors),
+        "warnCount": len(warns),
+        "notDetermined": unknown,
+        "manufacturable": manufacturable,
+        "verdict": verdict,
+        "note": ("Geometry only. This does not know your machine, your work "
+                 "holding, your material or your tolerances, and it does not "
+                 "replace a quote. What it does know is measured: a residual "
+                 "volume came out of an offset operation, not out of a "
+                 "sentence. For toolpath-level proof run the cam op."),
+    }
+
+
+# ---------- the CAM workbench proper ----------
+
+CAM_API_CANDIDATES = {
+    "job": (("Path.Main.Job", "Create"), ("PathScripts.PathJob", "Create")),
+    "profile": (("Path.Op.Profile", "Create"), ("PathScripts.PathProfile", "Create")),
+    "pocket": (("Path.Op.Pocket", "Create"), ("PathScripts.PathPocketShape", "Create")),
+    "drilling": (("Path.Op.Drilling", "Create"), ("PathScripts.PathDrilling", "Create")),
+    "adaptive": (("Path.Op.Adaptive", "Create"), ("PathScripts.PathAdaptive", "Create")),
+    "face": (("Path.Op.MillFace", "Create"), ("PathScripts.PathMillFace", "Create")),
+    "helix": (("Path.Op.Helix", "Create"), ("PathScripts.PathHelix", "Create")),
+    "bit": (("Path.Tool.Bit", None), ("PathScripts.PathToolBit", None)),
+    "controller": (("Path.Tool.Controller", "Create"),
+                   ("PathScripts.PathToolController", "Create")),
+    "post": (("Path.Post.Command", None), ("PathScripts.PathPost", None)),
+}
+
+CAM_OP_KINDS = ("profile", "pocket", "drilling", "adaptive", "face", "helix")
+
+
+def _import_probe(cands):
+    """Which spelling of a workbench API this build has. Probed, never assumed.
+
+    K0 with teeth: Path was PathScripts before 1.0 and the operation modules
+    moved with it; the FEM mesh object renamed its own shape link in the same
+    release. Guessing one spelling and catching ImportError would make "this
+    workbench is not installed" and "this workbench moved" the same message,
+    and they need different answers from the user.
+
+    cands maps a key to an ordered tuple of (module, attribute-or-None). The
+    first module that imports AND carries the attribute wins, and the winner
+    is reported so a reply can say which one answered.
+    """
+    import importlib
+    found = {}
+    for key, spellings in cands.items():
+        found[key] = None
+        for modname, attr in spellings:
+            try:
+                m = importlib.import_module(modname)
+            except Exception:
+                continue
+            if attr and not hasattr(m, attr):
+                continue
+            found[key] = {"module": modname, "m": m}
+            break
+    return found
+
+
+def _api_report(api):
+    return dict((k, (v["module"] if v else None)) for k, v in api.items())
+
+
+def _cam_api():
+    return _import_probe(CAM_API_CANDIDATES)
+
+
+def _cam_api_report(api):
+    return _api_report(api)
+
+
+def _cam_require(api, key):
+    v = api.get(key)
+    if v is None:
+        raise KoiOpError(
+            "this FreeCAD has no importable %s module for CAM (tried %s). "
+            "The CAM workbench is not available here -- say that rather than "
+            "reporting the design as unverified for some other reason."
+            % (key, ", ".join(c[0] for c in CAM_API_CANDIDATES[key])))
+    return v["m"]
+
+
+def _cam_jobs(doc):
+    out = []
+    for o in doc.Objects:
+        try:
+            if "Path::FeaturePython" in o.TypeId and hasattr(o, "Operations"):
+                out.append(o)
+            elif o.TypeId.startswith("Path::") and hasattr(o, "Stock"):
+                out.append(o)
+        except Exception:
+            continue
+    return out
+
+
+def _cam_path_stats(op, clearance=None):
+    """Read the toolpath. An empty one is the answer, not an error to swallow.
+
+    An operation that generated no commands recomputed clean, reports no
+    error, and shows nothing in the viewport that a screenshot would catch.
+    It means the workbench could not machine that feature with that tool --
+    which is exactly the definitive feedback this whole section exists for.
+    """
+    p = getattr(op, "Path", None)
+    cmds = []
+    try:
+        cmds = list(getattr(p, "Commands", []) or [])
+    except Exception:
+        cmds = []
+    x = y = z = 0.0
+    cut = 0.0
+    rapid = 0.0
+    low_rapids = 0
+    plunge = 0.0
+    for c in cmds:
+        try:
+            nm = str(getattr(c, "Name", "")).upper()
+            par = getattr(c, "Parameters", {}) or {}
+            nx = float(par.get("X", x))
+            ny = float(par.get("Y", y))
+            nz = float(par.get("Z", z))
+        except Exception:
+            continue
+        d = _math.sqrt((nx - x) ** 2 + (ny - y) ** 2 + (nz - z) ** 2)
+        lateral = _math.sqrt((nx - x) ** 2 + (ny - y) ** 2)
+        if nm in ("G0", "G00"):
+            rapid += d
+            if (clearance is not None and lateral > 1e-6
+                    and (nz < clearance - 1e-6 or z < clearance - 1e-6)):
+                low_rapids += 1
+        elif nm in ("G1", "G01", "G2", "G02", "G3", "G03"):
+            cut += d
+            if lateral < 1e-6 and nz < z:
+                plunge += (z - nz)
+        x, y, z = nx, ny, nz
+    out = {
+        "name": op.Name,
+        "label": op.Label,
+        "type": op.TypeId,
+        "commands": len(cmds),
+        "cutLengthMm": round(cut, 3),
+        "rapidLengthMm": round(rapid, 3),
+        "plungeLengthMm": round(plunge, 3),
+        "active": bool(getattr(op, "Active", True)),
+    }
+    if len(cmds) == 0:
+        out["empty"] = True
+        out["emptyNote"] = (
+            "this operation generated ZERO path commands. It recomputes clean "
+            "and shows nothing wrong: it means the workbench could not "
+            "machine this feature with this tool. Do not report the job as "
+            "verified.")
+    if low_rapids:
+        out["rapidsBelowClearance"] = low_rapids
+        out["rapidNote"] = (
+            "%d rapid move(s) travel sideways below the clearance height. On "
+            "a real machine that is a G0 through stock." % low_rapids)
+    return out
+
+
+def _cam_tool_controller(doc, job, api, diameter, kind="endmill"):
+    """A tool controller for the job, whatever this build calls one.
+
+    A Job created from a template usually arrives with one. Creating a bit
+    from scratch needs the shape files on disk, which a container image may
+    not carry -- so the existing controller is reused where there is one and
+    the failure is named where there is not, rather than a default tool being
+    invented and every later number being about a tool nobody chose.
+    """
+    tcs = []
+    try:
+        tcs = list(job.Tools.Group)
+    except Exception:
+        tcs = []
+    if tcs:
+        tc = tcs[0]
+        if diameter:
+            try:
+                tc.Tool.Diameter = App.Units.Quantity("%f mm" % float(diameter))
+            except Exception:
+                try:
+                    tc.Tool.Diameter = float(diameter)
+                except Exception:
+                    pass
+        return tc, "reused the job's default tool controller"
+    bitmod = api.get("bit")
+    ctlmod = api.get("controller")
+    if not bitmod or not ctlmod:
+        raise KoiOpError(
+            "this job has no tool controller and this build exposes no way to "
+            "create one from script (no %s). Add a tool in the CAM workbench "
+            "and re-run." % ("Path.Tool.Bit/Controller",))
+    raise KoiOpError(
+        "this job has no tool controller. Creating a bit from script needs the "
+        "tool shape files this install may not carry; add one tool in the CAM "
+        "workbench (CAM > Tool Bit Library) and re-run. Nothing here will "
+        "invent a tool, because every feed, radius and cycle time after it "
+        "would be about a tool nobody chose.")
+
+
+def _op_cam(doc, args, kid):
+    """The CAM workbench, through the same envelope as everything else.
+
+    mode:
+      job     create a Job on a target solid, with stock. Registers the kid.
+      op      add one operation to a job.
+      verify  recompute and read every operation's toolpath.
+      post    write G-code into the export directory.
+      clear   delete the job and everything under it.
+    """
+    api = _cam_api()
+    mode = str(args.get("mode") or "job")
+    # Same rule as every other creating call, enforced here rather than in the
+    # JS spec because only two of the five modes create anything. A Job with
+    # no koi id is a Job the next turn has to find by label.
+    if mode in ("job", "op") and not kid:
+        raise KoiOpError(
+            "cam mode %r creates an object, so it needs an id -- a handle like "
+            "'cam.plate' or 'camop.rough' that a later turn can address" % mode)
+    report = {"api": _cam_api_report(api), "mode": mode}
+
+    if mode == "job":
+        JobMod = _cam_require(api, "job")
+        target = args.get("target")
+        if not target:
+            raise KoiOpError("cam job needs a target: the solid to machine")
+        o = _resolve_or_die(doc, target, "object")
+        if _dfm_shape(o) is None:
+            raise KoiOpError(
+                "%r has no solid to machine. A CAM job on a sketch or an empty "
+                "body generates nothing and reports no error." % target)
+        job = JobMod.Create(_safe_name(args.get("name") or kid or "Job", "Job"),
+                            [o], None)
+        try:
+            doc.recompute()
+        except Exception:
+            pass
+        report["job"] = job.Name
+        report["model"] = o.Name
+        try:
+            report["stock"] = {"name": job.Stock.Name,
+                               "volumeMm3": round(float(job.Stock.Shape.Volume), 3)}
+        except Exception:
+            report["stock"] = None
+            report["stockNote"] = (
+                "the job has no readable stock. Every removal number below is "
+                "about nothing until it does.")
+        try:
+            report["toolControllers"] = [t.Name for t in job.Tools.Group]
+        except Exception:
+            report["toolControllers"] = []
+        if not report["toolControllers"]:
+            report["toolNote"] = (
+                "this job arrived with no tool controller. Add one tool in the "
+                "CAM workbench before adding operations -- an operation with no "
+                "tool generates an empty path and reports no error.")
+        if kid:
+            register(doc, kid, job)
+        return report
+
+    if mode == "op":
+        kind = str(args.get("op") or "profile")
+        if kind not in CAM_OP_KINDS:
+            raise KoiOpError("op must be one of %s" % ", ".join(CAM_OP_KINDS))
+        OpMod = _cam_require(api, kind)
+        job = _resolve_or_die(doc, args.get("job"), "cam job")
+        opobj = OpMod.Create(_safe_name(kid or kind, kind))
+        try:
+            job.Proxy.addOperation(opobj, None)
+        except Exception:
+            try:
+                grp = list(job.Operations.Group)
+                grp.append(opobj)
+                job.Operations.Group = grp
+            except Exception as e:
+                raise KoiOpError("could not add the operation to the job: %s" % e)
+        # The gate, not a best effort. An operation with no tool controller
+        # generates an empty path and reports no error -- which is exactly the
+        # reading this whole tool exists to make impossible, so it is refused
+        # here instead of surfacing three steps later as "not machinable".
+        tc, tcnote = _cam_tool_controller(doc, job, api,
+                                          args.get("toolDiameter"))
+        report["toolController"] = {"name": tc.Name, "note": tcnote}
+        try:
+            opobj.ToolController = tc
+        except Exception as e:
+            raise KoiOpError(
+                "this operation would not take the job's tool controller "
+                "(%s), so any path it generated would be about no tool at "
+                "all." % e)
+        base = args.get("base")
+        if base:
+            pairs = []
+            for b in base:
+                obj, sub = _resolve_ref_sub(doc, b)
+                pairs.append((obj, [sub] if sub else []))
+            try:
+                opobj.Base = pairs
+            except Exception as e:
+                raise KoiOpError("this operation would not take that base: %s" % e)
+        for prop, val in (args.get("props") or {}).items():
+            try:
+                setattr(opobj, str(prop), val)
+            except Exception as e:
+                raise KoiOpError("%s does not accept %r: %s" % (kind, prop, e))
+        try:
+            doc.recompute()
+        except Exception:
+            pass
+        clearance = None
+        try:
+            clearance = float(opobj.ClearanceHeight.Value)
+        except Exception:
+            pass
+        report["operation"] = _cam_path_stats(opobj, clearance)
+        if kid:
+            register(doc, kid, opobj)
+        return report
+
+    if mode == "verify":
+        job = _resolve_or_die(doc, args.get("job"), "cam job")
+        try:
+            doc.recompute()
+        except Exception:
+            pass
+        ops = []
+        try:
+            ops = list(job.Operations.Group)
+        except Exception:
+            ops = []
+        clearance = None
+        stats = []
+        for op in ops:
+            try:
+                clearance = float(op.ClearanceHeight.Value)
+            except Exception:
+                clearance = None
+            stats.append(_cam_path_stats(op, clearance))
+        empties = [s["name"] for s in stats if s.get("empty")]
+        unsafe = [s["name"] for s in stats if s.get("rapidsBelowClearance")]
+        report["job"] = job.Name
+        report["operations"] = stats
+        report["operationCount"] = len(stats)
+        report["emptyOperations"] = empties
+        report["rapidWarnings"] = unsafe
+        report["totalCommands"] = sum(s["commands"] for s in stats)
+        report["totalCutLengthMm"] = round(
+            sum(s["cutLengthMm"] for s in stats), 3)
+        if not stats:
+            report["machinable"] = None
+            report["verdict"] = (
+                "this job has no operations, so nothing was verified. An empty "
+                "job proves nothing and must not be reported as a pass.")
+        elif empties:
+            report["machinable"] = False
+            report["verdict"] = (
+                "%d of %d operations generated NO toolpath (%s). That is the "
+                "workbench saying it could not machine those features with "
+                "this tool." % (len(empties), len(stats), ", ".join(empties)))
+        else:
+            report["machinable"] = True
+            report["verdict"] = (
+                "every operation generated a toolpath: %d commands, %.1f mm of "
+                "cutting. A toolpath exists; it has not been simulated against "
+                "the stock, so this is proof of reachability, not of a correct "
+                "finished part." % (report["totalCommands"],
+                                    report["totalCutLengthMm"]))
+        if unsafe:
+            report["safetyNote"] = (
+                "operations %s contain lateral rapids below their clearance "
+                "height. Do not hand this G-code to a machine."
+                % ", ".join(unsafe))
+        return report
+
+    if mode == "post":
+        job = _resolve_or_die(doc, args.get("job"), "cam job")
+        postmod = api.get("post")
+        if postmod is None:
+            raise KoiOpError(
+                "this build exposes no scriptable post processor. The job and "
+                "its toolpaths are real; the G-code has to come out of the CAM "
+                "workbench by hand.")
+        import os
+        path = confined_path(args.get("savePath") or ((kid or job.Name) + ".nc"),
+                             (".nc", ".gcode", ".ngc", ".tap"))
+        # The post processor writes where the JOB says, not where we would
+        # like: exportObjectsWith(needFilename=False) takes the filename off
+        # the job. Reporting a confined path we never handed to it was how
+        # this could answer with a path that had no file behind it.
+        try:
+            job.PostProcessorOutputFile = path
+        except Exception as e:
+            raise KoiOpError(
+                "this job would not take an output filename (%s), so the post "
+                "processor would write somewhere nobody here can name. Set it "
+                "in the CAM workbench and post from there." % e)
+        was = None
+        try:
+            was = os.path.getmtime(path)
+        except Exception:
+            was = None
+        m = postmod["m"]
+        ran = False
+        for attr in ("CommandPathPost", "PathPost"):
+            cls = getattr(m, attr, None)
+            if cls is None:
+                continue
+            try:
+                inst = cls()
+                inst.exportObjectsWith([job], job, needFilename=False)
+                ran = True
+                break
+            except Exception as e:
+                report["postError"] = "%s: %s" % (type(e).__name__, e)
+        if not ran:
+            raise KoiOpError(
+                "the post processor did not run: %s. The toolpaths are still "
+                "real -- report the verification, not the G-code."
+                % report.get("postError", "no usable entry point"))
+        # Measured, like everything else here. A post processor that returns
+        # without raising has still not necessarily written a file: it opens a
+        # dialog on some builds and silently no-ops when the job has no post
+        # processor selected.
+        size = None
+        try:
+            now = os.path.getmtime(path)
+            size = os.path.getsize(path)
+            if was is not None and now <= was:
+                size = None
+        except Exception:
+            size = None
+        if not size:
+            raise KoiOpError(
+                "the post processor ran and no G-code file appeared at %s. On "
+                "this build it may need a post processor chosen on the job, "
+                "or it may be trying to open a save dialog. The toolpaths are "
+                "still real -- report the verification, not the G-code."
+                % path)
+        report["job"] = job.Name
+        report["savePath"] = path
+        report["bytes"] = size
+        report["note"] = (
+            "G-code is written and NOT verified against a machine. Post output "
+            "is machine-specific; the operator has to check it.")
+        return report
+
+    if mode == "clear":
+        job = _resolve_or_die(doc, args.get("job"), "cam job")
+        # A Job owns a Model group with a clone of the part, a Stock, an
+        # Operations group, a Tools group and a SetupSheet. removeObject on
+        # the Job alone leaves every one of them in the tree as an orphan --
+        # and then reports "removed", which is the kind of claim this file is
+        # supposed to measure rather than make.
+        name = job.Name
+        removed = _remove_subtree(doc, job)
+        if name not in removed:
+            raise KoiOpError(
+                "could not remove the job %s; %s came out and the rest is "
+                "still in the tree." % (name, ", ".join(removed) or "nothing"))
+        report["removed"] = removed
+        return report
+
+    raise KoiOpError(
+        "mode must be job, op, verify, post or clear (got %r)" % mode)
+
+
+# ---------- CAE: linear static structural (FEM) ----------
+#
+# What this is for, and what it deliberately is not.
+#
+# Everything above answers "is the model what I meant" (measure) or "can it be
+# made" (dfm, cam). Nothing above answers "does it survive the load", and the
+# failure mode of that silence is specific and bad: asked whether a 3 mm wall
+# is strong enough, a language model produces a confident sentence. A sentence
+# is not a number, and the user cannot tell the difference. This is the channel
+# that makes such a claim measurable -- or refuses to make it.
+#
+# It is a LINEAR STATIC solve and nothing else. Small displacements, linear
+# elastic material, bonded everything, one load case, no contact, no
+# plasticity, no buckling, no fatigue, no dynamics, no thermal. Each of those
+# is a real way the part fails that this cannot see, so a von Mises number
+# from here is evidence, never a certificate.
+#
+# Three silent failures it is built around, because all three "solve" cleanly
+# and print a plausible number:
+#
+#   * an under-restrained model, where rigid-body motion reads as deflection.
+#     Refused before the solver runs, not diagnosed after.
+#   * a surface mesh on a solid: no volume elements means no stiffness at all.
+#     Also refused rather than reported.
+#   * a peak stress at a sharp re-entrant corner. That is a SINGULARITY: it
+#     rises without bound as the mesh refines, so it is not a stress, and a
+#     factor of safety divided out of it is not a factor of safety. Measured,
+#     by asking how far the peak node is from the nearest concave edge, and
+#     said out loud.
+
+FEM_API_CANDIDATES = {
+    "objects": (("ObjectsFem", "makeAnalysis"),),
+    "gmsh": (("femmesh.gmshtools", "GmshTools"),),
+    "ccx": (("femtools.ccxtools", "FemToolsCcx"),),
+    "fem": (("Fem", None),),
+}
+
+# Spelling moves between builds exactly the way the CAM operation modules did,
+# and for the same reason: this is a workbench under active rework. Probed by
+# attribute, in preference order, and the one that answered is reported.
+FEM_SOLVER_FACTORIES = (
+    "makeSolverCalculixCcxTools", "makeSolverCcxTools",
+    "makeSolverCalculiXCcxTools", "makeSolverCalculix", "makeSolverCalculiX",
+)
+
+FEM_CONSTRAINT_FACTORIES = {
+    "fixed": ("makeConstraintFixed",),
+    "force": ("makeConstraintForce",),
+    "pressure": ("makeConstraintPressure",),
+    "displacement": ("makeConstraintDisplacement",),
+}
+
+FEM_RESTRAINTS = ("fixed", "displacement")
+FEM_LOADS = ("force", "pressure")
+
+FEM_PREFIX = "koi.fem."
+
+# Young's modulus (MPa), Poisson ratio, and the yield strength a factor of
+# safety is divided out of -- for the materials where that number means
+# something. Keyed to MATERIALS above so a body given a density for the BOM
+# already names its own card.
+#
+# yield is None where a single number would be a lie: grey iron is brittle and
+# does not yield, and a polymer's "yield" is a rate- and temperature-dependent
+# number that a linear elastic solve has no business dividing by. Those
+# materials still solve -- displacement is useful -- and the factor of safety
+# comes back null with the reason attached, which is the honest answer.
+FEM_MATERIALS = {
+    "aluminium-6061": {"E": 68900, "nu": 0.33, "yield": 276,
+                       "note": "6061-T6. Annealed -O is ~55 MPa: T6 is assumed"},
+    "aluminium-7075": {"E": 71700, "nu": 0.33, "yield": 503, "note": "7075-T6"},
+    "aluminium-cast": {"E": 72400, "nu": 0.33, "yield": 165,
+                       "note": "A356-T6. Cast porosity is not modelled"},
+    "steel-1018": {"E": 205000, "nu": 0.29, "yield": 370,
+                   "note": "cold drawn. Hot rolled is ~220 -- check which you buy"},
+    "steel-4140": {"E": 205000, "nu": 0.29, "yield": 655,
+                   "note": "quenched and tempered. Annealed is ~415"},
+    "stainless-304": {"E": 193000, "nu": 0.29, "yield": 215, "note": "annealed"},
+    "stainless-316": {"E": 193000, "nu": 0.29, "yield": 205, "note": "annealed"},
+    "stainless-17-4": {"E": 197000, "nu": 0.27, "yield": 1170, "note": "H900"},
+    "cast-iron": {"E": 100000, "nu": 0.26, "yield": None,
+                  "note": "grey iron is BRITTLE: it fractures without yielding, "
+                          "and von Mises is the wrong failure criterion for it"},
+    "brass-360": {"E": 97000, "nu": 0.31, "yield": 138, "note": "half hard is ~310"},
+    "bronze-932": {"E": 100000, "nu": 0.34, "yield": 125, "note": "SAE 660"},
+    "copper": {"E": 117000, "nu": 0.35, "yield": 70, "note": "annealed"},
+    "titanium-6al4v": {"E": 113800, "nu": 0.342, "yield": 880, "note": "grade 5"},
+    "magnesium-az31": {"E": 45000, "nu": 0.35, "yield": 200, "note": "AZ31B-H24"},
+    "zinc-zamak3": {"E": 96000, "nu": 0.29, "yield": 221, "note": "die cast"},
+    "abs": {"E": 2200, "nu": 0.35, "yield": None, "note": "polymer"},
+    "asa": {"E": 2100, "nu": 0.35, "yield": None, "note": "polymer"},
+    "pla": {"E": 3500, "nu": 0.36, "yield": None, "note": "polymer"},
+    "petg": {"E": 2100, "nu": 0.38, "yield": None, "note": "polymer"},
+    "nylon-pa6": {"E": 2700, "nu": 0.39, "yield": None,
+                  "note": "polymer, and PA6 absorbs water: dry and conditioned "
+                          "differ by more than a factor of two"},
+    "nylon-pa12": {"E": 1700, "nu": 0.40, "yield": None, "note": "polymer"},
+    "polycarbonate": {"E": 2300, "nu": 0.37, "yield": None, "note": "polymer"},
+    "acrylic": {"E": 3200, "nu": 0.37, "yield": None, "note": "polymer, brittle"},
+    "pom-acetal": {"E": 3100, "nu": 0.39, "yield": None, "note": "polymer"},
+    "peek": {"E": 3900, "nu": 0.38, "yield": None, "note": "polymer"},
+    "hdpe": {"E": 1000, "nu": 0.42, "yield": None, "note": "polymer, creeps"},
+    "epoxy-g10": {"E": 18000, "nu": 0.20, "yield": None,
+                  "note": "laminate: strongly ANISOTROPIC, and this solve is "
+                          "isotropic. Treat any number from it as indicative"},
+}
+
+FEM_POLYMER_NOTE = (
+    "this material has no yield strength in the table, so no factor of safety "
+    "was computed. For a polymer that is deliberate: modulus and strength are "
+    "rate- and temperature-dependent and the part creeps under a sustained "
+    "load, so a linear elastic factor of safety against a single number would "
+    "be a number nobody should act on. Displacement is still indicative. For a "
+    "brittle material von Mises is the wrong criterion outright.")
+
+# A mesh finer than this on a first pass is a solve the human sits through
+# with a frozen window, and CalculiX is single threaded here.
+FEM_NODE_WARN = 250000
+FEM_SHARP_EDGE_BUDGET = 400
+
+
+def _fem_api():
+    return _import_probe(FEM_API_CANDIDATES)
+
+
+def _fem_require(api, key):
+    v = api.get(key)
+    if v is None:
+        raise KoiOpError(
+            "this FreeCAD has no importable %s module (tried %s). The FEM "
+            "workbench is not available here -- say that, rather than "
+            "reporting the design as unverified for some other reason."
+            % (key, ", ".join(c[0] for c in FEM_API_CANDIDATES[key])))
+    return v["m"]
+
+
+def _fem_binaries():
+    """Where the two external programs are, or that they are not there.
+
+    Neither gmsh nor CalculiX ships inside FreeCAD's Python: they are separate
+    binaries, and a container image that has the FEM workbench menu very often
+    has neither. That is a deployment fact, not a modelling one, and it is
+    worth answering before a session designs a load case it cannot solve.
+    check_prerequisites() is still the authority -- this is the early answer.
+    """
+    out = {"gmsh": None, "ccx": None}
+    try:
+        import shutil
+    except Exception:
+        shutil = None
+    try:
+        p = App.ParamGet("User parameter:BaseApp/Preferences/Mod/Fem/Gmsh")
+        out["gmsh"] = p.GetString("gmshBinaryPath", "") or None
+    except Exception:
+        pass
+    try:
+        p = App.ParamGet("User parameter:BaseApp/Preferences/Mod/Fem/Ccx")
+        out["ccx"] = p.GetString("ccxBinaryPath", "") or None
+    except Exception:
+        pass
+    if shutil is not None:
+        if not out["gmsh"]:
+            out["gmsh"] = shutil.which("gmsh")
+        if not out["ccx"]:
+            for cand in ("ccx", "ccx_2.21", "ccx_2.20", "ccx_2.19", "CalculiX"):
+                found = shutil.which(cand)
+                if found:
+                    out["ccx"] = found
+                    break
+    return out
+
+
+def _fem_factory(OF, names, what):
+    for n in names:
+        f = getattr(OF, n, None)
+        if callable(f):
+            return f, n
+    raise KoiOpError(
+        "this build of ObjectsFem exposes no %s factory (tried %s). Report "
+        "that the workbench is present but this call is not wired for this "
+        "build -- do not improvise one." % (what, ", ".join(names)))
+
+
+def _fem_add(analysis, obj):
+    try:
+        analysis.addObject(obj)
+        return True
+    except Exception:
+        try:
+            grp = list(analysis.Group)
+            grp.append(obj)
+            analysis.Group = grp
+            return True
+        except Exception:
+            return False
+
+
+def _fem_members(analysis):
+    try:
+        return list(analysis.Group)
+    except Exception:
+        return []
+
+
+def _fem_of_type(analysis, frag):
+    out = []
+    for o in _fem_members(analysis):
+        try:
+            if frag in str(o.TypeId):
+                out.append(o)
+        except Exception:
+            continue
+    return out
+
+
+def _fem_analysis(doc, ref):
+    if not ref:
+        raise KoiOpError(
+            "this mode acts on an existing analysis, so it needs 'analysis': "
+            "the id that mode 'study' registered")
+    o = _resolve_or_die(doc, ref, "analysis")
+    if "Fem::FemAnalysis" not in str(getattr(o, "TypeId", "")):
+        raise KoiOpError(
+            "%r is %s, not an FEM analysis. Pass the id that mode 'study' "
+            "registered." % (ref, getattr(o, "TypeId", "?")))
+    return o
+
+
+def _fem_record(doc, analysis):
+    raw = _meta(doc).get(FEM_PREFIX + analysis.Name)
+    if not raw:
+        return {}
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _fem_record_set(doc, analysis, patch):
+    rec = _fem_record(doc, analysis)
+    rec.update(patch)
+    _meta_set(doc, FEM_PREFIX + analysis.Name, _json.dumps(rec))
+    return rec
+
+
+def _fem_shape_sig(o):
+    """Cheap identity for "is this still the shape that was solved".
+
+    Volume alone misses a fillet that moved material without changing it, so
+    the face count and the bounding box go in too. It is a signature, not a
+    hash of the BRep: it catches the edits a human would call a design change.
+    """
+    sh = _dfm_shape(o)
+    if sh is None:
+        return None
+    try:
+        bb = sh.BoundBox
+        return {"volumeMm3": round(float(sh.Volume), 4),
+                "faces": len(sh.Faces),
+                "diagMm": round(float(bb.DiagonalLength), 4)}
+    except Exception:
+        return None
+
+
+def _fem_sig_changed(a, b):
+    if not a or not b:
+        return False
+    for k in ("volumeMm3", "faces", "diagMm"):
+        va, vb = a.get(k), b.get(k)
+        if va is None or vb is None:
+            continue
+        if k == "faces":
+            if int(va) != int(vb):
+                return True
+        elif abs(float(va) - float(vb)) > max(1e-6, abs(float(va)) * 1e-6):
+            return True
+    return False
+
+
+def _fem_results(analysis):
+    out = []
+    for o in _fem_members(analysis):
+        try:
+            if o.isDerivedFrom("Fem::FemResultObject"):
+                out.append(o)
+        except Exception:
+            if "Result" in str(getattr(o, "TypeId", "")):
+                out.append(o)
+    return out
+
+
+def _fem_mesh_obj(analysis):
+    for o in _fem_members(analysis):
+        try:
+            if "Fem::FemMesh" in str(o.TypeId) or "MeshGmsh" in str(o.Name):
+                if hasattr(o, "FemMesh"):
+                    return o
+        except Exception:
+            continue
+    return None
+
+
+def _fem_mesh_stats(mesh):
+    fm = getattr(mesh, "FemMesh", None)
+    out = {"nodes": 0, "edges": 0, "faces": 0, "volumes": 0}
+    if fm is None:
+        return out
+    for key, attr in (("nodes", "NodeCount"), ("edges", "EdgeCount"),
+                      ("faces", "FaceCount"), ("volumes", "VolumeCount")):
+        try:
+            out[key] = int(getattr(fm, attr))
+        except Exception:
+            out[key] = 0
+    try:
+        out["elementSizeMm"] = round(float(mesh.CharacteristicLengthMax.Value), 4)
+    except Exception:
+        try:
+            out["elementSizeMm"] = round(float(mesh.CharacteristicLengthMax), 4)
+        except Exception:
+            out["elementSizeMm"] = None
+    return out
+
+
+def _fem_qty(value, unit):
+    try:
+        return App.Units.Quantity("%.10g %s" % (float(value), unit))
+    except Exception:
+        return float(value)
+
+
+def _fem_set(obj, prop, value):
+    try:
+        setattr(obj, prop, value)
+        return True
+    except Exception:
+        return False
+
+
+def _fem_read(obj, prop):
+    try:
+        v = getattr(obj, prop)
+    except Exception:
+        return None
+    try:
+        return round(float(v.Value), 6)
+    except Exception:
+        pass
+    try:
+        return round(float(v), 6)
+    except Exception:
+        return _plain(v)
+
+
+def _fem_material_card(args):
+    """(FreeCAD material dict, reply row). Refuses to invent a modulus.
+
+    A density is enough for a BOM and is nowhere near enough for a solve. If
+    the name is not in the table, an explicit E and nu are required rather
+    than defaulted: every displacement and every stress scales with them, and
+    a modulus recalled from memory is the kind of number this whole skill
+    exists to stop being recalled from memory.
+    """
+    name = str(args.get("material") or "").strip().lower()
+    E = args.get("E")
+    nu = args.get("nu")
+    rho = args.get("density")
+    rec = FEM_MATERIALS.get(name) if name else None
+    yld = None
+    src = "argument"
+    if rec is not None:
+        src = "table"
+        E = float(E) if E is not None else float(rec["E"])
+        nu = float(nu) if nu is not None else float(rec["nu"])
+        yld = rec.get("yield")
+        if rho is None:
+            drec = MATERIALS.get(name)
+            rho = float(drec["density"]) if drec else None
+    if E is None or nu is None:
+        near = [k for k in sorted(FEM_MATERIALS)
+                if name and name.split("-")[0] in k]
+        raise KoiOpError(
+            "no elastic properties for %r. %s Pass E (MPa) and nu explicitly "
+            "for anything not in the table, and quote the datasheet rather "
+            "than recalling it: every stress and every displacement in the "
+            "result scales with them."
+            % (name or "(no material given)",
+               ("Did you mean: " + ", ".join(near) + ".") if near
+               else "Call fn 'fem' with mode 'materials' for the list."))
+    E = float(E)
+    nu = float(nu)
+    if E <= 0 or E > 1.5e6:
+        raise KoiOpError(
+            "E is Young's modulus in MPa and %r is not one: steel is 205000, "
+            "aluminium 68900, a stiff polymer about 3000." % E)
+    if nu <= -1.0 or nu >= 0.5:
+        raise KoiOpError(
+            "nu is Poisson's ratio and must be between -1 and 0.5 (0.5 is "
+            "incompressible and will not solve); %r is not." % nu)
+    if rho is None:
+        rho = 7.85
+    card = {
+        "Name": name or "custom",
+        "YoungsModulus": "%.10g MPa" % E,
+        "PoissonRatio": "%.10g" % nu,
+        "Density": "%.10g kg/m^3" % (float(rho) * 1000.0),
+    }
+    row = {"material": name or "custom", "youngsModulusMPa": E,
+           "poissonRatio": nu, "densityGcm3": float(rho),
+           "yieldMPa": yld, "source": src}
+    if rec is not None and rec.get("note"):
+        row["note"] = rec["note"]
+    if yld is None:
+        row["yieldNote"] = FEM_POLYMER_NOTE
+    return card, row
+
+
+def _fem_sharp_edges(shape, budget=FEM_SHARP_EDGE_BUDGET):
+    """Concave edges with no radius: where a linear elastic peak is fiction.
+
+    Same test the DFM corner check uses, without the tool-axis filter -- a
+    stress riser does not care which way the cutter came from. A filleted
+    corner sums to a tangent join and is correctly not counted.
+    """
+    import Part
+    out = []
+    seen = 0
+    try:
+        edges = shape.Edges
+    except Exception:
+        return out
+    for e in edges:
+        seen += 1
+        if seen > budget:
+            break
+        try:
+            fs = shape.ancestorsOfType(e, Part.Face)
+        except Exception:
+            continue
+        if len(fs) != 2:
+            continue
+        if _edge_concave(shape, e, fs[0], fs[1]) is not True:
+            continue
+        out.append(e)
+    return out
+
+
+def _fem_singularity(shape, point, elem_size):
+    """How far the peak node is from the nearest sharp internal corner.
+
+    This is the whole reason a reported peak stress can be worthless. At a
+    re-entrant corner the elastic solution is unbounded: halve the element
+    size and the number goes up, forever. Distance is measured rather than
+    guessed at, and the threshold is in elements rather than millimetres
+    because that is the scale over which the singular field is resolved.
+    """
+    if point is None:
+        return None
+    sharp = _fem_sharp_edges(shape)
+    if not sharp:
+        return {"sharpEdges": 0, "peakNearCornerMm": None,
+                "singularitySuspect": False}
+    import Part
+    try:
+        v = Part.Vertex(App.Vector(point[0], point[1], point[2]))
+    except Exception:
+        return None
+    best = None
+    for e in sharp:
+        try:
+            d = float(e.distToShape(v)[0])
+        except Exception:
+            continue
+        if best is None or d < best:
+            best = d
+    if best is None:
+        return {"sharpEdges": len(sharp), "peakNearCornerMm": None,
+                "singularitySuspect": False}
+    band = max(2.0 * float(elem_size or 0.0), 0.5)
+    out = {"sharpEdges": len(sharp),
+           "peakNearCornerMm": round(best, 4),
+           "bandMm": round(band, 4),
+           "singularitySuspect": bool(best <= band)}
+    if out["singularitySuspect"]:
+        out["singularityNote"] = (
+            "the peak stress node is %.3f mm from a SHARP internal corner, "
+            "which is inside the band this mesh can resolve. At a zero-radius "
+            "re-entrant corner the linear elastic stress is a SINGULARITY: it "
+            "rises without bound as the mesh refines, so this peak is a "
+            "property of the mesh and not of the part. Do not quote it and do "
+            "not divide a factor of safety out of it. Either fillet the "
+            "corner and re-solve -- which is what the part needs anyway -- or "
+            "report the p99 field stress and say the peak was discarded and "
+            "why." % best)
+    return out
+
+
+def _fem_result_stats(doc, analysis, result, shape, elem_size):
+    """Read the result field. The peak alone is the number most likely to lie."""
+    out = {"result": result.Name}
+    vm = []
+    disp = []
+    try:
+        vm = [float(x) for x in (result.vonMises or [])]
+    except Exception:
+        vm = []
+    try:
+        disp = [float(x) for x in (result.DisplacementLengths or [])]
+    except Exception:
+        disp = []
+    out["nodeCount"] = len(vm)
+    if not vm:
+        out["readable"] = False
+        out["note"] = (
+            "the solver produced a result object with no von Mises field. "
+            "Nothing here is a stress -- report it as a failed solve, not as "
+            "a part that passed.")
+        return out
+    out["readable"] = True
+    s = sorted(vm)
+
+    def pct(p):
+        i = int(round((len(s) - 1) * p))
+        return s[max(0, min(len(s) - 1, i))]
+
+    peak = s[-1]
+    out["maxVonMisesMPa"] = round(peak, 4)
+    out["p99VonMisesMPa"] = round(pct(0.99), 4)
+    out["p95VonMisesMPa"] = round(pct(0.95), 4)
+    out["medianVonMisesMPa"] = round(pct(0.5), 4)
+    if disp:
+        out["maxDisplacementMm"] = round(max(disp), 6)
+    # Where the peak is, so the singularity test has somewhere to measure from.
+    point = None
+    try:
+        idx = vm.index(peak)
+        nid = list(result.NodeNumbers)[idx]
+        node = result.Mesh.FemMesh.Nodes[nid]
+        point = [float(node.x), float(node.y), float(node.z)]
+        out["peakAt"] = [round(c, 4) for c in point]
+        out["peakNode"] = int(nid)
+    except Exception:
+        out["peakAt"] = None
+    try:
+        sing = _fem_singularity(shape, point, elem_size)
+        if sing:
+            out.update(sing)
+    except Exception as e:
+        out["singularitySuspect"] = None
+        out["singularityNote"] = (
+            "the corner check did not run (%s), so whether this peak is a "
+            "singularity is UNKNOWN. Unknown is not a pass." % e)
+    # Small-strain sanity. Linear static assumes the deflection does not
+    # change the stiffness; a beam that has moved a tenth of its own size has
+    # left the assumption behind, and the usual cause is a missing restraint
+    # rather than a bendy part.
+    try:
+        diag = float(shape.BoundBox.DiagonalLength)
+        if disp and diag > 0:
+            ratio = max(disp) / diag
+            out["displacementOverSizePct"] = round(ratio * 100.0, 4)
+            if ratio > 0.1:
+                out["displacementImplausible"] = True
+                out["displacementNote"] = (
+                    "the largest displacement is %.1f%% of the part's own "
+                    "size. Linear static assumes small displacements, so this "
+                    "result is outside its own assumptions -- and the usual "
+                    "cause is not a bendy part, it is a model that is not "
+                    "properly restrained and is partly moving as a rigid "
+                    "body. Check the restraints before reading anything "
+                    "else." % (ratio * 100.0))
+    except Exception:
+        pass
+    return out
+
+
+def _fem_verdict(stats, yld):
+    """The factor of safety, or a named refusal to compute one."""
+    out = {}
+    if not stats.get("readable"):
+        out["solved"] = False
+        return out
+    out["solved"] = True
+    if yld is None:
+        out["factorOfSafety"] = None
+        out["factorOfSafetyNote"] = FEM_POLYMER_NOTE
+        return out
+    peak = stats.get("maxVonMisesMPa") or 0.0
+    p99 = stats.get("p99VonMisesMPa") or 0.0
+    out["yieldMPa"] = yld
+    out["factorOfSafetyPeak"] = round(yld / peak, 3) if peak > 1e-9 else None
+    out["factorOfSafetyP99"] = round(yld / p99, 3) if p99 > 1e-9 else None
+    if stats.get("singularitySuspect"):
+        out["factorOfSafety"] = None
+        out["factorOfSafetyNote"] = (
+            "no single factor of safety is reported, because the peak stress "
+            "sits on a sharp corner and is mesh-dependent. factorOfSafetyP99 "
+            "is the field away from the singularity; it is not a substitute "
+            "for filleting the corner and re-solving.")
+    else:
+        out["factorOfSafety"] = out["factorOfSafetyPeak"]
+        if out["factorOfSafety"] is not None and out["factorOfSafety"] < 1.0:
+            out["yields"] = True
+            out["yieldNote"] = (
+                "the peak von Mises stress EXCEEDS the yield strength: this "
+                "part yields under the load as modelled. Say so plainly.")
+    return out
+
+
+def _fem_lint(doc):
+    """Results that no longer describe the part they were solved on.
+
+    The same class of failure as split-stale, and worse in consequence: a
+    stale toolpath produces a bad part, a stale factor of safety produces a
+    part somebody trusts. Recorded at solve time, checked every turn, and it
+    keeps reporting until the analysis is re-solved or removed.
+    """
+    rows = []
+    m = _meta(doc)
+    for k in sorted(m):
+        if not k.startswith(FEM_PREFIX):
+            continue
+        try:
+            rec = _json.loads(m[k])
+        except Exception:
+            continue
+        name = k[len(FEM_PREFIX):]
+        analysis = doc.getObject(name)
+        if analysis is None:
+            continue
+        if not rec.get("solvedSig"):
+            continue
+        if not _fem_results(analysis):
+            continue
+        target = doc.getObject(str(rec.get("target") or ""))
+        if target is None:
+            rows.append({
+                "level": "warn", "object": name, "code": "fem-target-gone",
+                "message": "the solid this analysis was solved on (%s) is no "
+                           "longer in the document, so its results describe "
+                           "nothing that exists" % rec.get("target")})
+            continue
+        now = _fem_shape_sig(target)
+        if _fem_sig_changed(rec.get("solvedSig"), now):
+            rows.append({
+                "level": "warn", "object": target.Name, "code": "fem-stale",
+                "message": "%s has changed since %s was solved. The stress "
+                           "and displacement results, and any factor of "
+                           "safety quoted from them, describe the OLD shape: "
+                           "re-mesh and re-solve before repeating any of "
+                           "them" % (target.Name, name)})
+    return rows
+
+
+def _fem_do_mesh(doc, api, analysis, rec, elem_size, report):
+    """Create or update the mesh and generate it. Raises rather than returning
+    a mesh nobody can solve on."""
+    OF = _fem_require(api, "objects")
+    target = doc.getObject(str(rec.get("target") or ""))
+    if target is None:
+        raise KoiOpError(
+            "this analysis has no target solid recorded. Re-create it with "
+            "mode 'study'.")
+    mesh = _fem_mesh_obj(analysis)
+    created = False
+    if mesh is None:
+        maker, spelled = _fem_factory(OF, ("makeMeshGmsh",), "mesh")
+        mesh = maker(doc, _safe_name((rec.get("id") or "fem") + "_mesh", "FEMMesh"))
+        created = True
+        report["meshFactory"] = spelled
+    # 1.0 renamed the mesh object's shape link from Part to Shape and kept
+    # neither as an alias, so both are tried and the one that took is reported.
+    bound = None
+    for prop in ("Shape", "Part"):
+        if hasattr(mesh, prop) and _fem_set(mesh, prop, target):
+            bound = prop
+            break
+    if bound is None:
+        raise KoiOpError(
+            "this build's mesh object accepts neither Shape nor Part as the "
+            "solid to mesh. Report that the FEM workbench is present but not "
+            "wired for this build.")
+    report["meshShapeProperty"] = bound
+    if elem_size is not None:
+        if not _fem_set(mesh, "CharacteristicLengthMax",
+                        _fem_qty(elem_size, "mm")):
+            _fem_set(mesh, "CharacteristicLengthMax", float(elem_size))
+    if created:
+        _fem_add(analysis, mesh)
+    GmshTools = getattr(_fem_require(api, "gmsh"), "GmshTools")
+    err = None
+    try:
+        err = GmshTools(mesh).create_mesh()
+    except Exception as e:
+        err = "%s: %s" % (type(e).__name__, e)
+    doc.recompute()
+    stats = _fem_mesh_stats(mesh)
+    if err:
+        stats["gmshError"] = str(err)[:800]
+    bins = _fem_binaries()
+    if stats["nodes"] == 0:
+        raise KoiOpError(
+            "gmsh produced NO nodes, so there is no mesh and nothing can be "
+            "solved. gmsh binary: %s. %s"
+            % (bins.get("gmsh") or "not found on PATH or in FreeCAD's "
+                                   "preferences -- it is a separate program "
+                                   "and this install may not carry it",
+               ("gmsh said: %s" % str(err)[:400]) if err else ""))
+    if stats["volumes"] == 0:
+        raise KoiOpError(
+            "the mesh has %d nodes and ZERO volume elements: it is a surface "
+            "mesh on a solid, which has no stiffness. CalculiX would either "
+            "refuse it or return a displacement field that means nothing. "
+            "Check the target really is a solid, then re-mesh."
+            % stats["nodes"])
+    if stats["nodes"] > FEM_NODE_WARN:
+        stats["sizeNote"] = (
+            "%d nodes. CalculiX runs single threaded on the same thread that "
+            "owns the document, and nothing can preempt it: the human's "
+            "FreeCAD window will not respond until this solve finishes. Say "
+            "so before starting it, or re-mesh coarser."
+            % stats["nodes"])
+    return mesh, stats
+
+
+def _fem_do_solve(doc, api, analysis, report):
+    """Run CalculiX. Everything that can be refused is refused BEFORE this."""
+    ccxmod = _fem_require(api, "ccx")
+    solvers = _fem_of_type(analysis, "Solver") or [
+        o for o in _fem_members(analysis) if "Solver" in str(getattr(o, "Name", ""))]
+    if not solvers:
+        raise KoiOpError(
+            "this analysis has no solver object. Re-create it with mode "
+            "'study', which adds one.")
+    solver = solvers[0]
+    try:
+        fea = ccxmod.FemToolsCcx(analysis, solver)
+    except Exception:
+        fea = ccxmod.FemToolsCcx()
+    fea.update_objects()
+    fea.setup_working_dir()
+    fea.setup_ccx()
+    msg = ""
+    try:
+        msg = fea.check_prerequisites() or ""
+    except Exception as e:
+        msg = "%s: %s" % (type(e).__name__, e)
+    if msg:
+        bins = _fem_binaries()
+        raise KoiOpError(
+            "CalculiX refused to run: %s. (ccx binary: %s.) Nothing was "
+            "solved -- this is a missing prerequisite, not a result, and it "
+            "must not be reported as one."
+            % (str(msg)[:600],
+               bins.get("ccx") or "not found on PATH or in FreeCAD's "
+                                  "preferences; it is a separate program and "
+                                  "this install may not carry it"))
+    try:
+        fea.purge_results()
+    except Exception:
+        pass
+    fea.write_inp_file()
+    import time as _time
+    t0 = _time.time()
+    fea.ccx_run()
+    fea.load_results()
+    report["solveSeconds"] = round(_time.time() - t0, 2)
+    try:
+        report["workingDir"] = str(fea.working_dir)
+    except Exception:
+        pass
+    out = ""
+    try:
+        out = str(getattr(fea, "ccx_stdout", "") or "")
+    except Exception:
+        out = ""
+    if "*ERROR" in out.upper():
+        tail = [ln for ln in out.splitlines() if "*ERROR" in ln.upper()][:6]
+        report["solverErrors"] = tail
+        report["solverErrorNote"] = (
+            "CalculiX printed an error while solving. Any result loaded after "
+            "one of these is suspect: report the error, not the number.")
+    return solver
+
+
+def _op_fem(doc, args, kid):
+    """Linear static structural analysis, through the same envelope.
+
+    mode:
+      materials  the elastic table. Writes nothing.
+      study      create the Analysis, its solver and its material on a solid.
+      constrain  add one restraint or one load, on refs the same rules as
+                 fillet: a user pick or a query result, never an index this
+                 side authored.
+      mesh       generate the mesh and refuse the two useless outcomes.
+      solve      pre-check, run CalculiX, read the field, judge it.
+      converge   re-mesh finer, re-solve, and report whether the answer moved.
+      result     read the last result again without re-solving.
+      clear      delete the analysis and everything under it.
+    """
+    mode = str(args.get("mode") or "study")
+    api = _fem_api()
+    report = {"api": _api_report(api), "mode": mode,
+              "binaries": _fem_binaries()}
+    if mode == "materials":
+        # Carries api and binaries deliberately: this is the cheapest call in
+        # the group and it is the one worth making FIRST, because "gmsh and
+        # CalculiX are not installed here" is a fact worth having before a
+        # load case is designed rather than after.
+        report["materials"] = FEM_MATERIALS
+        report["count"] = len(FEM_MATERIALS)
+        report["note"] = ("E in MPa, nu dimensionless, yield in MPa. A null "
+                          "yield is deliberate: see yieldNote. Densities are "
+                          "the same table fn 'material' uses.")
+        return report
+
+    if mode in ("study", "constrain") and not kid:
+        raise KoiOpError(
+            "fem mode %r creates an object, so it needs an id -- a handle "
+            "like 'fea.bracket' or 'bc.mount_fixed' that a later turn can "
+            "address" % mode)
+
+    if mode == "study":
+        OF = _fem_require(api, "objects")
+        target = args.get("target")
+        if not target:
+            raise KoiOpError("fem study needs a target: the solid to analyse")
+        o = _resolve_or_die(doc, target, "object")
+        shape = _dfm_shape(o)
+        if shape is None or not getattr(shape, "Solids", None):
+            raise KoiOpError(
+                "%r has no solid to analyse. An analysis on a sketch or an "
+                "empty body meshes nothing and reports no error." % target)
+        card, matrow = _fem_material_card(args)
+        mk, spelled = _fem_factory(OF, ("makeAnalysis",), "analysis")
+        analysis = mk(doc, _safe_name(args.get("name") or kid or "Analysis",
+                                      "Analysis"))
+        smk, sspelled = _fem_factory(OF, FEM_SOLVER_FACTORIES, "solver")
+        solver = smk(doc, "SolverCalculiX")
+        _fem_set(solver, "AnalysisType", "static")
+        _fem_set(solver, "GeometricalNonlinearity", "linear")
+        _fem_set(solver, "MaterialNonlinearity", "linear")
+        _fem_add(analysis, solver)
+        mmk, mspelled = _fem_factory(OF, ("makeMaterialSolid", "makeMaterial"),
+                                     "material")
+        mat = mmk(doc, "FemMaterial")
+        try:
+            m = mat.Material
+            m.update(card)
+            mat.Material = m
+        except Exception as e:
+            raise KoiOpError(
+                "this build would not take a material card (%s). Without E "
+                "and nu nothing solved here would mean anything, so this "
+                "stops here rather than solving with a default." % e)
+        _fem_add(analysis, mat)
+        doc.recompute()
+        # Read back rather than trusting the assignment: if the card did not
+        # stick, every number downstream is about a material nobody chose.
+        got = {}
+        try:
+            got = dict(mat.Material)
+        except Exception:
+            got = {}
+        matrow["readback"] = {k: got.get(k) for k in
+                              ("Name", "YoungsModulus", "PoissonRatio", "Density")}
+        if not got.get("YoungsModulus"):
+            raise KoiOpError(
+                "the material card did not stick: the object reports no "
+                "Young's modulus after assignment. Report the FEM workbench "
+                "as not wired for this build rather than solving anyway.")
+        sig = _fem_shape_sig(o)
+        _fem_record_set(doc, analysis, {
+            "id": kid, "target": o.Name, "targetId": _id_of(doc, o.Name),
+            "material": matrow.get("material"), "yieldMPa": matrow.get("yieldMPa"),
+            "createdSig": sig})
+        register(doc, kid, analysis)
+        report["analysis"] = analysis.Name
+        report["target"] = o.Name
+        report["solver"] = {"name": solver.Name, "factory": sspelled}
+        report["materialFactory"] = mspelled
+        report["analysisFactory"] = spelled
+        report["material"] = matrow
+        report["next"] = (
+            "constrain: at least one restraint (fixed or displacement) AND at "
+            "least one load (force or pressure). A solve without both is "
+            "refused, because an unrestrained model returns rigid-body motion "
+            "that reads exactly like deflection.")
+        return report
+
+    if mode == "clear":
+        analysis = _fem_analysis(doc, args.get("analysis"))
+        name = analysis.Name
+        gone = _remove_subtree(doc, analysis)
+        _meta_set(doc, FEM_PREFIX + name, "")
+        report["removed"] = gone
+        report["note"] = ("the analysis and its members are gone. The solid "
+                          "it was solved on was not touched.")
+        return report
+
+    analysis = _fem_analysis(doc, args.get("analysis"))
+    rec = _fem_record(doc, analysis)
+    report["analysis"] = analysis.Name
+    target = doc.getObject(str(rec.get("target") or ""))
+    if target is None and mode in ("mesh", "solve", "converge", "result"):
+        raise KoiOpError(
+            "the solid this analysis was created on (%s) is not in the "
+            "document. Nothing can be meshed or solved against it."
+            % rec.get("target"))
+
+    if mode == "constrain":
+        OF = _fem_require(api, "objects")
+        kind = str(args.get("kind") or "").strip().lower()
+        if kind not in FEM_CONSTRAINT_FACTORIES:
+            raise KoiOpError(
+                "kind must be one of %s"
+                % ", ".join(sorted(FEM_CONSTRAINT_FACTORIES)))
+        refs = args.get("refs")
+        if not isinstance(refs, list) or not refs:
+            raise KoiOpError(
+                "a boundary condition with no references restrains or loads "
+                "nothing, and CalculiX will not say so. Pass refs: a user "
+                "pick captured with fn 'ref', or the refs array from a query.")
+        pairs = []
+        resolved = []
+        for r in refs[:64]:
+            obj, sub = _resolve_ref_sub(doc, r)
+            if not sub:
+                raise KoiOpError(
+                    "%r names a whole object. A boundary condition attaches "
+                    "to a face, an edge or a vertex -- query the face you "
+                    "mean, or have the user click it." % r)
+            # The silent one. A reference onto a different object than the one
+            # being meshed resolves fine, stores fine and finds NO NODES: the
+            # solver then runs a model without that restraint or that load and
+            # reports nothing wrong. Note that a PartDesign feature's own face
+            # numbering is not the finished body's, so this cannot be repaired
+            # by rewriting the index -- it has to be re-queried.
+            if target is not None and obj.Name != target.Name:
+                raise KoiOpError(
+                    "%r is on %s, and this analysis meshes %s. A boundary "
+                    "condition on anything other than the meshed solid finds "
+                    "no nodes, and the solve then runs WITHOUT it and reports "
+                    "nothing wrong. Query the face on %s instead: an "
+                    "intermediate feature's face numbering is not the "
+                    "finished body's, so this cannot be fixed by renumbering."
+                    % (r, obj.Name, target.Name, target.Name))
+            pairs.append((obj, sub))
+            resolved.append(obj.Name + ":" + sub)
+        mk, spelled = _fem_factory(OF, FEM_CONSTRAINT_FACTORIES[kind], kind)
+        con = mk(doc, _safe_name(kid or ("Fem" + kind), "FemConstraint"))
+        try:
+            con.References = pairs
+        except Exception as e:
+            raise KoiOpError("this constraint would not take those references: %s" % e)
+        applied = {}
+        if kind == "force":
+            val = _num(args, "magnitude")
+            if not _fem_set(con, "Force", _fem_qty(val, "N")):
+                _fem_set(con, "Force", float(val))
+            applied["forceN"] = _fem_read(con, "Force")
+            if args.get("direction"):
+                dobj, dsub = _resolve_ref_sub(doc, args.get("direction"))
+                if not _fem_set(con, "Direction", (dobj, [dsub] if dsub else [])):
+                    raise KoiOpError(
+                        "this build would not take that direction reference. "
+                        "Omit it and the force acts normal to the loaded face.")
+                applied["direction"] = dobj.Name + ":" + dsub
+            else:
+                applied["directionNote"] = (
+                    "no direction given, so the force acts along the normal "
+                    "of the referenced face. If the load is not normal to it, "
+                    "that is a different load from the one you meant.")
+            _fem_set(con, "Reversed", bool(args.get("reversed")))
+            applied["reversed"] = bool(args.get("reversed"))
+        elif kind == "pressure":
+            val = _num(args, "magnitude")
+            if not _fem_set(con, "Pressure", _fem_qty(val, "MPa")):
+                _fem_set(con, "Pressure", float(val))
+            applied["pressureMPa"] = _fem_read(con, "Pressure")
+            _fem_set(con, "Reversed", bool(args.get("reversed")))
+            applied["reversed"] = bool(args.get("reversed"))
+            applied["unitNote"] = (
+                "pressure is MPa, which is N/mm2. 1 bar is 0.1 MPa and 1 psi "
+                "is 0.0068948 MPa -- convert with fn 'param' rather than in "
+                "your head.")
+        elif kind == "displacement":
+            vals = args.get("values")
+            if not isinstance(vals, dict) or not vals:
+                raise KoiOpError(
+                    "a displacement constraint needs values: {x, y, z}, where "
+                    "a number is a prescribed displacement in mm, 'fix' is "
+                    "held at zero, and an axis left out is free.")
+            for ax in ("x", "y", "z"):
+                v = vals.get(ax)
+                A = ax.lower()
+                if v is None:
+                    _fem_set(con, A + "Free", True)
+                    _fem_set(con, A + "Fix", False)
+                    applied[ax] = "free"
+                elif str(v).strip().lower() in ("fix", "fixed", "0", "0.0"):
+                    _fem_set(con, A + "Free", False)
+                    _fem_set(con, A + "Fix", True)
+                    applied[ax] = "fixed"
+                else:
+                    _fem_set(con, A + "Free", False)
+                    _fem_set(con, A + "Fix", False)
+                    if not _fem_set(con, A + "Displacement", _fem_qty(v, "mm")):
+                        _fem_set(con, A + "Displacement", float(v))
+                    applied[ax] = _fem_read(con, A + "Displacement")
+        for prop, val in (args.get("props") or {}).items():
+            if not _fem_set(con, str(prop), val):
+                raise KoiOpError(
+                    "%s constraint does not accept %r on this build"
+                    % (kind, prop))
+        _fem_add(analysis, con)
+        doc.recompute()
+        register(doc, kid, con)
+        # Readback: References is where a renumbered face silently becomes a
+        # load on the wrong side of the part, and it recomputes clean.
+        back = []
+        try:
+            for o, subs in con.References:
+                for s in (subs if isinstance(subs, (list, tuple)) else [subs]):
+                    back.append(o.Name + ":" + s)
+        except Exception:
+            back = None
+        report["constraint"] = {
+            "name": con.Name, "kind": kind, "factory": spelled,
+            "requested": resolved, "stored": back, "applied": applied}
+        if back is not None and sorted(back) != sorted(resolved):
+            report["constraint"]["referenceNote"] = (
+                "the constraint stored different references from the ones "
+                "asked for. Check what it is actually attached to before "
+                "solving; a load on the wrong face solves perfectly cleanly.")
+        return report
+
+    if mode == "mesh":
+        size = args.get("elementSize")
+        mesh, stats = _fem_do_mesh(doc, api, analysis, rec,
+                                   None if size is None else float(size),
+                                   report)
+        _fem_record_set(doc, analysis, {"mesh": mesh.Name,
+                                        "elementSizeMm": stats.get("elementSizeMm")})
+        report["mesh"] = stats
+        report["next"] = "solve"
+        return report
+
+    if mode in ("solve", "converge"):
+        # By substring of TypeId rather than by exact type, and the material
+        # by the property it carries rather than by type at all: ObjectsFem
+        # has returned makeMaterialSolid as App::MaterialObjectPython on one
+        # build and Fem::MaterialCommon on another, and a pre-check that
+        # refuses a model which DOES have a material is the same class of
+        # wrongness as one that lets a model through without one.
+        members = {k: _fem_of_type(analysis, k) for k in
+                   ("ConstraintFixed", "ConstraintForce",
+                    "ConstraintPressure", "ConstraintDisplacement")}
+        materials = [o for o in _fem_members(analysis)
+                     if hasattr(o, "Material") and not "Constraint" in str(getattr(o, "TypeId", ""))]
+        restraints = (members["ConstraintFixed"] +
+                      members["ConstraintDisplacement"])
+        loads = members["ConstraintForce"] + members["ConstraintPressure"]
+        if not materials:
+            raise KoiOpError(
+                "this analysis has no material, so it has no stiffness. "
+                "Re-create it with mode 'study'.")
+        if not restraints:
+            raise KoiOpError(
+                "this model has NO restraint. A linear static solve of a "
+                "floating body has no unique solution: CalculiX either fails "
+                "with a singular stiffness matrix or returns rigid-body "
+                "motion, and rigid-body motion looks exactly like an enormous "
+                "deflection. Add a fixed or displacement constraint that "
+                "removes all six degrees of freedom before solving.")
+        if not loads:
+            raise KoiOpError(
+                "this model has no load. A solve with no load returns zero "
+                "stress everywhere, and zero stress is not a pass.")
+        mesh = _fem_mesh_obj(analysis)
+        stats0 = _fem_mesh_stats(mesh) if mesh is not None else None
+        if mesh is None or not stats0 or stats0.get("volumes", 0) <= 0:
+            raise KoiOpError(
+                "this analysis has no volume mesh. Run mode 'mesh' first -- "
+                "and read what it says, because a mesh with no volume "
+                "elements is the other way to get a clean solve that means "
+                "nothing.")
+        report["mesh"] = stats0
+        _fem_do_solve(doc, api, analysis, report)
+        doc.recompute()
+        results = _fem_results(analysis)
+        if not results:
+            raise KoiOpError(
+                "the solver ran and produced no result object. Report the "
+                "solve as failed; do not describe the part as passing.")
+        shape = _dfm_shape(target)
+        stats = _fem_result_stats(doc, analysis, results[-1], shape,
+                                  stats0.get("elementSizeMm"))
+        report["field"] = stats
+        report.update(_fem_verdict(stats, rec.get("yieldMPa")))
+        sig = _fem_shape_sig(target)
+        _fem_record_set(doc, analysis, {
+            "solvedSig": sig, "elementSizeMm": stats0.get("elementSizeMm"),
+            "peakMPa": stats.get("maxVonMisesMPa"),
+            "p99MPa": stats.get("p99VonMisesMPa")})
+
+        if mode == "converge":
+            # One mesh is one number with no error bar. Two meshes is the
+            # cheapest honest statement about whether the number is converged
+            # -- and at a singular corner it will correctly refuse to be.
+            factor = float(args.get("factor") or 0.6)
+            if not (0.2 <= factor < 1.0):
+                raise KoiOpError(
+                    "factor is how much finer the second mesh is and must be "
+                    "between 0.2 and 1.0; %r is not" % factor)
+            base = stats0.get("elementSizeMm")
+            if not base:
+                raise KoiOpError(
+                    "this mesh does not report a characteristic length, so a "
+                    "second mesh cannot be scaled from it. Run mode 'mesh' "
+                    "with an explicit elementSize first.")
+            mesh2, stats2 = _fem_do_mesh(doc, api, analysis, rec,
+                                         base * factor, report)
+            _fem_do_solve(doc, api, analysis, report)
+            doc.recompute()
+            results = _fem_results(analysis)
+            if not results:
+                raise KoiOpError(
+                    "the refined solve produced no result object; the coarse "
+                    "result above stands alone and is therefore unconverged.")
+            fine = _fem_result_stats(doc, analysis, results[-1], shape,
+                                     stats2.get("elementSizeMm"))
+            report["refined"] = {"mesh": stats2, "field": fine}
+
+            def _delta(a, b):
+                if not a or not b:
+                    return None
+                return round((b - a) / a * 100.0, 2)
+
+            dpeak = _delta(stats.get("maxVonMisesMPa"), fine.get("maxVonMisesMPa"))
+            dp99 = _delta(stats.get("p99VonMisesMPa"), fine.get("p99VonMisesMPa"))
+            ddisp = _delta(stats.get("maxDisplacementMm"),
+                           fine.get("maxDisplacementMm"))
+            report["convergence"] = {
+                "elementSizeMm": [stats0.get("elementSizeMm"),
+                                  stats2.get("elementSizeMm")],
+                "peakChangePct": dpeak, "p99ChangePct": dp99,
+                "displacementChangePct": ddisp}
+            conv = (dp99 is not None and abs(dp99) < 5.0 and
+                    (ddisp is None or abs(ddisp) < 5.0))
+            report["converged"] = bool(conv)
+            report["convergence"]["note"] = (
+                "the field moved %s%% between the two meshes. %s"
+                % (dp99 if dp99 is not None else "?",
+                   "Under 5%%, so the answer is mesh-independent to that "
+                   "tolerance." if conv else
+                   "That is NOT converged: the number depends on the mesh, so "
+                   "quote it as an estimate or refine again. A peak that "
+                   "keeps climbing while the p99 settles is the signature of "
+                   "a corner singularity, not of a mesh that is too coarse."))
+            report["field"] = fine
+            report.update(_fem_verdict(fine, rec.get("yieldMPa")))
+            _fem_record_set(doc, analysis, {
+                "solvedSig": _fem_shape_sig(target),
+                "elementSizeMm": stats2.get("elementSizeMm"),
+                "peakMPa": fine.get("maxVonMisesMPa"),
+                "p99MPa": fine.get("p99VonMisesMPa")})
+        else:
+            report["converged"] = None
+            report["convergenceNote"] = (
+                "one mesh is one number with no error bar. Whether it is "
+                "mesh-independent is UNKNOWN until it is solved again finer: "
+                "mode 'converge' does exactly that. Report converged:null as "
+                "an unfinished check, never as a pass.")
+
+        report["loadNote"] = (
+            "the loads and restraints are the ones you were given or chose. "
+            "Nothing here knows the real service load, the shock case, the "
+            "clamping, or how the part is actually held -- and a linear "
+            "static solve sees no contact, no buckling, no fatigue and no "
+            "plasticity. This is evidence, not a certificate.")
+        return report
+
+    if mode == "result":
+        results = _fem_results(analysis)
+        if not results:
+            report["solved"] = None
+            report["note"] = ("this analysis has no results: it has not been "
+                              "solved, or they were purged. Nothing to read.")
+            return report
+        mesh = _fem_mesh_obj(analysis)
+        stats0 = _fem_mesh_stats(mesh) if mesh is not None else {}
+        shape = _dfm_shape(target)
+        stats = _fem_result_stats(doc, analysis, results[-1], shape,
+                                  stats0.get("elementSizeMm"))
+        report["field"] = stats
+        report.update(_fem_verdict(stats, rec.get("yieldMPa")))
+        now = _fem_shape_sig(target)
+        if _fem_sig_changed(rec.get("solvedSig"), now):
+            report["stale"] = True
+            report["staleNote"] = (
+                "%s has CHANGED since this was solved (%s -> %s). These "
+                "results, and any factor of safety from them, describe the "
+                "old shape. Re-mesh and re-solve before repeating any number "
+                "here." % (target.Name, rec.get("solvedSig"), now))
+        else:
+            report["stale"] = False
+        return report
+
+    raise KoiOpError(
+        "mode must be materials, study, constrain, mesh, solve, converge, "
+        "result or clear (got %r)" % mode)
+
+
 OPS = {
     "new_document": {"fn": _op_new_document, "mode": "document"},
     "open_document": {"fn": _op_open_document, "mode": "document"},
@@ -11529,6 +14539,8 @@ OPS = {
     "material": {"fn": _op_material, "mode": "write"},
     "recompute": {"fn": _op_recompute, "mode": "write"},
     "capabilities": {"fn": _op_capabilities, "mode": "read"},
+    "cam": {"fn": _op_cam, "mode": "write"},
+    "fem": {"fn": _op_fem, "mode": "write"},
 }
 
 OP_NAMES = sorted(OPS)
@@ -12503,6 +15515,50 @@ const OP_SPECS = {
       "nobody should machine to.",
     props: { a: "string", b: "string" },
     required: ["a"],
+  },
+  cam: {
+    mode: "write", creates: false,
+    summary:
+      "The CAM workbench: build a machining Job on a solid, add operations to " +
+      "it, read the toolpaths they generated, and post G-code out. mode is " +
+      "'job' (create the Job and its stock on target), 'op' (add one " +
+      "operation of kind profile|pocket|drilling|adaptive|face|helix to job, " +
+      "optionally with base refs and props), 'verify' (recompute and read " +
+      "every operation's path), 'post' (write G-code into the export " +
+      "directory) or 'clear' (delete the job). 'job' and 'op' create an " +
+      "object and need an id. An operation that generates ZERO path commands " +
+      "recomputes clean, reports no error and shows nothing on screen: it is " +
+      "the workbench saying it could NOT machine that feature with that tool, " +
+      "and it is the whole reason to run this rather than to assert " +
+      "manufacturability. Slow, and the geometry kernel cannot be preempted, " +
+      "so this is not a batch step.",
+    props: { mode: "string", target: "string", job: "string", op: "string",
+             base: "array", props: "object", name: "string",
+             toolDiameter: "number", savePath: "string" },
+  },
+  fem: {
+    mode: "write", creates: false,
+    summary:
+      "Linear static structural analysis (CalculiX): does the part survive " +
+      "the load? mode is 'materials' (the elastic table, writes nothing), " +
+      "'study' (Analysis + solver + material on target), 'constrain' (one " +
+      "restraint or load of kind fixed|force|pressure|displacement on refs), " +
+      "'mesh', 'solve', 'converge' (re-mesh finer and re-solve, which is the " +
+      "only thing here that says whether the number is mesh-independent), " +
+      "'result' (read the last solve again) or 'clear'. 'study' and " +
+      "'constrain' create an object and need an id. refs follow the fillet " +
+      "rule: a user pick or a query result, never an index authored here — a " +
+      "load on a renumbered face solves perfectly cleanly. A model with no " +
+      "restraint, no load, or no volume elements is REFUSED before the " +
+      "solver runs, because each of those returns a plausible number that " +
+      "means nothing. Slow, single threaded, and the human's window does not " +
+      "respond while it solves: never a batch step.",
+    props: { mode: "string", target: "string", analysis: "string",
+             kind: "string", refs: "array", magnitude: "number",
+             direction: "string", reversed: "boolean", values: "object",
+             props: "object", material: "string", E: "number", nu: "number",
+             density: "number", elementSize: "number", factor: "number",
+             name: "string" },
   },
   material: {
     mode: "write", creates: false,
@@ -13613,6 +16669,182 @@ async function toolMeasure(args) {
 }
 
 /**
+ * freecad_dfm — can this be made?
+ *
+ * `safe` and read-only for exactly the reason freecad_measure is: a check that
+ * costs the user a confirmation is a check that stops being run, and this one
+ * is meant to run on every design before anything leaves the session. It opens
+ * no transaction, writes nothing, and books no undo entry.
+ *
+ * It needs no CAM workbench. Everything it measures comes out of OCC — offsets,
+ * ray casts and concavity tests — so it answers the same on a build that has
+ * never had Path installed. freecad_cam is the layer above, and it is the one
+ * that depends on how this build spells its API.
+ */
+async function toolDfm(args) {
+  args = args || {};
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
+  await ensureKoiCad(false);
+  const payload = pyPayload({
+    targets: Array.isArray(args.targets) ? args.targets.map(String) : null,
+    process: args.process ? String(args.process) : "mill3axis",
+    tool: args.tool == null ? null : Number(args.tool),
+    axes: Array.isArray(args.axes) ? args.axes.map(String) : null,
+    stock: args.stock == null ? null : String(args.stock),
+    // No default here on purpose. koi_cad.dfm's signature owns it, and when
+    // this line carried its own copy the two drifted the first time one of
+    // them changed: the Python moved to 0 and every call still arrived with
+    // 2.0, so a plate's 2 mm underside allowance was measured against the
+    // setup that machines its top and reported as unreachable material.
+    stockMargin: args.stockMargin == null ? null : Number(args.stockMargin),
+    checks: Array.isArray(args.checks) ? args.checks.map(String) : null,
+  });
+  const res = await execPython(
+    "import koi_cad, json\n" +
+    "a = json.loads(" + payload + ")\n" +
+    "return koi_cad.dfm(a['targets'], a['process'], a['tool'], a['axes'],\n" +
+    "                   a['stock'], a['stockMargin'], a['checks'])",
+    args.timeoutMs || 300000
+  );
+  return res.data || {};
+}
+
+/**
+ * freecad_cam — the toolpath, which is the proof freecad_dfm cannot give.
+ *
+ * `mutating`, because it puts a Job in the user's tree, and through the same
+ * envelope as every other write so one Ctrl+Z takes it back out and the diff
+ * says what appeared. The timeout is its own: adaptive clearing on a real part
+ * takes tens of seconds inside the geometry kernel, which nothing here can
+ * preempt — the human watches their window not respond for the duration, and
+ * that is worth saying before starting a long one.
+ */
+async function toolCam(args) {
+  args = args || {};
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
+  const mode = String(args.mode || "job");
+  if (["job", "op", "verify", "post", "clear"].indexOf(mode) === -1) {
+    return { error: "mode must be job, op, verify, post or clear" };
+  }
+  if ((mode === "job" || mode === "op") && !args.id) {
+    return {
+      error:
+        "cam mode '" + mode + "' creates an object, so it needs an id — a " +
+        "handle like 'cam.plate' or 'camop.rough'. Ids are what let a later " +
+        "turn read this job's toolpaths instead of building a second one.",
+    };
+  }
+  await ensureKoiCad(false);
+  const opArgs = {
+    mode,
+    target: args.target == null ? null : String(args.target),
+    job: args.job == null ? null : String(args.job),
+    op: args.op == null ? null : String(args.op),
+    base: Array.isArray(args.base) ? args.base.map(String) : null,
+    props: args.props && typeof args.props === "object" ? args.props : null,
+    name: args.name == null ? null : String(args.name),
+    savePath: args.savePath == null ? null : String(args.savePath),
+  };
+  const payload = pyPayload({
+    args: opArgs,
+    id: args.id == null ? null : String(args.id),
+    label: String(args.name || ("CAM " + mode)),
+    dryRun: !!args.dryRun,
+  });
+  const res = await execPython(
+    "import koi_cad, json\n" +
+    "a = json.loads(" + payload + ")\n" +
+    "return koi_cad.call('cam', a['args'], a['id'], a['label'], a['dryRun'])",
+    args.timeoutMs || 600000
+  );
+  return annotateEdit(res.data || {}, args.detail);
+}
+
+/**
+ * freecad_fem — does it survive the load?
+ *
+ * `mutating`, like freecad_cam and for the same reason: it puts an Analysis in
+ * the user's tree, through the same envelope, so one Ctrl+Z takes it back out.
+ * The timeout is the largest in this file. CalculiX is a separate program, it
+ * is single threaded, and it runs on the thread that owns the document — the
+ * human watches their window stop responding for the whole solve, and a mesh
+ * fine enough to be interesting is minutes of that. Say so before starting one.
+ *
+ * Nothing here defaults a material, a load or a restraint. A modulus recalled
+ * from memory scales every number in the result, and an unrestrained model
+ * returns rigid-body motion that reads exactly like deflection — so both are
+ * refused on the Python side rather than filled in on this one.
+ */
+async function toolFem(args) {
+  args = args || {};
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
+  const mode = String(args.mode || "study");
+  const MODES = ["materials", "study", "constrain", "mesh", "solve",
+                 "converge", "result", "clear"];
+  if (MODES.indexOf(mode) === -1) {
+    return { error: "mode must be one of " + MODES.join(", ") };
+  }
+  if ((mode === "study" || mode === "constrain") && !args.id) {
+    return {
+      error:
+        "fem mode '" + mode + "' creates an object, so it needs an id — a " +
+        "handle like 'fea.bracket' or 'bc.mount_fixed'. Ids are what let a " +
+        "later turn re-solve this study instead of building a second one.",
+    };
+  }
+  if (mode === "constrain" && !Array.isArray(args.refs)) {
+    return {
+      error:
+        "a boundary condition needs refs: the faces it acts on. Capture the " +
+        "user's pick with freecad_call({fn:'ref'}) or hand over the `refs` " +
+        "array from freecad_call({fn:'query'}) — an index authored here " +
+        "loads the wrong face and solves clean.",
+    };
+  }
+  await ensureKoiCad(false);
+  const opArgs = {
+    mode,
+    target: args.target == null ? null : String(args.target),
+    analysis: args.analysis == null ? null : String(args.analysis),
+    kind: args.kind == null ? null : String(args.kind),
+    refs: Array.isArray(args.refs) ? args.refs.map(String) : null,
+    magnitude: args.magnitude == null ? null : Number(args.magnitude),
+    direction: args.direction == null ? null : String(args.direction),
+    reversed: !!args.reversed,
+    values: args.values && typeof args.values === "object" ? args.values : null,
+    props: args.props && typeof args.props === "object" ? args.props : null,
+    material: args.material == null ? null : String(args.material),
+    E: args.E == null ? null : Number(args.E),
+    nu: args.nu == null ? null : Number(args.nu),
+    density: args.density == null ? null : Number(args.density),
+    elementSize: args.elementSize == null ? null : Number(args.elementSize),
+    factor: args.factor == null ? null : Number(args.factor),
+    name: args.name == null ? null : String(args.name),
+  };
+  const payload = pyPayload({
+    args: opArgs,
+    id: args.id == null ? null : String(args.id),
+    label: String(args.name || ("FEM " + mode)),
+    dryRun: !!args.dryRun,
+  });
+  // A solve is the longest single call this server makes. The two mesh-and-
+  // solve modes get their own budget rather than sharing the CAM one: an
+  // aborted transport on a solve that WAS running leaves the human with a
+  // frozen window and no reply to explain it.
+  const slow = mode === "solve" || mode === "converge";
+  const res = await execPython(
+    "import koi_cad, json\n" +
+    "a = json.loads(" + payload + ")\n" +
+    "return koi_cad.call('fem', a['args'], a['id'], a['label'], a['dryRun'])",
+    args.timeoutMs || (slow ? 1800000 : mode === "mesh" ? 600000 : 120000)
+  );
+  return annotateEdit(res.data || {}, args.detail);
+}
+
+/**
  * freecad_resolve — is that pick still the thing it was?
  *
  * Read-only and `safe`, so re-validating costs nothing and therefore actually
@@ -14655,6 +17887,345 @@ return {
         },
       },
       {
+        name: "freecad_dfm",
+        description:
+          "Can this be MADE? Read-only, and the answer is measured rather " +
+          "than asserted.\n\nEverything freecad_measure reports is about " +
+          "whether the model is what you meant. This is about whether the " +
+          "shape exists in metal, which is a different question with a " +
+          "different failure mode: a zero-radius internal corner is valid " +
+          "geometry, recomputes clean, passes interference, and cannot be " +
+          "milled by any cutter at any feed.\n\nIt checks internal corner " +
+          "radii (which set the largest tool that fits), tool reach per setup " +
+          "direction (undercuts, and how many times the part has to be " +
+          "re-fixtured), enclosed voids, hole depth ratios, and the RESIDUAL: " +
+          "the volume of material a cutter of that diameter cannot reach from " +
+          "ANY direction. The residual is the definitive number — it is the " +
+          "five-axis bound, so anything above zero means the finished part " +
+          "will not be the modelled shape, whatever the machine.\n\nNeeds no " +
+          "CAM workbench: it is OCC offsets and ray casts, so it answers the " +
+          "same on a build that has never had Path installed. Run it before " +
+          "exporting geometry to anybody who is going to make it. Read " +
+          "`manufacturable`: false is a refusal, null means a check did not " +
+          "run and is NOT a pass.",
+        displayMessage:
+          "\u{1F527} Checking manufacturability" +
+          "{{#process}} \u00b7 {{process}}{{/process}}" +
+          "{{#tool}} \u00b7 \u00f8{{tool}} mm{{/tool}}",
+        tier: "safe",
+        inputSchema: {
+          type: "object",
+          properties: {
+            targets: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Objects to check, by koi id, Name or Label. Omit for the " +
+                "parts a human would count — the same set partsOnly measures.",
+            },
+            process: {
+              type: "string",
+              enum: ["mill3axis", "mill5axis", "mill_any", "turn", "print_fdm"],
+              description:
+                "Which process the part has to survive. Default mill3axis, " +
+                "which checks +Z and -Z and is what most of this skill's " +
+                "output is actually made by.",
+            },
+            tool: {
+              type: "number",
+              description:
+                "Cutter diameter in mm for the residual check. Omit and the " +
+                "largest tool that fits the tightest internal corner is used, " +
+                "which is the most optimistic case and therefore the right " +
+                "default for a lower bound.",
+            },
+            axes: {
+              type: "array",
+              items: { type: "string", enum: ["+Z", "-Z", "+X", "-X", "+Y", "-Y"] },
+              description:
+                "Setup directions to test reach from. Overrides the ones the " +
+                "process implies — pass the faces the part can actually be " +
+                "clamped on.",
+            },
+            stock: {
+              type: "string",
+              description:
+                "Object to use as the stock the part is cut out of. Omit for " +
+                "the part's bounding box plus a margin.",
+            },
+            stockMargin: {
+              type: "number",
+              description:
+                "Machining allowance on the bounding-box stock, mm. Default 0 " +
+                "— the material to remove is what a rectangular billet has and " +
+                "the part does not. An allowance on the underside is cut in " +
+                "its own setup, so charging it to the first one reports it as " +
+                "unreachable; pass one only when the billet is the question.",
+            },
+            checks: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: ["corners", "reach", "residual", "voids", "holes"],
+              },
+              description:
+                "Run a subset. The residual is the expensive one and the " +
+                "conclusive one; dropping it makes the verdict weaker, and " +
+                "the reply says so.",
+            },
+            timeoutMs: { type: "number", description: "Default 300000." },
+          },
+        },
+      },
+      {
+        name: "freecad_cam",
+        description:
+          "Run the real CAM workbench on the design: build a machining Job " +
+          "with stock on a solid, add operations to it, recompute, and read " +
+          "the toolpaths that came out.\n\nThis is the proof freecad_dfm " +
+          "cannot give. freecad_dfm reasons about the shape; this asks the " +
+          "workbench to actually generate the cuts. An operation that " +
+          "generates ZERO path commands recomputes clean, reports no error " +
+          "and looks like nothing on screen — and it means the workbench " +
+          "could not machine that feature with that tool. Read " +
+          "`emptyOperations` and `machinable` over the state flags and over " +
+          "any render.\n\nWrites a Job into the user's tree, inside the " +
+          "transaction envelope, so one Ctrl+Z takes it back out. Slow: " +
+          "toolpath generation runs in the geometry kernel, which no deadline " +
+          "can preempt, and the human watches their window not respond for " +
+          "the duration. Say so before starting a long one. The CAM API's " +
+          "spelling moves between builds — check " +
+          "freecad_call({fn:'capabilities'}) first, and the reply reports the " +
+          "spelling it found under `api`.",
+        displayMessage:
+          "\u{1F6E0}\ufe0f FreeCAD CAM \u00b7 {{mode|default:job}}" +
+          "{{#op}} \u00b7 {{op}}{{/op}}" +
+          "{{#id}} \u2192 {{id}}{{/id}}",
+        tier: "mutating",
+        inputSchema: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["job", "op", "verify", "post", "clear"],
+              description:
+                "job creates the Job and its stock on `target`; op adds one " +
+                "operation to `job`; verify recomputes and reads every " +
+                "operation's path; post writes G-code into the export " +
+                "directory; clear deletes the job. Default job.",
+            },
+            target: {
+              type: "string",
+              description: "The solid to machine. Required for mode 'job'.",
+            },
+            job: {
+              type: "string",
+              description:
+                "The Job to act on, by the id mode 'job' registered. Required " +
+                "for op, verify, post and clear.",
+            },
+            op: {
+              type: "string",
+              enum: ["profile", "pocket", "drilling", "adaptive", "face", "helix"],
+              description: "Which operation to add. Default profile.",
+            },
+            base: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Geometry the operation works on: ref ids from a user pick or " +
+                "'object:Face3' pairs from query. Same rule as fillet — do " +
+                "not author an index yourself. Omit to let the operation take " +
+                "the whole model.",
+            },
+            toolDiameter: {
+              type: "number",
+              description:
+                "Diameter in mm to set on the job's existing tool " +
+                "controller. Nothing here CREATES a tool: a job with no " +
+                "controller is refused rather than given an invented one, " +
+                "because every feed, radius and cycle time after a default " +
+                "tool is a number about a tool nobody chose.",
+            },
+            props: {
+              type: "object",
+              description:
+                "Properties to set on the operation (StepOver, FinalDepth, " +
+                "ClearanceHeight, ...). Spelled as this build spells them; a " +
+                "name the operation does not have is refused rather than " +
+                "silently dropped.",
+            },
+            id: {
+              type: "string",
+              description:
+                "Handle for the Job or operation this creates, e.g. " +
+                "'cam.plate'. Required for mode job and op.",
+            },
+            name: { type: "string", description: "Undo entry label." },
+            savePath: {
+              type: "string",
+              description:
+                "For mode 'post': a bare filename or a path inside the export " +
+                "directory, ending .nc, .gcode, .ngc or .tap.",
+            },
+            dryRun: {
+              type: "boolean",
+              description:
+                "Apply, measure, roll back. Useful for asking whether the " +
+                "toolpaths generate at all without leaving a Job in the tree.",
+            },
+            detail: { type: "string", enum: ["delta", "full"] },
+            timeoutMs: { type: "number", description: "Default 600000." },
+          },
+        },
+      },
+      {
+        name: "freecad_fem",
+        description:
+          "Does it SURVIVE the load? A linear static structural solve " +
+          "(CalculiX), through the same envelope as every other write.\n\n" +
+          "freecad_dfm and freecad_cam answer whether the shape can be made. " +
+          "This is the other question nobody can answer by looking, and the " +
+          "one a language model is most likely to answer with a confident " +
+          "sentence instead of a number. It refuses to produce a number it " +
+          "cannot stand behind: a model with no restraint, no load or no " +
+          "volume elements is rejected BEFORE the solver runs, because each " +
+          "of those solves cleanly and returns something that looks like an " +
+          "answer.\n\nRead `solved`, `factorOfSafety` and " +
+          "`singularitySuspect` together. A peak stress on a sharp internal " +
+          "corner is a SINGULARITY — it rises without bound as the mesh " +
+          "refines — so when that is flagged no single factor of safety is " +
+          "reported and the p99 field stress is what to quote. `converged` " +
+          "is null until mode 'converge' has solved it twice: an unfinished " +
+          "check, never a pass.\n\nLinear static only: no contact, no " +
+          "plasticity, no buckling, no fatigue, no dynamics, no thermal. " +
+          "Needs gmsh and CalculiX, which are separate PROGRAMS a FreeCAD " +
+          "install often does not carry — the reply reports both under " +
+          "`binaries`. Slow, single threaded, and it freezes the human's " +
+          "window for the duration: say so before starting one.",
+        displayMessage:
+          "\u{1F9EE} FreeCAD FEM \u00b7 {{mode|default:study}}" +
+          "{{#kind}} \u00b7 {{kind}}{{/kind}}" +
+          "{{#id}} \u2192 {{id}}{{/id}}",
+        tier: "mutating",
+        inputSchema: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["materials", "study", "constrain", "mesh", "solve",
+                     "converge", "result", "clear"],
+              description:
+                "materials returns the elastic table and writes nothing; " +
+                "study creates the Analysis, solver and material on `target`; " +
+                "constrain adds one restraint or load; mesh generates the " +
+                "mesh; solve runs CalculiX and reads the field; converge " +
+                "re-meshes finer, re-solves and reports whether the answer " +
+                "moved; result re-reads the last solve without re-running it; " +
+                "clear deletes the analysis. Default study.",
+            },
+            target: {
+              type: "string",
+              description: "The solid to analyse. Required for mode 'study'.",
+            },
+            analysis: {
+              type: "string",
+              description:
+                "The analysis to act on, by the id mode 'study' registered. " +
+                "Required for every mode after it.",
+            },
+            kind: {
+              type: "string",
+              enum: ["fixed", "force", "pressure", "displacement"],
+              description:
+                "For mode 'constrain'. A solve needs at least one restraint " +
+                "(fixed or displacement) AND at least one load (force or " +
+                "pressure); it is refused without both.",
+            },
+            refs: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Faces the constraint acts on: ref ids from a user pick or " +
+                "'object:Face3' pairs from query. Same rule as fillet — do " +
+                "not author an index yourself. A load on a renumbered face " +
+                "solves perfectly cleanly and is wrong.",
+            },
+            magnitude: {
+              type: "number",
+              description:
+                "Newtons for kind 'force' (the TOTAL force spread over the " +
+                "referenced faces), MPa for kind 'pressure'. MPa is N/mm2: " +
+                "1 bar is 0.1, 1 psi is 0.0068948. Convert with fn 'param', " +
+                "not in your head.",
+            },
+            direction: {
+              type: "string",
+              description:
+                "Optional ref giving the direction of a force. Omitted, the " +
+                "force acts along the loaded face's normal — which is a " +
+                "different load if that is not the direction you meant.",
+            },
+            reversed: {
+              type: "boolean",
+              description: "Flip the force or pressure onto the other side.",
+            },
+            values: {
+              type: "object",
+              description:
+                "For kind 'displacement': {x, y, z}, where a number is a " +
+                "prescribed displacement in mm, 'fix' is held at zero, and " +
+                "an axis left out is free. This is how a symmetry plane is " +
+                "written.",
+            },
+            material: {
+              type: "string",
+              description:
+                "Name from the elastic table ('aluminium-6061', " +
+                "'steel-1018'), which is the same table fn 'material' uses " +
+                "for density. Anything not in it needs E and nu explicitly: " +
+                "every stress and displacement scales with them, so nothing " +
+                "here defaults them.",
+            },
+            E: { type: "number", description: "Young's modulus, MPa." },
+            nu: { type: "number", description: "Poisson's ratio, 0 to 0.5." },
+            density: { type: "number", description: "g/cm3." },
+            elementSize: {
+              type: "number",
+              description:
+                "Characteristic element length in mm for mode 'mesh'. Omit " +
+                "for gmsh's own default, which is usually too coarse to " +
+                "resolve a fillet.",
+            },
+            factor: {
+              type: "number",
+              description:
+                "For mode 'converge': how much finer the second mesh is, " +
+                "0.2 to 1.0. Default 0.6. Halving the size is roughly eight " +
+                "times the elements and the solve time goes with it.",
+            },
+            id: {
+              type: "string",
+              description:
+                "Handle for what this creates, e.g. 'fea.bracket' or " +
+                "'bc.mount_fixed'. Required for mode study and constrain.",
+            },
+            name: { type: "string", description: "Undo entry label." },
+            dryRun: {
+              type: "boolean",
+              description:
+                "Apply, measure, roll back. Useful for asking whether the " +
+                "model even solves without leaving an Analysis in the tree.",
+            },
+            detail: { type: "string", enum: ["delta", "full"] },
+            timeoutMs: {
+              type: "number",
+              description: "Default 1800000 for solve and converge.",
+            },
+          },
+        },
+      },
+      {
         name: "freecad_export",
         description:
           "Write the document out to the user's filesystem: FCStd " +
@@ -14946,6 +18517,15 @@ return {
           break;
         case "freecad_measure":
           result = await toolMeasure(args);
+          break;
+        case "freecad_dfm":
+          result = await toolDfm(args);
+          break;
+        case "freecad_cam":
+          result = await toolCam(args);
+          break;
+        case "freecad_fem":
+          result = await toolFem(args);
           break;
         case "freecad_call":
           result = await toolCall(args);

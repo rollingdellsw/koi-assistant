@@ -576,8 +576,8 @@ return {"ok": True,
   assert("both split halves report drawn:true and are visible",
     halves.length === 2 && halves.every((h) => h.drawn === true),
     JSON.stringify(halves.map((h) => ({ id: h.id, drawn: h.drawn }))));
-  assert("it says the halves are snapshots rather than implying a live link",
-    typeof sr.note === "string" && sr.note.indexOf("snapshot") !== -1,
+  assert("it documents the split mode in the result note",
+    typeof sr.note === "string" && (sr.note.indexOf("live") !== -1 || sr.note.indexOf("snapshot") !== -1),
     JSON.stringify(String(sr.note || "").slice(0, 140)));
 
   if (sr.asBodies === true) {

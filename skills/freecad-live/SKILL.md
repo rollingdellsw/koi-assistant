@@ -1,6 +1,6 @@
 ---
 name: freecad-live
-description: Turn-based human/AI co-design of a live FreeCAD document running natively on this machine. Reads the document every turn, edits it through a validated call whitelist inside a transaction envelope, measures the result rather than trusting it, and keeps user-picked face and edge references alive across recomputes. Purchased parts are interfaces bound by expression, not modelled solids. Pins the exact FreeCAD build the session is talking to.
+description: Turn-based human/AI co-design of a live FreeCAD document running natively on this machine. Reads the document every turn, edits it through a validated call whitelist inside a transaction envelope, measures the result rather than trusting it, and keeps user-picked face and edge references alive across recomputes. Purchased parts are interfaces bound by expression, not modelled solids. Checks that the result can actually be made -- corner radii, tool reach, undercuts and the volume no cutter can reach -- and can run the CAM workbench to prove a toolpath exists. Where CalculiX is installed it also runs a linear static solve, so "is it strong enough" is answered with a measured stress or refused, never with a sentence. Pins the exact FreeCAD build the session is talking to.
 runnable: true
 
 # Positional. scripts/connect.js reads them as args[0], args[1], args[2] —
@@ -100,18 +100,18 @@ guardrails: scripts/guardrail.js
 # arrives at the moment it applies.
 reminders:
   - id: "freecad-live:turn-open"
-    description: Sync opens every turn; the human shares this document.
+    description: Sync before reacting to human changes or ambiguous context.
     trigger:
       type: "user_message"
       pattern: "."
     content: |
-      FreeCAD turn protocol: call freecad_sync() BEFORE any edit or any claim
-      about the model. Read userDiff (what the human changed — revertedAiObjects
-      is a rejection, never re-create), selection (what "this one" means),
-      health, and guiBusy. Answering from the document as you left it is how
-      their work gets overwritten.
+      FreeCAD turn protocol: call freecad_sync() when starting a session,
+      when referencing user selections ("this face", "this one"), or before
+      reacting to human changes (userDiff). For direct, self-contained design
+      sequences or known batches, proceed directly with freecad_call/batch to
+      avoid unnecessary latency.
     strategy: "persistent"
-    priority: "high"
+    priority: "medium"
 
   - id: "freecad-live:measure-not-pixels"
     description: A render proves existence, never dimension.
@@ -152,6 +152,59 @@ reminders:
       from what generated it — re-capture it and check what it now points at.
       `broken`/`ambiguous` means STOP: name the reference and ask the human to
       re-pick. Never author a replacement index yourself.
+    strategy: "persistent"
+    priority: "high"
+
+  - id: "freecad-live:manufacturable"
+    description: A design nobody can make is not a finished design.
+    trigger:
+      type: "tool_call"
+      toolName: "freecad_export"
+    content: |
+      Geometry is about to leave this session. Before handing it to anyone who
+      will make it, run freecad_dfm — it is `safe`, it writes nothing, and it
+      is the only thing here that answers whether the shape exists in metal
+      rather than only in the document. Report its `verdict` with the export,
+      including a `manufacturable: null` (a check that did not run is not a
+      pass). If they are machining it, freecad_cam({mode:"job"}) then
+      {mode:"verify"} is the toolpath-level proof.
+    strategy: "persistent"
+    priority: "high"
+
+  - id: "freecad-live:dfm-findings"
+    description: The findings that are geometry, not opinion.
+    trigger:
+      type: "tool_result"
+      toolName: "freecad_(dfm|cam)"
+      outputPattern: 'manufacturable":false|manufacturable":null|machinable":false|dfm-|emptyOperations":\["'
+    content: |
+      This reply carries a manufacturability finding. `dfm-sharp-corner`,
+      `dfm-undercut`, `dfm-unreachable-volume` and `dfm-internal-void` are not
+      tolerances to negotiate — no smaller tool, slower feed or extra setup
+      fixes them. An empty CAM operation is the workbench saying it could not
+      cut that feature. Say which finding it is, what it costs, and what
+      change would clear it, BEFORE building anything else on the part.
+      `manufacturable: null` means a check did not run: report it as
+      unfinished, never as a pass.
+    strategy: "persistent"
+    priority: "high"
+
+  - id: "freecad-live:fem-findings"
+    description: A stress number that is a property of the mesh, not the part.
+    trigger:
+      type: "tool_result"
+      toolName: "freecad_fem"
+      outputPattern: 'singularitySuspect":true|converged":null|factorOfSafety":null|displacementImplausible|stale":true|solved":false'
+    content: |
+      This solve carries a finding that outranks the number next to it.
+      `singularitySuspect` means the peak sits on a sharp corner and rises
+      forever as the mesh refines — quote the p99, say the peak was discarded
+      and why, and offer the fillet. `converged: null` means it was solved
+      once, so mesh-independence is UNKNOWN: report it as an unfinished check.
+      `factorOfSafety: null` is a refusal with a reason attached, never a pass.
+      `displacementImplausible` usually means a missing restraint, not a bendy
+      part. `stale` means the geometry moved after the solve. Say which one it
+      is before saying anything about strength.
     strategy: "persistent"
     priority: "high"
 
@@ -218,7 +271,9 @@ reminders:
       Checkpoint: offer the user a save (freecad_call({fn:"save"}) writes their
       own file; freecad_export({format:"FCStd"}) writes a separate copy) and
       run freecad_measure({partsOnly:true, interference:true}) so the state of
-      the model is measured rather than assumed at this point.
+      the model is measured rather than assumed at this point. If there is a
+      solid, freecad_dfm() as well: an undercut found at turn 15 is a sketch
+      edit, and the same undercut found at handover is a redesign.
     strategy: "one_shot"
     priority: "medium"
 
@@ -231,6 +286,9 @@ allowed-tools:
   - freecad_get
   - freecad_render
   - freecad_measure
+  - freecad_dfm
+  - freecad_cam
+  - freecad_fem
   - freecad_resolve
   - freecad_export
   - freecad_call
@@ -313,9 +371,9 @@ satisfied, so say that rather than authoring the reference yourself.
 
 ## 3. The turn protocol
 
-**`freecad_sync()` opens every turn.** It is not a formality — the human may
-have moved, deleted or rejected something since your last reply. Read four
-things from it before anything else:
+**`freecad_sync()` synchronizes with the human co-designer.** Call it when
+opening a session, responding to user references ("this one", GUI selection),
+or inspecting what changed since your last response. Read four things from it:
 
 - **`userDiff`** — what they changed. `revertedAiObjects` means they deleted
   something you made: a rejection, never silently re-created. `dofChanges`
@@ -325,6 +383,12 @@ things from it before anything else:
 - **`health`** — errors, touched, underconstrained, at a glance.
 - **`guiBusy`** — advisory. The real gate is inside the edit, which fails
   closed. If it is set, answer in prose and wait.
+
+**Avoid redundant syncs during continuous design flows.** When executing a
+known sequence of steps (such as setting parameters, building sketches, or
+running batches), you can proceed directly to `freecad_call` or `batch`. Each
+write call runs inside the transaction envelope, checks the GUI gate, and
+returns its own diff and lint report.
 
 The tree and the lint are **trimmed** on a large document. `objectCount` and
 `lintTotal` are always exact and `treeNote`/`lintNote` say when something was
@@ -427,6 +491,8 @@ needs something not on this list, say it is absent rather than improvising.**
 | Repeats        | `pattern` (feature in its body), `polar_array` / `link_array` (whole-object links), `mirror` (whole solid) |
 | Multi-solid    | `boolean`, `split_body`, `primitive`, `place`                                                              |
 | Purchased      | `insert`, `swap`, `hole`, `mate`, `fastener_pattern`, `param`, `material`                                  |
+| Manufacturing  | `cam` (Job, operations, toolpaths, G-code — see §8)                                                        |
+| Analysis       | `fem` (analysis, restraints, loads, mesh, CalculiX solve — see §8)                                         |
 | Lifecycle      | `feature_edit`, `suppress`, `delete`, `allow`, `batch`                                                     |
 | Presentation   | `isolate`, `show`, `view_set`, `view_fit`, `view_section`, `view_restore`, `render`                        |
 
@@ -749,6 +815,186 @@ edges a boolean leaves across a face — **the sliver faces `deepLint` reports.*
 Refining cannot change the volume, so the volume is measured either side and a
 difference is reported as a problem rather than a result.
 
+### Manufacturability
+
+Everything above this line answers _is the model what I meant_. None of it
+answers _can this be made_, and those are different questions. A part can be
+dimensionally perfect, recompute clean, pass interference, and weigh exactly
+what the BOM says, and still be a shape no cutter can produce. An internal
+corner with a zero radius is the canonical case: it is trivially valid
+geometry, and it does not exist in metal.
+
+**Do not assert manufacturability. Measure it.** A sentence from you saying a
+part looks machinable is worth nothing; a residual volume that came out of an
+offset operation is worth what it says.
+
+**`freecad_dfm` is `safe`, writes nothing, and needs no CAM workbench.** Run it
+on any solid before handing geometry to anybody who will make it, and run it
+early enough that a finding is still a sketch edit. It reports:
+
+- **Internal corner radii** — the tightest concave corner running along the
+  tool axis sets the largest cutter that fits, and `nearestStockTool` says
+  which one you can actually buy. A **sharp** internal corner (`dfm-sharp-corner`)
+  is not a smaller tool: a rotating cutter leaves its own radius, so the answer
+  is a corner relief, EDM, or a redesign. Rounding a corner to a stock radius
+  usually costs nothing and lets a bigger, faster tool in — that is worth
+  offering.
+- **Reach per setup direction** — a face reachable from none of the tested axes
+  is an **undercut** (`dfm-undercut`) and no feed rate, tool or setup reaches
+  it on a 3-axis machine. A part needing more than one direction is
+  `dfm-multi-setup`: makeable, but each re-fixture is a tolerance stack, so say
+  so before quoting a position tolerance across the two.
+- **The residual** — the volume a cutter of that diameter cannot reach from
+  **any of the setup directions being checked**. This is the conclusive number,
+  and it is an intersection, not a sum: a pocket in the underside of a plate is
+  a second setup, not a defect. **Read `obstructed`, not `volumeMm3`.** The
+  reply names the `method`, and the two do not claim quite the same thing:
+  `slab-2d` slices along each axis and models a flat end mill arriving from
+  above, so a square pocket floor reads zero; `ball-closing` is the fallback,
+  axis-free and therefore stronger where it works, but its structuring element
+  is a ball, so it leaves the cutter's own radius in every internal corner —
+  reported as `skinOnly` with `dfm-corner-leftover` at `info`, not as a
+  failure. That one is still worth a sentence: the corners will be radiused,
+  not square, and a drawing that says otherwise is a drawing the shop will
+  phone about. A leftover that could not be classified is reported as
+  obstructed on purpose.
+
+  Stock defaults to the part's **bounding box**, so the material to remove is
+  what a rectangular billet has and the part does not. Pass `stock` or
+  `stockMargin` for a real billet with an allowance — but an allowance on the
+  underside is machined in its own setup, and counting it against the first one
+  would report every plate as unreachable from the side its top was cut from.
+
+- **Enclosed voids, hole depth ratios, flat-bottomed blind holes** — a cavity
+  with no opening cannot be cut by anything; a hole past 5×D is a peck cycle
+  with a special drill; a twist drill leaves a 118° cone, so a flat blind
+  bottom is an end mill and its diameter has to be a cutter size.
+
+A part with a machined underside needs **two** setups, and `setupCount: 2` on
+a plain plate is the right answer rather than a complaint — the top and the
+bottom are not reachable from the same side. What matters is
+`unreachableFaceCount`.
+
+Read `manufacturable`. `false` is a refusal, and it **outranks** an unfinished
+check: a residual that could not be measured cannot make a sharp internal
+corner go away, so a blocking finding is reported as one even when something
+else did not run. `true` is a pass on **the checks that ran**. **`null` means a
+check did not run and nothing blocking was found** — an OCC offset that failed on
+a hard shape is reported as a failure, not resolved in favour of a pass — and
+`null` must be relayed as an unfinished check.
+
+### Strength
+
+`freecad_dfm` and `freecad_cam` answer whether the shape can be made. Neither
+answers whether it survives its load, and that is the question you are most
+likely to be asked and least able to answer by looking. **A sentence saying a
+wall looks strong enough is worth nothing, and the user cannot tell it apart
+from a number.** So either measure it or say it has not been measured.
+
+**`freecad_fem` is a linear static solve through CalculiX**, in the same
+envelope as every other write, and it is deliberately narrow: small
+displacements, linear elastic material, everything bonded, one load case. No
+contact, no plasticity, no buckling, no fatigue, no dynamics, no thermal. Every
+one of those is a real way the part fails that this cannot see, so what comes
+out is evidence, never a certificate — and never a substitute for whatever
+standard the part is actually built to.
+
+The sequence is `study` → `constrain` (at least twice) → `mesh` → `solve`:
+
+- `freecad_fem({mode: "study", target: "body.bracket", material:
+"aluminium-6061", id: "fea.bracket"})` builds the Analysis, its solver and its
+  material. **Nothing here defaults a modulus.** A material not in the table
+  needs `E` and `nu` explicitly, because every stress and every displacement
+  in the result scales with them, and a modulus recalled from memory is exactly
+  the kind of number this skill exists to stop being recalled from memory.
+  `{mode: "materials"}` is the table and writes nothing.
+- `freecad_fem({mode: "constrain", analysis: "fea.bracket", kind: "fixed",
+refs: [...], id: "bc.bolted"})`, then again with `kind: "force"` and
+  `magnitude` in newtons — or `kind: "pressure"` in **MPa, which is N/mm²**;
+  convert bar and psi with `param` rather than in your head. `refs` follows the
+  `fillet` rule exactly: a user pick or a `query` result, never an index you
+  authored. **A load on a renumbered face solves perfectly cleanly**, and the
+  reply reports what the constraint actually stored so you can check.
+- `freecad_fem({mode: "mesh", analysis: "fea.bracket", elementSize: 2})`.
+- `freecad_fem({mode: "solve", analysis: "fea.bracket"})`.
+
+**Three things are refused before the solver runs**, because all three return a
+plausible number rather than an error: a model with **no restraint** (a
+floating body's rigid-body motion reads exactly like deflection), a model with
+**no load** (zero stress everywhere is not a pass), and a mesh with **no volume
+elements** (a surface mesh on a solid has no stiffness at all). Relay the
+refusal; do not work around it.
+
+Read the reply in this order:
+
+- **`singularitySuspect`** first. The peak stress node's distance to the
+  nearest sharp internal corner is measured, and if it is inside the band this
+  mesh can resolve, the peak is a **singularity**: refine the mesh and it rises
+  without bound, so it is a property of the mesh and not of the part. When that
+  fires, no single `factorOfSafety` is reported on purpose. Quote
+  `p99VonMisesMPa`, say the peak was discarded and why, and offer the fillet —
+  which is what the part needed anyway.
+- **`factorOfSafety`** — yield over peak, and `null` is a refusal with a reason
+  attached rather than a missing value. It is null for a singular peak, and
+  null for every material with no yield in the table: grey iron is brittle and
+  does not yield, and a polymer's strength is rate- and temperature-dependent
+  and creeps under a sustained load, so dividing by one number would be a
+  number nobody should act on. Displacement is still worth reading there.
+- **`converged`** — `null` until `{mode: "converge"}` has solved it a second
+  time on a finer mesh and compared. One mesh is one number with no error bar,
+  so `null` is an unfinished check and is reported as one, exactly like
+  `manufacturable: null`. A peak that keeps climbing while the p99 settles is
+  the signature of a corner singularity, not of a mesh that is too coarse.
+- **`displacementImplausible`** — the deflection is more than a tenth of the
+  part's own size, so the solve is outside its own small-displacement
+  assumption. The usual cause is a missing restraint, not a bendy part.
+- **`fem-stale`** in lint — the geometry changed after the solve, so the stress
+  and any factor of safety quoted from it describe the old shape. It keeps
+  reporting every turn until the analysis is re-solved or removed, the same way
+  `split-stale` does.
+
+Two practical things. **gmsh and CalculiX are separate programs**, not part of
+FreeCAD's Python — an install carrying the FEM workbench menu very often has
+neither, and the reply reports both under `binaries`. If they are absent, say
+the solver is not available here rather than reporting the design as unchecked
+for some other reason. And the solve **runs on the thread that owns the
+document**: the human's window stops responding for the duration, which on a
+fine mesh is minutes. Say so before starting one, and never put `fem` in a
+batch.
+
+**`freecad_cam` is the toolpath, and it is the proof `freecad_dfm` cannot
+give.** `freecad_dfm` reasons about the shape; this asks the workbench to
+generate the actual cuts:
+
+- `freecad_cam({mode: "job", target: "body.plate", id: "cam.plate"})` builds a
+  Job with stock.
+- `freecad_cam({mode: "op", job: "cam.plate", op: "pocket", id: "camop.pocket"})`
+  adds an operation. `base` takes refs the way `fillet` does — a user pick or a
+  `query` result, never an index you authored.
+- `freecad_cam({mode: "verify", job: "cam.plate"})` recomputes and reads every
+  operation's path.
+
+**An operation that generated zero path commands is the answer, not a
+glitch.** It recomputes Up-to-date, reports no error, and shows nothing on
+screen a render would catch — and it means the workbench could not machine that
+feature with that tool. `emptyOperations` and `machinable: false` are the
+fields; believe them over the state flags. `rapidsBelowClearance` is the other
+one that matters: a lateral G0 under the clearance height is a rapid through
+stock, and that G-code does not go to a machine.
+
+Two things about running it. The CAM API's spelling **moves between builds** —
+`Path.Op.Profile` was `PathScripts.PathProfile` before 1.0 — so the reply
+reports the spelling it found under `api`, and if a module is absent, say the
+workbench is not available here rather than reporting the design as unverified
+for some other reason. And toolpath generation runs **inside the geometry
+kernel**, which no deadline preempts: the human's window stops responding for
+the duration. Say that before starting a long one, and never put `cam` in a
+batch.
+
+A job with no tool controller is refused rather than given an invented tool.
+Every feed, radius and cycle time after a default tool would be a number about
+a tool nobody chose — ask the human to add one in CAM → Tool Bit Library.
+
 ## 9. Changing your mind
 
 - **`feature_edit`** reaches any property or expression an object has,
@@ -863,6 +1109,16 @@ referenced.
   `freecad_render` for a picture that is definitely current.
 - `unregisteredObjects` — a script created something nobody can address later.
 - `non-stock`, `thread-engagement` — buildable in CAD and not in a workshop.
+- `manufacturable` — `false` is a refusal, `true` is a pass on the checks that
+  ran, `null` is a check that did not run. Never report `null` as a pass.
+- `emptyOperations` / `machinable` — the CAM workbench could not generate a cut
+  for those features. A clean recompute does not contradict this.
+- `singularitySuspect` / `factorOfSafety` / `converged` — a peak stress on a
+  sharp corner is mesh-dependent and is not a stress; a null factor of safety
+  is a refusal with a reason; `converged: null` means solved once, so
+  mesh-independence is unknown. None of the three is a pass.
+- `fem-stale` — the geometry moved after the solve. Re-solve before repeating
+  any number from it.
 - `split-stale` — re-run `split_body` before exporting anything.
 
 ## 12. What is not here
@@ -879,7 +1135,26 @@ Say it plainly rather than improvising a substitute:
   but it samples a continuum, and the true minimum can fall between samples.
   Say which angles you sampled.
 - **Drawings and dimensioned output.** No TechDraw.
-- **Threads as geometry**, sheet metal, and FEA.
+- **Material-removal simulation.** `freecad_cam` proves a toolpath exists and
+  measures it; it does not sweep the tool through the stock and compare the
+  result with the model. Leftover material between passes, a stepover that
+  misses, and a finish pass that gouges are all invisible to it. The
+  `freecad_dfm` residual is the geometric bound, not a simulation.
+- **Work holding, fixtures and tolerance stacks.** The setup count is
+  geometry; how the part is actually clamped, and what that costs in
+  tolerance, is not modelled.
+- **Post-processor correctness.** G-code comes out machine-specific and
+  unverified. An operator checks it.
+- **Speeds, feeds, cycle time and cost.** Not estimated, and a number invented
+  for them would be worse than none.
+- **Everything a linear static solve cannot see.** `freecad_fem` is one load
+  case, small displacements, linear elastic, everything bonded. No contact, no
+  preload, no plasticity, no buckling, no fatigue or endurance limit, no
+  dynamics or modal analysis, no thermal, and no anisotropy — so a laminate, a
+  printed part's layer adhesion and a welded or bolted joint are all outside
+  it. It does not know your service load, your shock case or your safety
+  factor policy, and it certifies nothing.
+- **Threads as geometry**, and sheet metal.
 - **An ellipse sketch primitive**, and a mirrored _feature_ (`mirror` is a whole
   solid).
 - **Mesh import.** STL goes out; only STEP, IGES and BREP come in.
