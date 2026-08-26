@@ -889,7 +889,7 @@ function protocolStatus() {
 //                window freeze while it runs.
 
 const KOI_CAD_PY = String.raw`
-VERSION = "0.9.0"
+VERSION = "0.11.0"
 
 import json as _json
 import math as _math
@@ -9809,6 +9809,15 @@ CAP_MODULES = (
     # separate programs that a container carrying the workbench often does not
     # have. fn 'fem' reports the binaries; this reports the Python side.
     "ObjectsFem", "femmesh.gmshtools", "femtools.ccxtools",
+    # Kinematics. The native Assembly workbench arrived in 1.0 and its Python
+    # side is three modules with different jobs: Assembly is the workbench,
+    # UtilsAssembly resolves joint frames, JointObject defines the joint. A
+    # build can have the first and not be scriptable through the others.
+    "UtilsAssembly", "JointObject",
+    # Drawings. TechDraw is the non-GUI half and writes DXF; TechDrawGui is
+    # the half that writes PDF and SVG, and it is only importable when this
+    # FreeCAD has a GUI. Two different facts, so two entries.
+    "TechDrawGui",
 )
 
 
@@ -14471,6 +14480,1670 @@ def _op_fem(doc, args, kid):
         "result or clear (got %r)" % mode)
 
 
+# ---------- kinematics, and quasi-static kinetics ----------
+#
+# The third question a part cannot answer by being looked at.
+#
+#   dfm/cam:  can it be made?
+#   fem:      does it survive its load?
+#   motion:   does it MOVE the way it was supposed to, through its whole
+#             travel, without hitting itself -- and what does it take to
+#             drive it?
+#
+# An assembly is the place where a render is at its most convincing and least
+# informative. It shows one pose. The mechanism was designed for a range, and
+# every interesting failure lives at some angle nobody screenshotted:
+#
+#   * the mechanism that assembles, solves and renders beautifully at 0 deg
+#     and drives its own link through the frame at 47 deg;
+#   * the four-bar that has TWO assembly configurations, where the solver
+#     quietly jumps from one branch to the other mid-sweep. Every pose in the
+#     animation is a valid solution of the constraints and the physical
+#     linkage cannot get from one to the next without being taken apart;
+#   * the mechanism that is one joint short of the mobility it was drawn for,
+#     so it is a structure: it solves, it renders, and it does not move;
+#   * the joint that reaches a toggle and stops, while the driving value keeps
+#     going up and the solver keeps reporting success;
+#   * the part nothing grounds, so every placement in the document is relative
+#     to a frame that is itself free, and every number measured off it is
+#     meaningless in a way no flag reports.
+#
+# All five recompute clean. All five are measurable by driving the assembly
+# and WATCHING, which is what this does.
+#
+# What it deliberately is not: a dynamics engine. There is no time here, no
+# contact, no friction, no impact, no compliance, no backlash and no control
+# loop. The kinetics is virtual work against gravity -- quasi-static, the
+# torque needed to HOLD the mechanism at each pose -- which is the number that
+# sizes a hinge, a gas strut or a servo at stall, and is not the number that
+# survives an impact. It is arithmetic on measured placements and measured
+# masses, not a simulation, and it is reported as such.
+
+ASM_API_CANDIDATES = {
+    "assembly": (("Assembly", None),),
+    "utils": (("UtilsAssembly", None),),
+    "joints": (("JointObject", None),),
+}
+
+# Degrees of freedom a joint LEAVES between the two parts it connects. Used
+# for the Kutzbach-Grubler count, which is the independent check on what the
+# solver reports: two numbers from two methods that should agree, and a
+# disagreement that means something specific when they do not.
+#
+# Deliberately incomplete. A joint type not in here makes the whole count
+# None rather than an approximation, because a mobility number that is quietly
+# wrong is worse than no mobility number -- it is the thing the user would
+# have checked by hand.
+JOINT_FREEDOM = {
+    "Fixed": 0,
+    "Revolute": 1,
+    "Cylindrical": 2,
+    "Slider": 1,
+    "Ball": 3,
+    "Distance": 5,
+    "Parallel": 4,
+    "Perpendicular": 5,
+    "Angle": 5,
+    "RackPinion": 5,
+    "Screw": 5,
+    "Gears": 5,
+    "Belt": 5,
+}
+
+# Properties a joint might expose as its driven value. Probed in this order
+# and reported, because which one a build uses is a fact about the build.
+ASM_DRIVE_PROPS = ("Rotation", "Angle", "Distance", "Distance2", "Offset",
+                   "Length", "Position")
+
+ASM_ANGLE_HINTS = ("Rotation", "Angle")
+
+ASM_DOF_METHODS = ("numberOfDof", "numberOfDOF", "getNumberOfDof", "dof")
+ASM_SOLVE_METHODS = ("solve", "solveAssembly")
+
+# A boolean per pair per step is the expensive thing here, so pairs whose
+# bounding boxes do not overlap are dropped before any of it happens.
+ASM_MAX_PAIRS = 200
+ASM_MAX_STEPS = 200
+
+
+def _asm_api():
+    return _import_probe(ASM_API_CANDIDATES)
+
+
+def _q(v):
+    """A float out of a Quantity, a float, or nothing."""
+    try:
+        return float(v.Value)
+    except Exception:
+        pass
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _asm_find(doc, ref):
+    """The assembly to work on: named, or the only one there is."""
+    if ref:
+        o = _resolve_or_die(doc, ref, "assembly")
+        if "Assembly" not in str(getattr(o, "TypeId", "")):
+            raise KoiOpError(
+                "%r is %s, not an assembly." % (ref, getattr(o, "TypeId", "?")))
+        return o
+    found = [o for o in doc.Objects
+             if "AssemblyObject" in str(getattr(o, "TypeId", ""))]
+    if not found:
+        raise KoiOpError(
+            "this document has no native Assembly. Kinematics needs one: the "
+            "parts, the joints between them and which part is grounded all "
+            "live in it. Build it in the Assembly workbench -- joints are "
+            "made by clicking the two features that mate, which is a job for "
+            "the human in front of the window, not for this side.")
+    if len(found) > 1:
+        raise KoiOpError(
+            "this document has %d assemblies (%s); say which one."
+            % (len(found), ", ".join(o.Name for o in found)))
+    return found[0]
+
+
+def _asm_walk(obj, out, depth=0):
+    if depth > 6:
+        return
+    try:
+        kids = list(obj.Group)
+    except Exception:
+        kids = []
+    for k in kids:
+        out.append(k)
+        _asm_walk(k, out, depth + 1)
+
+
+def _asm_members(assembly):
+    out = []
+    _asm_walk(assembly, out)
+    return out
+
+
+def _asm_classify(assembly):
+    """Parts, joints and grounds, by the properties they carry.
+
+    By property rather than by TypeId on purpose: joints are FeaturePython
+    objects whose class name and module path have both moved between builds,
+    while JointType and ObjectToGround are what they are FOR.
+    """
+    parts, joints, grounds, other = [], [], [], []
+    for o in _asm_members(assembly):
+        if hasattr(o, "ObjectToGround"):
+            grounds.append(o)
+        elif hasattr(o, "JointType"):
+            joints.append(o)
+        elif hasattr(o, "Shape") or hasattr(o, "LinkedObject"):
+            parts.append(o)
+        else:
+            other.append(o)
+    return parts, joints, grounds, other
+
+
+def _asm_shape(o):
+    """The part's shape in ASSEMBLY coordinates, or None with a reason.
+
+    Assembly coordinates rather than world is deliberate: every part shares
+    the assembly as a parent, so interference between them is decided there,
+    and it saves resolving a container chain that App::Link makes ambiguous.
+
+    Returning None matters more than it looks. A collision check that silently
+    receives an empty shape reports NO COLLISION, which is the exact class of
+    lie this file exists to stop -- so every caller of this has to treat None
+    as "not checked" and say so, never as "clear".
+    """
+    lo = getattr(o, "LinkedObject", None)
+    if lo is not None:
+        target = lo
+        chain = [o]
+        while getattr(target, "LinkedObject", None) is not None:
+            chain.append(target)
+            target = target.LinkedObject
+        sh = getattr(target, "Shape", None)
+        if sh is None or getattr(sh, "isNull", lambda: True)():
+            return None, "no shape"
+        try:
+            s = sh.copy()
+            pl = App.Placement()
+            for item in chain:
+                pl = pl.multiply(item.Placement)
+            s.Placement = pl.multiply(sh.Placement)
+            if s.Volume > 1e-9:
+                return s, None
+        except Exception as e:
+            return None, "%s: %s" % (type(e).__name__, e)
+    try:
+        import Part
+        s = Part.getShape(o, "", needSubElement=False, transform=True)
+        if s is not None and not s.isNull() and s.Volume > 1e-9:
+            return s, None
+    except Exception as e:
+        pass
+    sh = getattr(o, "Shape", None)
+    if sh is None or getattr(sh, "isNull", lambda: True)():
+        return None, "no shape"
+    return sh.copy(), None
+
+
+def _asm_pose(parts):
+    """A snapshot of where everything is, cheap enough to take every step."""
+    out = {}
+    for p in parts:
+        try:
+            pl = p.Placement
+            out[p.Name] = (float(pl.Base.x), float(pl.Base.y), float(pl.Base.z),
+                           float(pl.Rotation.Angle),
+                           float(pl.Rotation.Axis.x), float(pl.Rotation.Axis.y),
+                           float(pl.Rotation.Axis.z))
+        except Exception:
+            continue
+    return out
+
+
+def _asm_pose_delta(a, b):
+    """How far the assembly moved between two poses: mm, and degrees."""
+    dmax = 0.0
+    amax = 0.0
+    for k in a:
+        if k not in b:
+            continue
+        pa, pb = a[k], b[k]
+        d = _math.sqrt((pa[0] - pb[0]) ** 2 + (pa[1] - pb[1]) ** 2 +
+                       (pa[2] - pb[2]) ** 2)
+        if d > dmax:
+            dmax = d
+        # Rotation compared as the angle between the two orientations, not as
+        # the difference of two angle-axis pairs: those are not comparable
+        # across an axis flip and would read a 1 degree move as 179.
+        try:
+            qa = App.Rotation(App.Vector(pa[4], pa[5], pa[6]), _math.degrees(pa[3]))
+            qb = App.Rotation(App.Vector(pb[4], pb[5], pb[6]), _math.degrees(pb[3]))
+            rel = qa.inverted().multiply(qb)
+            ang = abs(_math.degrees(rel.Angle))
+            if ang > 180.0:
+                ang = 360.0 - ang
+        except Exception:
+            ang = 0.0
+        if ang > amax:
+            amax = ang
+    return round(dmax, 6), round(amax, 6)
+
+
+def _asm_restore(parts, pose):
+    for p in parts:
+        row = pose.get(p.Name)
+        if not row:
+            continue
+        try:
+            p.Placement = App.Placement(
+                App.Vector(row[0], row[1], row[2]),
+                App.Rotation(App.Vector(row[4], row[5], row[6]),
+                             _math.degrees(row[3])))
+        except Exception:
+            continue
+
+
+def _asm_solver(assembly):
+    for name in ASM_SOLVE_METHODS:
+        f = getattr(assembly, name, None)
+        if callable(f):
+            return f, name
+    raise KoiOpError(
+        "this build's assembly object exposes no solve method (tried %s), so "
+        "nothing here can drive it. Report that the Assembly workbench is "
+        "present but not scriptable on this build."
+        % ", ".join(ASM_SOLVE_METHODS))
+
+
+def _asm_solve(fn):
+    """Run the solver. The return value is recorded, never believed.
+
+    Whether a solve 'worked' is decided downstream by measuring: did the
+    driven value land where it was asked to, and did anything actually move.
+    A status code that says yes while the mechanism sat still is precisely
+    the failure this is watching for.
+    """
+    try:
+        rv = fn()
+        return True, (None if rv is None else _plain(rv))
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def _asm_measured_dof(assembly):
+    for name in ASM_DOF_METHODS:
+        f = getattr(assembly, name, None)
+        if not callable(f):
+            continue
+        try:
+            return int(f()), name
+        except Exception:
+            continue
+    return None, None
+
+
+def _asm_grubler(parts, joints, grounds):
+    """Kutzbach-Grubler mobility, or None if any joint type is unknown.
+
+    M = 6(n-1) - sum(6 - f_i), links counted with ground as one link. This is
+    the hand calculation the mechanism was designed against, and it is here to
+    DISAGREE with the solver when something is redundant.
+    """
+    n = len(parts)
+    if n == 0:
+        return None, "no parts"
+    if not grounds:
+        # Nothing fixed: no link is the frame, so mobility is not defined in
+        # the usual sense and every part carries its own six.
+        return None, "nothing grounded"
+    total = 6 * (n - 1)
+    for j in joints:
+        t = str(getattr(j, "JointType", "") or "")
+        f = JOINT_FREEDOM.get(t)
+        if f is None:
+            return None, "unknown joint type %r" % t
+        total -= (6 - f)
+    return total, None
+
+
+def _asm_joint_parts(doc, assembly, joint, byname):
+    """Which two parts a joint connects, by resolving its references.
+
+    Needed for two things: the connectivity graph, and knowing which pairs
+    TOUCH BY DESIGN -- a pin in its hole overlaps by exactly the pin, and
+    reporting that as an interference would bury the one collision that
+    matters under a list of the ones that were drawn on purpose.
+    """
+    out = []
+    for attr in ("Reference1", "Reference2"):
+        ref = getattr(joint, attr, None)
+        if not ref:
+            continue
+        obj, subs = None, None
+        try:
+            obj, subs = ref[0], ref[1]
+        except Exception:
+            obj, subs = ref, None
+        name = None
+        sub = ""
+        if isinstance(subs, (list, tuple)) and subs:
+            sub = str(subs[0])
+        elif isinstance(subs, str):
+            sub = subs
+        if sub:
+            name = sub.split(".")[0]
+        if name and name in byname:
+            out.append(byname[name])
+        elif obj is not None and getattr(obj, "Name", None) in byname:
+            out.append(byname[obj.Name])
+    return out
+
+
+def _asm_connectivity(parts, joints, grounds, doc, assembly):
+    """Which parts the ground can reach through joints, and which float.
+
+    A part connected to nothing is not a bug in the solver, it is a mechanism
+    the designer has not finished -- and it moves freely under a sweep while
+    everything downstream of it reports plausible placements.
+    """
+    byname = {}
+    for p in parts:
+        byname[p.Name] = p
+        lo = getattr(p, "LinkedObject", None)
+        if lo is not None and getattr(lo, "Name", None):
+            byname.setdefault(lo.Name, p)
+    adj = {}
+    pairs = []
+    for j in joints:
+        ends = _asm_joint_parts(doc, assembly, j, byname)
+        if len(ends) == 2 and ends[0].Name != ends[1].Name:
+            a, b = ends[0].Name, ends[1].Name
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+            pairs.append((a, b))
+    rooted = set()
+    for g in grounds:
+        tgt = getattr(g, "ObjectToGround", None)
+        nm = getattr(tgt, "Name", None)
+        if nm and nm in byname:
+            rooted.add(byname[nm].Name)
+        elif nm:
+            rooted.add(nm)
+    seen = set(rooted)
+    stack = list(rooted)
+    while stack:
+        cur = stack.pop()
+        for nxt in adj.get(cur, ()):
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    floating = [p.Name for p in parts if p.Name not in seen]
+    return {"grounded": sorted(rooted), "reachable": sorted(seen),
+            "floating": floating, "jointedPairs": pairs,
+            "unresolvedJoints": [j.Name for j in joints
+                                 if len(_asm_joint_parts(doc, assembly, j,
+                                                         byname)) != 2]}
+
+
+def _asm_interference(parts, skip_pairs, budget=ASM_MAX_PAIRS):
+    """Which parts share space, and how much.
+
+    Bounding boxes first, because the boolean is the expensive call and most
+    pairs in a mechanism are nowhere near each other. Pairs joined by a joint
+    are skipped by default and the skip is REPORTED, so that "no interference"
+    always comes with the list of what was not looked at.
+    """
+    shapes = {}
+    unchecked = []
+    for p in parts:
+        s, why = _asm_shape(p)
+        if s is None:
+            unchecked.append({"part": p.Name, "why": why})
+        else:
+            shapes[p.Name] = s
+    hits = []
+    names = sorted(shapes)
+    tested = 0
+    skip = set()
+    for a, b in (skip_pairs or []):
+        skip.add((a, b))
+        skip.add((b, a))
+    for i in range(len(names)):
+        for k in range(i + 1, len(names)):
+            a, b = names[i], names[k]
+            if (a, b) in skip:
+                continue
+            if tested >= budget:
+                return {"pairs": hits, "unchecked": unchecked,
+                        "truncated": True, "skippedJointed": len(skip) // 2}
+            tested += 1
+            sa, sb = shapes[a], shapes[b]
+            try:
+                ba, bb = sa.BoundBox, sb.BoundBox
+                if not ba.intersect(bb):
+                    continue
+            except Exception:
+                pass
+            try:
+                vol = float(sa.common(sb).Volume)
+            except Exception as e:
+                unchecked.append({"pair": [a, b],
+                                  "why": "%s: %s" % (type(e).__name__, e)})
+                continue
+            if vol > 1e-6:
+                hits.append({"pair": [a, b], "volumeMm3": round(vol, 4)})
+    return {"pairs": hits, "unchecked": unchecked, "tested": tested,
+            "skippedJointed": len(skip) // 2}
+
+
+def _asm_drivable(joint):
+    """Which numeric properties on this joint could be driven, with values."""
+    out = []
+    for prop in ASM_DRIVE_PROPS:
+        if not hasattr(joint, prop):
+            continue
+        t = ""
+        try:
+            t = str(joint.getTypeIdOfProperty(prop))
+        except Exception:
+            t = ""
+        if t and ("Placement" in t or "Link" in t or "Bool" in t or
+                  "String" in t or "Enumeration" in t):
+            continue
+        v = _q(getattr(joint, prop, None))
+        if v is None:
+            continue
+        kind = "angle" if (prop in ASM_ANGLE_HINTS or "Angle" in t) else "length"
+        out.append({"property": prop, "propertyType": t or None,
+                    "value": round(v, 6), "kind": kind})
+    return out
+
+
+def _asm_joint_row(joint, drivable=True):
+    row = {"name": joint.Name, "label": joint.Label,
+           "type": str(getattr(joint, "JointType", "") or "") or None}
+    if row["type"] is not None:
+        row["freedoms"] = JOINT_FREEDOM.get(row["type"])
+    for flag in ("Activated", "Suppressed"):
+        if hasattr(joint, flag):
+            row[flag[0].lower() + flag[1:]] = bool(getattr(joint, flag))
+    if drivable:
+        row["drivable"] = _asm_drivable(joint)
+    return row
+
+
+def _asm_pick_drive(joint, wanted):
+    opts = _asm_drivable(joint)
+    if wanted:
+        for o in opts:
+            if o["property"] == wanted:
+                return o
+        raise KoiOpError(
+            "joint %s has no drivable property %r. It exposes: %s."
+            % (joint.Name, wanted,
+               ", ".join(o["property"] for o in opts) or "none"))
+    if not opts:
+        raise KoiOpError(
+            "joint %s exposes no numeric property this build can drive "
+            "(looked for %s). Nothing here will guess at one: driving the "
+            "wrong property moves the mechanism somewhere real and reports "
+            "success. Say which property to use, or drive a different joint."
+            % (joint.Name, ", ".join(ASM_DRIVE_PROPS)))
+    return opts[0]
+
+
+def _asm_gravity(args):
+    g = str(args.get("gravity") or "-Z")
+    v = _axis_vec(g)
+    return g, v
+
+
+def _asm_masses(doc, parts, overrides):
+    """Mass in kg per part, and which parts have none.
+
+    A missing density is a refusal, not a zero. A sum that quietly drops the
+    heaviest link produces a torque curve that is smooth, plausible and low.
+    """
+    out = {}
+    missing = []
+    ov = {}
+    for k, v in (overrides or {}).items():
+        ov[str(k)] = float(v)
+    for p in parts:
+        if p.Name in ov:
+            out[p.Name] = ov[p.Name]
+            continue
+        lo = getattr(p, "LinkedObject", None)
+        g = mass_of(doc, p)
+        if g is None and lo is not None:
+            g = mass_of(doc, lo)
+        if g is None:
+            missing.append(p.Name)
+        else:
+            out[p.Name] = float(g) / 1000.0
+    return out, missing
+
+
+def _asm_potential(parts, masses, gvec):
+    """Gravitational potential of the whole assembly at the current pose, in
+    joules, plus the centre of mass height it came from."""
+    total = 0.0
+    ok = True
+    for p in parts:
+        m = masses.get(p.Name)
+        if m is None:
+            ok = False
+            continue
+        s, _why = _asm_shape(p)
+        if s is None:
+            ok = False
+            continue
+        try:
+            c = s.CenterOfMass
+        except Exception:
+            ok = False
+            continue
+        # U = -m * g . r, with r in metres. g points DOWN, so a part lifted
+        # against it gains potential.
+        h = -(c.x * gvec.x + c.y * gvec.y + c.z * gvec.z) / 1000.0
+        total += m * 9.80665 * h
+    return (round(total, 9) if ok else None)
+
+
+def _op_motion(doc, args, kid):
+    """Does the mechanism move the way it was drawn, and what holds it there.
+
+    mode:
+      check    grounding, connectivity, mobility measured against Grubler,
+               and interference at the pose it is in now. Writes nothing.
+      joints   what the joints are and which of their properties can be driven.
+               Writes nothing.
+      sweep    drive one joint through a range and watch: solve failures,
+               locks, branch flips, and interference at every step.
+      torque   the sweep, plus the gravity torque needed to HOLD each pose.
+    """
+    mode = str(args.get("mode") or "check")
+    api = _asm_api()
+    report = {"api": _api_report(api), "mode": mode}
+    if api.get("assembly") is None:
+        raise KoiOpError(
+            "this build has no importable Assembly module, so it has no "
+            "native assembly engine and nothing here can drive a mechanism. "
+            "The native Assembly workbench arrived in FreeCAD 1.0; say that "
+            "rather than reporting the mechanism as unverified for some "
+            "other reason.")
+
+    assembly = _asm_find(doc, args.get("assembly"))
+    parts, joints, grounds, other = _asm_classify(assembly)
+    report["assembly"] = assembly.Name
+    report["parts"] = [p.Name for p in parts]
+    report["jointCount"] = len(joints)
+
+    if mode == "joints":
+        report["joints"] = [_asm_joint_row(j) for j in joints]
+        report["grounded"] = [getattr(getattr(g, "ObjectToGround", None),
+                                      "Name", None) for g in grounds]
+        if not joints:
+            report["note"] = (
+                "this assembly has no joints. Its parts are wherever they were "
+                "dropped, and nothing constrains them to each other.")
+        return report
+
+    conn = _asm_connectivity(parts, joints, grounds, doc, assembly)
+    report["connectivity"] = conn
+    measured, dof_method = _asm_measured_dof(assembly)
+    grub, why = _asm_grubler(parts, joints, grounds)
+    report["mobility"] = {"measured": measured, "measuredVia": dof_method,
+                          "grubler": grub, "grublerNote": why}
+    if measured is not None and grub is not None and measured != grub:
+        report["mobility"]["mismatch"] = True
+        report["mobility"]["mismatchNote"] = (
+            "the solver reports %d degrees of freedom and the Kutzbach-"
+            "Grubler count of the same joint list gives %d. They disagree, "
+            "and the usual reason is REDUNDANT constraints -- joints that "
+            "repeat a restraint the geometry already provides. The solver "
+            "absorbs them silently while the mechanism is exactly aligned, "
+            "and the real one binds as soon as it is not. Say which joints "
+            "overlap rather than reporting a working mechanism."
+            % (measured, grub))
+    if not grounds:
+        report["ungrounded"] = True
+        report["ungroundedNote"] = (
+            "NOTHING in this assembly is grounded. Every placement is "
+            "relative to a frame that is itself free, so the solver will move "
+            "whatever is cheapest to move and the result looks like a working "
+            "mechanism. Ground the frame part before believing any pose.")
+    if conn["floating"]:
+        report["floatingNote"] = (
+            "%s reach the ground through no chain of joints. They are not "
+            "part of the mechanism, whatever the render shows."
+            % ", ".join(conn["floating"]))
+    if conn["unresolvedJoints"]:
+        report["unresolvedJointsNote"] = (
+            "the two parts joined by %s could not be resolved from their "
+            "references, so those joints are missing from the connectivity "
+            "graph and from the pairs skipped in the interference check. "
+            "Treat the mobility and the collision list as incomplete."
+            % ", ".join(conn["unresolvedJoints"]))
+
+    if mode == "check":
+        if args.get("interference") is False:
+            report["interference"] = {"checked": False}
+            return report
+        inter = _asm_interference(parts, conn["jointedPairs"])
+        report["interference"] = inter
+        if inter["unchecked"]:
+            report["interferenceIncomplete"] = True
+            report["interferenceNote"] = (
+                "%d part(s) or pair(s) could not be tested, so this is NOT a "
+                "clean bill: report which ones were skipped rather than "
+                "reporting no interference." % len(inter["unchecked"]))
+        report["poseNote"] = (
+            "this is the assembly AS IT SITS. A mechanism that is clear here "
+            "and fouls at 40 degrees of travel looks exactly like this. Use "
+            "mode 'sweep' before saying it clears.")
+        return report
+
+    if mode not in ("sweep", "torque"):
+        raise KoiOpError(
+            "mode must be check, joints, sweep or torque (got %r)" % mode)
+
+    # ---- the sweep ----------------------------------------------------
+    if not grounds:
+        raise KoiOpError(
+            "nothing in this assembly is grounded, so a sweep would move the "
+            "whole mechanism through space and report the travel of a frame "
+            "that is itself free. Ground the frame part first.")
+    jref = args.get("joint")
+    if not jref:
+        raise KoiOpError(
+            "a sweep drives ONE joint. Say which: %s. Use mode 'joints' to "
+            "see what each of them exposes."
+            % (", ".join(j.Name for j in joints) or "this assembly has none"))
+    joint = None
+    for j in joints:
+        if j.Name == jref or j.Label == jref:
+            joint = j
+            break
+    if joint is None:
+        try:
+            cand = _resolve_or_die(doc, jref, "joint")
+            if hasattr(cand, "JointType"):
+                joint = cand
+        except Exception:
+            joint = None
+    if joint is None:
+        raise KoiOpError(
+            "%r is not a joint in %s. It has: %s."
+            % (jref, assembly.Name, ", ".join(j.Name for j in joints) or "none"))
+
+    drive = _asm_pick_drive(joint, args.get("property"))
+    prop = drive["property"]
+    start = _q(getattr(joint, prop))
+    lo = _num(args, "from") if args.get("from") is not None else start
+    hi = _num(args, "to")
+    if hi is None:
+        raise KoiOpError(
+            "a sweep needs 'to': the far end of the travel to check, in %s. "
+            "The whole point is the poses nobody screenshotted."
+            % ("degrees" if drive["kind"] == "angle" else "mm"))
+    steps = int(args.get("steps") or 24)
+    if steps < 2 or steps > ASM_MAX_STEPS:
+        raise KoiOpError("steps must be between 2 and %d" % ASM_MAX_STEPS)
+    check_hits = args.get("interference") is not False
+
+    solve_fn, solve_name = _asm_solver(assembly)
+    report["driven"] = {"joint": joint.Name, "property": prop,
+                        "kind": drive["kind"], "startValue": start,
+                        "from": lo, "to": hi, "steps": steps,
+                        "solveVia": solve_name,
+                        "unit": "deg" if drive["kind"] == "angle" else "mm"}
+
+    masses, missing = ({}, [])
+    gname, gvec = _asm_gravity(args)
+    if mode == "torque":
+        masses, missing = _asm_masses(doc, parts, args.get("massOverrides"))
+        if missing:
+            raise KoiOpError(
+                "no mass for %s. A torque is a sum over masses, and a sum "
+                "that silently drops a link is smooth, plausible and wrong. "
+                "Assign densities with fn 'material', or pass massOverrides "
+                "{'%s': <kg>} for anything bought rather than made."
+                % (", ".join(missing), missing[0]))
+        report["gravity"] = gname
+        report["masses"] = {k: round(v, 6) for k, v in masses.items()}
+
+    home = _asm_pose(parts)
+    frames = []
+    prev = home
+    failed = []
+    locked = []
+    hits = []
+    span = float(hi) - float(lo)
+    for i in range(steps + 1):
+        val = float(lo) + span * (float(i) / float(steps))
+        try:
+            setattr(joint, prop, val)
+        except Exception as e:
+            raise KoiOpError(
+                "joint %s would not take %s = %r (%s). Nothing was swept."
+                % (joint.Name, prop, val, e))
+        ok, rv = _asm_solve(solve_fn)
+        doc.recompute()
+        pose = _asm_pose(parts)
+        dmm, ddeg = _asm_pose_delta(prev, pose)
+        got = _q(getattr(joint, prop))
+        row = {"step": i, "requested": round(val, 6),
+               "achieved": None if got is None else round(got, 6),
+               "solved": ok, "movedMm": dmm, "movedDeg": ddeg}
+        if not ok:
+            row["solverError"] = rv
+            failed.append(i)
+        # The solver reported success and the joint did not go where it was
+        # asked: a toggle, a limit, or a mechanism that has run out of travel.
+        if got is not None and abs(got - val) > max(1e-6, abs(val) * 1e-4):
+            row["notReached"] = True
+            failed.append(i)
+        if i > 0 and dmm < 1e-9 and ddeg < 1e-9:
+            row["locked"] = True
+            locked.append(i)
+        if check_hits:
+            inter = _asm_interference(parts, conn["jointedPairs"])
+            if inter["pairs"]:
+                row["interference"] = inter["pairs"]
+                for h in inter["pairs"]:
+                    hits.append({"step": i, "value": round(val, 6),
+                                 "pair": h["pair"],
+                                 "volumeMm3": h["volumeMm3"]})
+            if inter["unchecked"]:
+                row["interferenceIncomplete"] = True
+        if mode == "torque":
+            row["potentialJ"] = _asm_potential(parts, masses, gvec)
+        frames.append(row)
+        prev = pose
+
+    # ---- put it back --------------------------------------------------
+    park = args.get("leaveAt")
+    try:
+        setattr(joint, prop, float(park) if park is not None else start)
+    except Exception:
+        pass
+    _asm_solve(solve_fn)
+    if park is None:
+        # The solver may come back on the other branch, so the saved
+        # placements are reasserted rather than trusted to the re-solve.
+        _asm_restore(parts, home)
+    doc.recompute()
+    back = _asm_pose(parts)
+    dmm, ddeg = _asm_pose_delta(home, back)
+    report["restored"] = bool(park is None and dmm < 1e-3 and ddeg < 1e-3)
+    report["parkedAt"] = park if park is not None else start
+    if park is None and not report["restored"]:
+        report["restoreNote"] = (
+            "the assembly did not come back to the pose it started in (%.4f "
+            "mm, %.4f deg out). The sweep has MOVED the user's model. Say so, "
+            "and offer the undo." % (dmm, ddeg))
+
+    # ---- what the frames say ------------------------------------------
+    moves = [f["movedMm"] + f["movedDeg"] for f in frames[1:]]
+    flips = []
+    if len(moves) >= 4:
+        ordered = sorted(moves)
+        med = ordered[len(ordered) // 2]
+        if med > 1e-9:
+            for f in frames[1:]:
+                if (f["movedMm"] + f["movedDeg"]) > max(4.0 * med, med + 1e-6):
+                    f["branchFlip"] = True
+                    flips.append(f["step"])
+
+    report["frames"] = frames
+    report["travel"] = {
+        "requested": [round(float(lo), 6), round(float(hi), 6)],
+        "reachedThrough": (frames[-1]["requested"] if not failed
+                           else frames[max(0, min(failed) - 1)]["requested"]),
+        "failedSteps": sorted(set(failed)),
+        "lockedSteps": locked,
+        "branchFlipSteps": flips,
+    }
+    if failed:
+        report["sweepIncomplete"] = True
+        report["sweepNote"] = (
+            "%d of %d poses did not solve or did not reach the value they "
+            "were given. The mechanism does NOT go through the range asked "
+            "for -- it stops around %s %s. Report the travel it actually has, "
+            "not the travel it was asked for."
+            % (len(set(failed)), steps + 1,
+               report["travel"]["reachedThrough"],
+               report["driven"]["unit"]))
+    if locked:
+        report["lockedNote"] = (
+            "at step(s) %s the driving value changed and NOTHING MOVED. That "
+            "is a toggle, a limit or a dead point, and the solver reported "
+            "success at every one of them."
+            % ", ".join(str(s) for s in locked))
+    if flips:
+        report["branchFlip"] = True
+        report["branchFlipNote"] = (
+            "between adjacent steps the assembly jumped far further than it "
+            "did anywhere else (step(s) %s). A linkage with more than one "
+            "assembly configuration does this: both poses satisfy every "
+            "constraint, the solver walked from one to the other, and the "
+            "PHYSICAL mechanism cannot -- it would have to come apart. Do not "
+            "report the far side of a flip as reachable travel."
+            % ", ".join(str(s) for s in flips))
+    if check_hits:
+        report["interference"] = {"hits": hits, "checked": True}
+        if hits:
+            first = min(h["step"] for h in hits)
+            report["collides"] = True
+            report["collidesNote"] = (
+                "the mechanism INTERFERES with itself during travel -- first "
+                "at step %d, %s %s. It is clear at the pose it was sitting "
+                "in, which is the pose in every render. Name the pair and the "
+                "angle."
+                % (first,
+                   [h["value"] for h in hits if h["step"] == first][0],
+                   report["driven"]["unit"]))
+    else:
+        report["interference"] = {"checked": False, "note": (
+            "interference was switched off for this sweep, so nothing here "
+            "says the mechanism clears itself.")}
+
+    if mode == "torque":
+        # Virtual work: the torque that HOLDS the mechanism is the rate of
+        # change of gravitational potential with the driven coordinate. It is
+        # differentiated from measured poses rather than derived from a model
+        # of the linkage, so it needs no knowledge of the geometry at all --
+        # and it is only as smooth as the number of steps.
+        vals, us = [], []
+        for f in frames:
+            if f.get("potentialJ") is None or not f.get("solved"):
+                continue
+            vals.append(f["requested"])
+            us.append(f["potentialJ"])
+        if len(vals) < 3:
+            raise KoiOpError(
+                "fewer than three poses solved with a full set of masses, so "
+                "there is nothing to differentiate. Fix the sweep first: a "
+                "torque curve through a mechanism that does not move is not a "
+                "torque curve.")
+        scale = (_math.pi / 180.0) if drive["kind"] == "angle" else 1.0
+        curve = []
+        peak = None
+        for i in range(len(vals)):
+            a = max(0, i - 1)
+            b = min(len(vals) - 1, i + 1)
+            dq = (vals[b] - vals[a]) * scale
+            if abs(dq) < 1e-12:
+                continue
+            t = (us[b] - us[a]) / dq
+            row = {"value": vals[i], "potentialJ": us[i],
+                   ("torqueNm" if drive["kind"] == "angle" else "forceN"):
+                       round(t, 6)}
+            curve.append(row)
+            if peak is None or abs(t) > abs(peak[1]):
+                peak = (vals[i], t)
+        report["kinetics"] = {
+            "curve": curve,
+            "unit": "Nm" if drive["kind"] == "angle" else "N",
+            "peak": {"value": peak[0], "magnitude": round(abs(peak[1]), 6),
+                     "signed": round(peak[1], 6)} if peak else None,
+            "totalMassKg": round(sum(masses.values()), 6),
+        }
+        report["kineticsNote"] = (
+            "QUASI-STATIC and GRAVITY ONLY. This is the torque needed to HOLD "
+            "the mechanism at each pose, differentiated numerically from "
+            "measured centres of mass. It contains no inertia, no friction, "
+            "no bearing drag, no spring, no payload beyond the masses listed, "
+            "and no acceleration -- a real drive needs all of those on top, "
+            "and an impact needs a different calculation entirely. It is "
+            "arithmetic on this document, not a simulation of the machine.")
+
+    return report
+
+
+# ---------- the drawing: TechDraw, and whether it can be made from ----------
+#
+# The last artefact in the chain, and the one the part is actually handed over
+# as. A machinist does not receive a STEP file and a conversation; they receive
+# a sheet, and everything not dimensioned on that sheet is a decision somebody
+# else makes on the shop floor.
+#
+# The reason this belongs in a skill built on measuring rather than asserting:
+# a drawing is the single easiest artefact in CAD to produce WRONG and have it
+# look right. All of these render, print, and pass a glance:
+#
+#   * a view whose source projected nothing. The page exists, the tree is
+#     clean, the PDF is a title block around white space.
+#   * a dimension attached to a projected 2D edge instead of the model. It
+#     reads 46.19 on a 50 mm edge because the projection foreshortened it, and
+#     nothing anywhere says so.
+#   * a dimension attached to Edge7 -- the same topological naming problem the
+#     rest of this skill spends its time avoiding, now printed on paper. The
+#     model is edited, Edge7 becomes a different edge, the dimension moves to
+#     it and keeps displaying a number.
+#   * a page at 1:2.37 that a human reads as 1:1 because the title block says
+#     what somebody typed rather than what the views are scaled to.
+#   * a drawing with three dimensions on a part with eleven independent
+#     features, which is not a drawing, it is a suggestion.
+#
+# So every dimension this creates is cross-checked against the MODEL, in 3D,
+# and mode 'check' re-checks the whole page. What it will not do is claim a
+# drawing is complete: whether a part is fully constrained by its dimensions
+# is a judgement about intent, and counting is not that judgement. It reports
+# the count and refuses the verdict.
+
+TD_TEMPLATE_DIR = "Mod/TechDraw/Templates"
+TD_DEFAULT_TEMPLATE = "A4_LandscapeTD.svg"
+
+TD_DIM_TYPES = ("Distance", "DistanceX", "DistanceY", "Radius", "Diameter",
+                "Angle", "Angle3Pt")
+
+TD_VIEW_DIRS = {
+    "front": (0, -1, 0), "rear": (0, 1, 0), "back": (0, 1, 0),
+    "top": (0, 0, 1), "bottom": (0, 0, -1),
+    "left": (-1, 0, 0), "right": (1, 0, 0),
+    "iso": (1, -1, 1), "isometric": (1, -1, 1),
+}
+
+# A dimension and the model disagreeing by more than this is not rounding.
+TD_DIM_TOL = 1e-3
+
+
+def _td_api():
+    return _import_probe({"techdraw": (("TechDraw", None),),
+                          "gui": (("TechDrawGui", None),)})
+
+
+def _td_pages(doc):
+    return [o for o in doc.Objects
+            if str(getattr(o, "TypeId", "")) == "TechDraw::DrawPage"]
+
+
+def _td_page(doc, ref):
+    if ref:
+        o = _resolve_or_die(doc, ref, "page")
+        if "DrawPage" not in str(getattr(o, "TypeId", "")):
+            raise KoiOpError("%r is %s, not a drawing page."
+                             % (ref, getattr(o, "TypeId", "?")))
+        return o
+    pages = _td_pages(doc)
+    if not pages:
+        raise KoiOpError(
+            "this document has no drawing page. Make one with "
+            "mode 'page' first.")
+    if len(pages) > 1:
+        raise KoiOpError("this document has %d pages (%s); say which."
+                         % (len(pages), ", ".join(p.Name for p in pages)))
+    return pages[0]
+
+
+def _td_views(page):
+    try:
+        return list(page.Views)
+    except Exception:
+        return []
+
+
+def _td_is(o, kind):
+    return kind in str(getattr(o, "TypeId", ""))
+
+
+def _td_parts(page):
+    return [v for v in _td_views(page) if _td_is(v, "DrawViewPart")]
+
+
+def _td_dims(page):
+    return [v for v in _td_views(page) if _td_is(v, "DrawViewDimension")]
+
+
+def _td_templates():
+    """Which sheet templates this install actually carries.
+
+    Templates are SVG FILES on disk, not code, and a page whose template path
+    does not resolve renders as views floating on nothing -- no border, no
+    title block, no scale field. Asked rather than assumed, like everything
+    else that lives outside the interpreter.
+    """
+    import os
+    out = {"dir": None, "found": [], "error": None}
+    try:
+        d = os.path.join(App.getResourceDir(), TD_TEMPLATE_DIR)
+        out["dir"] = d
+        if os.path.isdir(d):
+            out["found"] = sorted(f for f in os.listdir(d)
+                                  if f.lower().endswith(".svg"))[:80]
+        else:
+            out["error"] = "no template directory at %s" % d
+    except Exception as e:
+        out["error"] = "%s: %s" % (type(e).__name__, e)
+    return out
+
+
+def _td_view_edges(view):
+    """(edge count, how it was counted) or (None, why not).
+
+    None is not zero. A view whose edge count cannot be read is a view whose
+    emptiness is UNKNOWN, and reporting unknown as "has geometry" is how a
+    blank sheet gets signed off.
+    """
+    try:
+        if hasattr(Gui, "updateGui"):
+            Gui.updateGui()
+    except Exception:
+        pass
+    f = getattr(view, "getVisibleEdges", None)
+    if callable(f):
+        try:
+            edges = f()
+            if len(edges) > 0:
+                return len(edges), "getVisibleEdges"
+        except Exception as e:
+            pass
+    try:
+        srcs = getattr(view, "Source", [])
+        d = getattr(view, "Direction", None)
+        if srcs and d is not None:
+            import TechDraw
+            total = 0
+            for s in srcs:
+                shp = _dfm_shape(s)
+                if shp:
+                    pEx = TechDraw.projectEx(shp, d)
+                    total += sum(len(x.Edges) for x in pEx if hasattr(x, "Edges"))
+            if total > 0:
+                return total, "projectEx"
+    except Exception:
+        pass
+    if callable(f):
+        try:
+            return len(f()), "getVisibleEdges"
+        except Exception:
+            pass
+    f = getattr(view, "getEdgeByIndex", None)
+    if callable(f):
+        n = 0
+        try:
+            while n < 20000:
+                e = f(n)
+                if e is None:
+                    break
+                n += 1
+            return n, "getEdgeByIndex"
+        except Exception:
+            return n, "getEdgeByIndex"
+    return None, "this build exposes no way to count a view's edges"
+
+
+def _td_view_row(view):
+    n, how = _td_view_edges(view)
+    row = {"name": view.Name, "label": view.Label,
+           "type": str(getattr(view, "TypeId", "")),
+           "edges": n, "edgeCountVia": how,
+           "x": _q(getattr(view, "X", None)),
+           "y": _q(getattr(view, "Y", None)),
+           "scale": _q(getattr(view, "Scale", None)),
+           "scaleType": _plain(getattr(view, "ScaleType", None))}
+    try:
+        row["source"] = [o.Name for o in view.Source]
+    except Exception:
+        row["source"] = None
+    try:
+        d = view.Direction
+        row["direction"] = [round(float(d.x), 4), round(float(d.y), 4),
+                            round(float(d.z), 4)]
+    except Exception:
+        row["direction"] = None
+    if n == 0:
+        row["empty"] = True
+        row["emptyNote"] = (
+            "this view projected NOTHING. The page will print a title block "
+            "around white space. Usually the source is unset or invisible, or "
+            "the direction is degenerate. Do not report the drawing as made.")
+    elif n is None:
+        row["emptyUnknown"] = True
+    return row
+
+
+def _td_model_value(doc, dim):
+    """What the MODEL says this dimension measures, or None with a reason.
+
+    The whole point of the exercise. A DrawViewDimension displays a number it
+    computed from whatever it is attached to; if that is a projected edge, the
+    number is a property of the projection, and a foreshortened edge produces
+    a shorter, entirely plausible, wrong dimension. Measuring the same thing
+    in 3D and comparing is the only way to tell from here.
+    """
+    refs = []
+    try:
+        for o, subs in dim.References3D:
+            for s in (subs if isinstance(subs, (list, tuple)) else [subs]):
+                if s:
+                    refs.append((o, str(s)))
+    except Exception:
+        refs = []
+    if not refs:
+        return None, "no 3D reference to measure against"
+    kind = str(getattr(dim, "Type", "") or "")
+    try:
+        shapes = []
+        for o, sub in refs:
+            shapes.append(getattr(o.Shape, sub, None) or
+                          o.Shape.getElement(sub))
+    except Exception as e:
+        return None, "could not resolve the 3D reference (%s)" % e
+    try:
+        if kind in ("Radius", "Diameter"):
+            c = shapes[0].Curve
+            r = float(getattr(c, "Radius", None))
+            return (r if kind == "Radius" else 2.0 * r), None
+        if kind in ("Distance", "DistanceX", "DistanceY"):
+            if len(shapes) == 1:
+                e = shapes[0]
+                if kind == "Distance":
+                    return float(e.Length), None
+                a = e.Vertexes[0].Point
+                b = e.Vertexes[-1].Point
+                return (abs(b.x - a.x) if kind == "DistanceX"
+                        else abs(b.y - a.y)), None
+            if len(shapes) >= 2:
+                a = shapes[0].Point if hasattr(shapes[0], "Point") \
+                    else shapes[0].CenterOfMass
+                b = shapes[1].Point if hasattr(shapes[1], "Point") \
+                    else shapes[1].CenterOfMass
+                if kind == "DistanceX":
+                    return abs(b.x - a.x), None
+                if kind == "DistanceY":
+                    return abs(b.y - a.y), None
+                return float(a.distanceToPoint(b)), None
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+    return None, "no independent check for a %r dimension" % kind
+
+
+def _td_dim_displayed(dim):
+    f = getattr(dim, "getDimValue", None)
+    if callable(f):
+        try:
+            v = float(f())
+            if v != 0.0:
+                return round(v, 6)
+        except Exception:
+            pass
+    f = getattr(dim, "getRawValue", None)
+    if callable(f):
+        try:
+            v = float(f())
+            if v != 0.0:
+                return round(v, 6)
+        except Exception:
+            pass
+    geom = getattr(dim, "SavedGeometry", None)
+    if geom:
+        kind = str(getattr(dim, "Type", "") or "")
+        try:
+            if kind in ("Radius", "Diameter"):
+                c = geom[0].Curve
+                r = float(getattr(c, "Radius", None))
+                return round(r if kind == "Radius" else 2.0 * r, 6)
+            if kind in ("Distance", "DistanceX", "DistanceY"):
+                if len(geom) == 1:
+                    e = geom[0]
+                    if kind == "Distance":
+                        return round(float(e.Length), 6)
+                    a = e.Vertexes[0].Point
+                    b = e.Vertexes[-1].Point
+                    return round(abs(b.x - a.x) if kind == "DistanceX" else abs(b.y - a.y), 6)
+                if len(geom) >= 2:
+                    a = geom[0].Point if hasattr(geom[0], "Point") else geom[0].CenterOfMass
+                    b = geom[1].Point if hasattr(geom[1], "Point") else geom[1].CenterOfMass
+                    if kind == "DistanceX":
+                        return round(abs(b.x - a.x), 6)
+                    if kind == "DistanceY":
+                        return round(abs(b.y - a.y), 6)
+                    return round(float(a.distanceToPoint(b)), 6)
+        except Exception:
+            pass
+    txt = getattr(dim, "getText", None)
+    if callable(txt):
+        try:
+            import re
+            m = re.search(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?", str(txt()))
+            if m:
+                v = float(m.group(0))
+                if v != 0.0:
+                    return round(v, 6)
+        except Exception:
+            pass
+    if callable(f):
+        try:
+            return round(float(f()), 6)
+        except Exception:
+            pass
+    return None
+
+
+def _td_dim_row(doc, dim):
+    row = {"name": dim.Name, "label": dim.Label,
+           "dimType": _plain(getattr(dim, "Type", None)),
+           "format": _plain(getattr(dim, "FormatSpec", None))}
+    row["displayed"] = _td_dim_displayed(dim)
+    if row["displayed"] is None:
+        row["displayedNote"] = "no numeric value displayed"
+    r3, r2 = [], []
+    try:
+        for o, subs in dim.References3D:
+            for s in (subs if isinstance(subs, (list, tuple)) else [subs]):
+                r3.append(o.Name + ":" + str(s))
+    except Exception:
+        pass
+    try:
+        for o, subs in dim.References2D:
+            for s in (subs if isinstance(subs, (list, tuple)) else [subs]):
+                r2.append(o.Name + ":" + str(s))
+    except Exception:
+        pass
+    row["references3D"] = r3
+    row["references2D"] = r2
+    if not r3 and r2:
+        row["projectionReferenced"] = True
+        row["projectionNote"] = (
+            "this dimension is attached to the PROJECTED edge, not to the "
+            "model. Two consequences and both are silent: the number is the "
+            "length of the projection, so anything not parallel to the sheet "
+            "reads short; and the 2D edge index is regenerated on every "
+            "recompute of the view, so the dimension can migrate to a "
+            "different edge and go on displaying a number.")
+    model, why = _td_model_value(doc, dim)
+    row["model"] = None if model is None else round(float(model), 6)
+    if model is None:
+        row["modelCheck"] = "unchecked"
+        row["modelCheckNote"] = why
+    elif row["displayed"] is None:
+        row["modelCheck"] = "unchecked"
+    else:
+        d = abs(row["displayed"] - row["model"])
+        row["modelCheck"] = "agrees" if d <= max(TD_DIM_TOL,
+                                                 abs(row["model"]) * 1e-6) \
+            else "disagrees"
+        if row["modelCheck"] == "disagrees":
+            row["disagreesBy"] = round(d, 6)
+            row["disagreeNote"] = (
+                "the sheet says %.4f and the model measures %.4f. Somebody "
+                "will make the part to the sheet. Either the dimension is on "
+                "a foreshortened projection or it is attached to different "
+                "geometry than intended -- find out which before this is sent."
+                % (row["displayed"], row["model"]))
+    return row
+
+
+def _td_audit(doc, page):
+    try:
+        if hasattr(Gui, "updateGui"):
+            Gui.updateGui()
+    except Exception:
+        pass
+    views = _td_parts(page)
+    dims = _td_dims(page)
+    vrows = [_td_view_row(v) for v in views]
+    drows = [_td_dim_row(doc, d) for d in dims]
+    out = {"page": page.Name,
+           "views": vrows, "dimensions": drows,
+           "viewCount": len(vrows), "dimensionCount": len(drows)}
+    tmpl = getattr(page, "Template", None)
+    out["template"] = getattr(tmpl, "Name", None)
+    path = _plain(getattr(tmpl, "Template", None)) if tmpl is not None else None
+    out["templateFile"] = path
+    if tmpl is None:
+        out["templateMissing"] = True
+        out["templateNote"] = (
+            "this page has no template: no border, no title block, no scale "
+            "field and no space for a revision. It is a projection, not a "
+            "drawing.")
+    else:
+        try:
+            import os
+            if path and not os.path.isfile(path):
+                out["templateMissing"] = True
+                out["templateNote"] = (
+                    "the template file %r is not on disk. The page will "
+                    "render the views on nothing." % path)
+        except Exception:
+            pass
+    empty = [r["name"] for r in vrows if r.get("empty")]
+    if empty:
+        out["emptyViews"] = empty
+        out["emptyViewNote"] = (
+            "%s projected no geometry at all. The sheet prints blank where "
+            "they are." % ", ".join(empty))
+    unknown = [r["name"] for r in vrows if r.get("emptyUnknown")]
+    if unknown:
+        out["viewsUnchecked"] = unknown
+    proj = [r["name"] for r in drows if r.get("projectionReferenced")]
+    if proj:
+        out["projectionReferencedDimensions"] = proj
+    bad = [r["name"] for r in drows if r.get("modelCheck") == "disagrees"]
+    if bad:
+        out["dimensionsDisagree"] = bad
+        out["dimensionsDisagreeNote"] = (
+            "%d dimension(s) print a number the model does not measure: %s. "
+            "This is the failure that survives every review, because the "
+            "sheet is internally consistent and only wrong against the part."
+            % (len(bad), ", ".join(bad)))
+    unchecked = [r["name"] for r in drows if r.get("modelCheck") == "unchecked"]
+    if unchecked:
+        out["dimensionsUnchecked"] = unchecked
+        out["dimensionsUncheckedNote"] = (
+            "%d dimension(s) could not be checked against the model, so they "
+            "are neither right nor wrong here -- say unchecked, not correct."
+            % len(unchecked))
+    # Scale is reported per view AND at page level, because they can differ and
+    # the title block only ever says one of them.
+    scales = sorted(set(r["scale"] for r in vrows if r.get("scale")))
+    out["scales"] = scales
+    if len(scales) > 1:
+        out["mixedScales"] = True
+        out["mixedScaleNote"] = (
+            "the views on this sheet are at different scales (%s). That is "
+            "legitimate and it is also how a part gets made at the wrong "
+            "size: every view needs its scale called out next to it, not just "
+            "in the title block."
+            % ", ".join(str(s) for s in scales))
+    if not drows:
+        out["undimensioned"] = True
+        out["undimensionedNote"] = (
+            "this drawing carries NO dimensions. Nothing on it constrains the "
+            "part; it is a picture.")
+    out["completenessNote"] = (
+        "%d dimension(s) over %d view(s). Nothing here judges whether that is "
+        "ENOUGH to make the part -- whether a drawing is fully constrained is "
+        "a question about design intent, and counting is not that judgement. "
+        "It is a count. GD&T, datums, surface finish and tolerance callouts "
+        "are not created or checked by this tool at all."
+        % (len(drows), len(vrows)))
+    return out
+
+
+def _op_draw(doc, args, kid):
+    """The sheet a part is actually handed over as.
+
+    mode:
+      templates   which sheet templates this install carries. Writes nothing.
+      page        a page, with a template.
+      view        project an object onto it, and measure whether anything
+                  landed.
+      dimension   a dimension, attached to the MODEL where possible, and
+                  cross-checked against what the model measures.
+      check       re-audit the whole page. Writes nothing.
+      export      DXF, or SVG/PDF where a GUI is present -- and the file is
+                  confirmed on disk before it is reported as written.
+    """
+    mode = str(args.get("mode") or "check")
+    api = _td_api()
+    report = {"api": _api_report(api), "mode": mode}
+    if api.get("techdraw") is None:
+        raise KoiOpError(
+            "this build has no importable TechDraw module, so it cannot make "
+            "drawings. Say that, rather than reporting the part as ready to "
+            "hand over.")
+
+    if mode == "templates":
+        report["templates"] = _td_templates()
+        return report
+
+    if mode == "page":
+        if not kid:
+            raise KoiOpError(
+                "a page is an object, so it needs an id -- a handle like "
+                "'dwg.bracket' that a later turn can add views to")
+        tm = _td_templates()
+        want = str(args.get("template") or TD_DEFAULT_TEMPLATE)
+        page = doc.addObject("TechDraw::DrawPage",
+                             _safe_name(kid or "Page", "Page"))
+        tmpl = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
+        chosen = None
+        if tm.get("found"):
+            import os
+            for cand in (want, TD_DEFAULT_TEMPLATE):
+                if cand in tm["found"]:
+                    chosen = os.path.join(tm["dir"], cand)
+                    break
+            if chosen is None:
+                chosen = os.path.join(tm["dir"], tm["found"][0])
+        if chosen:
+            try:
+                tmpl.Template = chosen
+            except Exception as e:
+                report["templateError"] = "%s: %s" % (type(e).__name__, e)
+        try:
+            page.Template = tmpl
+        except Exception as e:
+            raise KoiOpError("the page would not take a template: %s" % e)
+        doc.recompute()
+        register(doc, kid, page)
+        report["page"] = page.Name
+        report["templateFile"] = chosen
+        if not chosen:
+            report["templateMissing"] = True
+            report["templateNote"] = (
+                "no SVG template was found in %s, so this page has a template "
+                "object pointing at nothing: no border, no title block, no "
+                "scale field. Tell the user their install is missing the "
+                "TechDraw templates rather than handing them a sheet."
+                % tm.get("dir"))
+        report["next"] = "view"
+        return report
+
+    page = _td_page(doc, args.get("page"))
+    report["page"] = page.Name
+
+    if mode == "check":
+        report.update(_td_audit(doc, page))
+        return report
+
+    if mode == "view":
+        if not kid:
+            raise KoiOpError("a view is an object, so it needs an id")
+        src = args.get("source") or args.get("target")
+        if not src:
+            raise KoiOpError(
+                "a view needs a source: the object to project. A view with no "
+                "source renders an empty sheet and reports no error.")
+        srcs = src if isinstance(src, list) else [src]
+        objs = [_resolve_or_die(doc, s, "object") for s in srcs]
+        for o in objs:
+            if _dfm_shape(o) is None:
+                raise KoiOpError(
+                    "%s has no shape to project, so the view would be blank."
+                    % o.Name)
+        view = doc.addObject("TechDraw::DrawViewPart",
+                             _safe_name(kid or "View", "View"))
+        try:
+            page.addView(view)
+        except Exception:
+            pass
+        view.Source = objs
+        d = args.get("direction") or "front"
+        vec = TD_VIEW_DIRS.get(str(d).lower())
+        if vec is None:
+            try:
+                vec = tuple(_axis_vec(str(d)))
+            except Exception:
+                raise KoiOpError(
+                    "direction must be one of %s or an axis name"
+                    % ", ".join(sorted(TD_VIEW_DIRS)))
+        view.Direction = App.Vector(*vec)
+        scale = args.get("scale")
+        if scale is not None:
+            try:
+                view.ScaleType = "Custom"
+            except Exception:
+                pass
+            view.Scale = float(scale)
+        for prop, val in (args.get("props") or {}).items():
+            if not _fem_set(view, str(prop), val):
+                raise KoiOpError("a view does not accept %r on this build"
+                                 % prop)
+        if args.get("x") is not None:
+            _fem_set(view, "X", float(args.get("x")))
+        if args.get("y") is not None:
+            _fem_set(view, "Y", float(args.get("y")))
+        doc.recompute()
+        try:
+            if hasattr(Gui, "updateGui"):
+                Gui.updateGui()
+        except Exception:
+            pass
+        register(doc, kid, view)
+        row = _td_view_row(view)
+        report["view"] = row
+        if row.get("empty"):
+            raise KoiOpError(
+                "the view projected NOTHING from %s along %s. A blank view on "
+                "a page is the drawing failure that survives review, so this "
+                "is refused rather than left on the sheet. Check the object "
+                "has a solid and the direction is not edge-on."
+                % (", ".join(o.Name for o in objs), vec))
+        return report
+
+    if mode == "dimension":
+        if not kid:
+            raise KoiOpError("a dimension is an object, so it needs an id")
+        refs = args.get("refs")
+        if not isinstance(refs, list) or not refs:
+            raise KoiOpError(
+                "a dimension needs refs: the model geometry it measures. Use "
+                "the refs array from freecad_call({fn:'query'}) or a user "
+                "pick captured with fn 'ref' -- an edge index authored here "
+                "dimensions whatever Edge7 happens to be today, and prints a "
+                "number either way.")
+        kind = str(args.get("dimType") or "Distance")
+        if kind not in TD_DIM_TYPES:
+            raise KoiOpError("dimType must be one of %s"
+                             % ", ".join(TD_DIM_TYPES))
+        pairs = []
+        resolved = []
+        for r in refs[:8]:
+            obj, sub = _resolve_ref_sub(doc, r)
+            if not sub:
+                raise KoiOpError(
+                    "%r names a whole object; a dimension measures an edge or "
+                    "a vertex." % r)
+            pairs.append((obj, [sub]))
+            resolved.append(obj.Name + ":" + sub)
+        views = _td_parts(page)
+        if not views:
+            raise KoiOpError(
+                "this page has no view to hang a dimension on. Add one first.")
+        dim = doc.addObject("TechDraw::DrawViewDimension",
+                            _safe_name(kid or "Dimension", "Dimension"))
+        try:
+            page.addView(dim)
+        except Exception:
+            pass
+        dim.Type = kind
+        try:
+            dim.References3D = pairs
+        except Exception as e:
+            raise KoiOpError(
+                "the dimension would not take those 3D references (%s). "
+                "Attaching it to the projected edge instead is possible and "
+                "is not offered here: that dimension measures the projection "
+                "and migrates when the view regenerates." % e)
+        if args.get("x") is not None:
+            _fem_set(dim, "X", float(args.get("x")))
+        if args.get("y") is not None:
+            _fem_set(dim, "Y", float(args.get("y")))
+        doc.recompute()
+        register(doc, kid, dim)
+        row = _td_dim_row(doc, dim)
+        row["requested"] = resolved
+        report["dimension"] = row
+        if row.get("modelCheck") == "disagrees":
+            raise KoiOpError(
+                "this dimension prints %.4f and the model measures %.4f. It "
+                "is not being left on the sheet: a dimension that disagrees "
+                "with the part is the one drawing error that survives every "
+                "review, because the sheet is internally consistent. %s"
+                % (row["displayed"], row["model"], row.get("disagreeNote", "")))
+        return report
+
+    if mode == "export":
+        fmt = str(args.get("format") or "dxf").lower()
+        if fmt not in ("dxf", "svg", "pdf"):
+            raise KoiOpError("format must be dxf, svg or pdf")
+        import os
+        path = confined_path(args.get("savePath") or
+                             ((kid or page.Name) + "." + fmt),
+                             ("." + fmt,))
+        was = None
+        try:
+            was = os.path.getmtime(path)
+        except Exception:
+            was = None
+        audit = _td_audit(doc, page)
+        wrote_via = None
+        err = None
+        if fmt == "dxf":
+            f = getattr(api["techdraw"]["m"], "writeDXFPage", None)
+            if not callable(f):
+                raise KoiOpError(
+                    "this build's TechDraw module exposes no writeDXFPage, so "
+                    "a DXF cannot be written from here.")
+            try:
+                f(page, path)
+                wrote_via = "TechDraw.writeDXFPage"
+            except Exception as e:
+                err = "%s: %s" % (type(e).__name__, e)
+        else:
+            g = api.get("gui")
+            fn = None
+            if g is not None:
+                fn = getattr(g["m"],
+                             "exportPageAsPdf" if fmt == "pdf"
+                             else "exportPageAsSvg", None)
+            if not callable(fn):
+                raise KoiOpError(
+                    "%s export lives in TechDrawGui, which is not importable "
+                    "here (this FreeCAD may be running without a GUI). DXF is "
+                    "written by the non-GUI module and does work." % fmt)
+            try:
+                fn(page, path)
+                wrote_via = "TechDrawGui"
+            except Exception as e:
+                err = "%s: %s" % (type(e).__name__, e)
+        size = None
+        try:
+            now = os.path.getmtime(path)
+            size = os.path.getsize(path)
+            if was is not None and now <= was:
+                size = None
+        except Exception:
+            size = None
+        if not size:
+            raise KoiOpError(
+                "nothing appeared at %s after the export ran%s. Report the "
+                "drawing, not the file."
+                % (path, (" (%s)" % err) if err else ""))
+        report["savePath"] = path
+        report["bytes"] = size
+        report["wroteVia"] = wrote_via
+        report["audit"] = audit
+        report["note"] = (
+            "the file is on disk and its CONTENT is unverified -- nothing "
+            "here opened it. Any finding in 'audit' is still true of what is "
+            "inside it.")
+        return report
+
+    raise KoiOpError(
+        "mode must be templates, page, view, dimension, check or export "
+        "(got %r)" % mode)
+
+
 OPS = {
     "new_document": {"fn": _op_new_document, "mode": "document"},
     "open_document": {"fn": _op_open_document, "mode": "document"},
@@ -14541,6 +16214,8 @@ OPS = {
     "capabilities": {"fn": _op_capabilities, "mode": "read"},
     "cam": {"fn": _op_cam, "mode": "write"},
     "fem": {"fn": _op_fem, "mode": "write"},
+    "motion": {"fn": _op_motion, "mode": "write"},
+    "draw": {"fn": _op_draw, "mode": "write"},
 }
 
 OP_NAMES = sorted(OPS)
@@ -15559,6 +17234,44 @@ const OP_SPECS = {
              props: "object", material: "string", E: "number", nu: "number",
              density: "number", elementSize: "number", factor: "number",
              name: "string" },
+  },
+  motion: {
+    mode: "write", creates: false,
+    summary:
+      "Kinematics and quasi-static kinetics on a native Assembly. mode is " +
+      "'check' (grounding, connectivity, mobility measured against " +
+      "Kutzbach-Grubler, interference at the current pose), 'joints' (what " +
+      "each joint is and which property can be driven), 'sweep' (drive one " +
+      "joint from..to over steps and watch every pose for solve failures, " +
+      "locks, branch flips and self-interference) or 'torque' (the sweep " +
+      "plus the gravity torque that HOLDS each pose, by virtual work over " +
+      "measured masses). A render shows one pose; the mechanism was designed " +
+      "for a range, and the collision is at 47 degrees. Quasi-static: no " +
+      "inertia, friction, contact or impact. Slow — a boolean per pair per " +
+      "step — so never a batch step.",
+    props: { mode: "string", assembly: "string", joint: "string",
+             property: "string", from: "number", to: "number",
+             steps: "number", interference: "boolean", leaveAt: "number",
+             gravity: "string", massOverrides: "object" },
+  },
+  draw: {
+    mode: "write", creates: true,
+    summary:
+      "The 2D sheet the part is actually handed over as. mode is 'templates' " +
+      "(which sheet templates this install carries), 'page', 'view' (project " +
+      "an object and REFUSE a view that projected nothing), 'dimension' " +
+      "(attached to the model in 3D, and cross-checked against what the " +
+      "model measures — a dimension that disagrees with the part is refused " +
+      "rather than left on the sheet), 'check' (re-audit the page) or " +
+      "'export' (DXF always; SVG and PDF need a GUI). Dimension refs follow " +
+      "the fillet rule: a query result or a user pick, never an authored " +
+      "edge index. Does NOT do GD&T, datums, surface finish or tolerance " +
+      "callouts, and does not judge whether a drawing is complete.",
+    props: { mode: "string", page: "string", source: "array",
+             target: "string", direction: "string", scale: "number",
+             refs: "array", dimType: "string", template: "string",
+             format: "string", savePath: "string", x: "number", y: "number",
+             props: "object" },
   },
   material: {
     mode: "write", creates: false,
@@ -16840,6 +18553,157 @@ async function toolFem(args) {
     "a = json.loads(" + payload + ")\n" +
     "return koi_cad.call('fem', a['args'], a['id'], a['label'], a['dryRun'])",
     args.timeoutMs || (slow ? 1800000 : mode === "mesh" ? 600000 : 120000)
+  );
+  return annotateEdit(res.data || {}, args.detail);
+}
+
+/**
+ * freecad_motion — does the mechanism move the way it was drawn?
+ *
+ * `mutating`, because a sweep drives the user's assembly through its travel
+ * and the solver moves parts to get there. It restores the pose it started in
+ * and REPORTS whether it managed to — a solver that comes back on the other
+ * branch is a real outcome, not an error to swallow — and one Ctrl+Z takes
+ * the whole sweep back regardless.
+ *
+ * Nothing here builds an assembly or authors a joint. A joint is made by
+ * clicking the two features that mate, in the window the human is already
+ * looking at, and inventing one from this side would mean inventing which
+ * geometry it attaches to. This drives what they built and watches what it
+ * does.
+ */
+async function toolMotion(args) {
+  args = args || {};
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
+  const mode = String(args.mode || "check");
+  const MODES = ["check", "joints", "sweep", "torque"];
+  if (MODES.indexOf(mode) === -1) {
+    return { error: "mode must be one of " + MODES.join(", ") };
+  }
+  if ((mode === "sweep" || mode === "torque") && args.to == null) {
+    return {
+      error:
+        "mode '" + mode + "' needs 'to': the far end of the travel to check. " +
+        "The whole point of a sweep is the poses nobody screenshotted — a " +
+        "range of zero is the render you already have.",
+    };
+  }
+  if ((mode === "sweep" || mode === "torque") && !args.joint) {
+    return {
+      error:
+        "a sweep drives one joint. Say which — freecad_motion({mode:" +
+        "'joints'}) lists them and says which property of each one this " +
+        "build lets you drive.",
+    };
+  }
+  await ensureKoiCad(false);
+  const opArgs = {
+    mode,
+    assembly: args.assembly == null ? null : String(args.assembly),
+    joint: args.joint == null ? null : String(args.joint),
+    property: args.property == null ? null : String(args.property),
+    from: args.from == null ? null : Number(args.from),
+    to: args.to == null ? null : Number(args.to),
+    steps: args.steps == null ? null : Number(args.steps),
+    interference: args.interference === false ? false : true,
+    leaveAt: args.leaveAt == null ? null : Number(args.leaveAt),
+    gravity: args.gravity == null ? null : String(args.gravity),
+    massOverrides:
+      args.massOverrides && typeof args.massOverrides === "object"
+        ? args.massOverrides
+        : null,
+  };
+  const payload = pyPayload({
+    args: opArgs,
+    id: args.id == null ? null : String(args.id),
+    label: String(args.name || ("motion " + mode)),
+    dryRun: !!args.dryRun,
+  });
+  // A sweep is a solve and an interference test per step. Steps default to 24
+  // and the boolean is the expensive half, so this gets a CAM-sized budget
+  // rather than a read-sized one.
+  const sweeping = mode === "sweep" || mode === "torque";
+  const res = await execPython(
+    "import koi_cad, json\n" +
+    "a = json.loads(" + payload + ")\n" +
+    "return koi_cad.call('motion', a['args'], a['id'], a['label'], a['dryRun'])",
+    args.timeoutMs || (sweeping ? 900000 : 120000)
+  );
+  return annotateEdit(res.data || {}, args.detail);
+}
+
+/**
+ * freecad_draw — the sheet, and whether the part can be made from it.
+ *
+ * The last artefact in the chain and the one that actually leaves the
+ * building. A machinist gets a sheet, not a STEP file and a conversation, and
+ * everything not dimensioned on it is a decision somebody else makes.
+ *
+ * Two of the modes REFUSE rather than report, which is unusual here and
+ * deliberate. A view that projected nothing and a dimension that prints a
+ * number the model does not measure are both internally consistent, both
+ * survive a review, and both reach the shop floor — so neither is left on the
+ * page for a later audit to maybe catch.
+ */
+async function toolDraw(args) {
+  args = args || {};
+  const att = await ensureAttached();
+  if (!att.attached) return { error: att.error, detail: att.detail };
+  const mode = String(args.mode || "check");
+  const MODES = ["templates", "page", "view", "dimension", "check", "export"];
+  if (MODES.indexOf(mode) === -1) {
+    return { error: "mode must be one of " + MODES.join(", ") };
+  }
+  if (["page", "view", "dimension"].indexOf(mode) !== -1 && !args.id) {
+    return {
+      error:
+        "draw mode '" + mode + "' creates an object on the sheet, so it needs " +
+        "an id — a handle like 'dwg.bracket' or 'dim.overall' that a later " +
+        "turn can move or re-measure.",
+    };
+  }
+  if (mode === "dimension" && !Array.isArray(args.refs)) {
+    return {
+      error:
+        "a dimension measures model geometry, so it needs refs. Hand over " +
+        "the `refs` array from freecad_call({fn:'query'}) or a pick captured " +
+        "with fn 'ref' — an edge index authored here dimensions whatever " +
+        "Edge7 happens to be today, and prints a number either way.",
+    };
+  }
+  await ensureKoiCad(false);
+  const opArgs = {
+    mode,
+    page: args.page == null ? null : String(args.page),
+    source: Array.isArray(args.source)
+      ? args.source.map(String)
+      : args.source == null
+      ? null
+      : String(args.source),
+    target: args.target == null ? null : String(args.target),
+    direction: args.direction == null ? null : String(args.direction),
+    scale: args.scale == null ? null : Number(args.scale),
+    refs: Array.isArray(args.refs) ? args.refs.map(String) : null,
+    dimType: args.dimType == null ? null : String(args.dimType),
+    template: args.template == null ? null : String(args.template),
+    format: args.format == null ? null : String(args.format),
+    savePath: args.savePath == null ? null : String(args.savePath),
+    x: args.x == null ? null : Number(args.x),
+    y: args.y == null ? null : Number(args.y),
+    props: args.props && typeof args.props === "object" ? args.props : null,
+  };
+  const payload = pyPayload({
+    args: opArgs,
+    id: args.id == null ? null : String(args.id),
+    label: String(args.name || ("draw " + mode)),
+    dryRun: !!args.dryRun,
+  });
+  const res = await execPython(
+    "import koi_cad, json\n" +
+    "a = json.loads(" + payload + ")\n" +
+    "return koi_cad.call('draw', a['args'], a['id'], a['label'], a['dryRun'])",
+    args.timeoutMs || 180000
   );
   return annotateEdit(res.data || {}, args.detail);
 }
@@ -18226,6 +20090,244 @@ return {
         },
       },
       {
+        name: "freecad_motion",
+        description:
+          "Does the MECHANISM work? Kinematics and quasi-static kinetics on " +
+          "a native Assembly (FreeCAD 1.0+).\n\nAn assembly render shows " +
+          "one pose. The mechanism was designed for a range, and every " +
+          "interesting failure lives at an angle nobody screenshotted: the " +
+          "link that clears at 0\u00b0 and drives through the frame at " +
+          "47\u00b0; the four-bar the solver quietly walks onto its OTHER " +
+          "assembly branch, where every pose satisfies every constraint and " +
+          "the physical linkage would have to come apart to get there; the " +
+          "joint that hits a toggle and stops while the driving value keeps " +
+          "climbing and the solver keeps reporting success; the mechanism " +
+          "that is one joint short of its intended mobility, so it is a " +
+          "structure that solves, renders, and does not move. All of them " +
+          "recompute clean.\n\nRead `mobility.mismatch`, `sweepIncomplete`, " +
+          "`lockedNote`, `branchFlip` and `collides` before anything else. " +
+          "`interference.checked:false` and `interferenceIncomplete` are NOT " +
+          "clean bills — they mean nothing was looked at.\n\n`torque` is " +
+          "virtual work against gravity: what it takes to HOLD each pose, " +
+          "differentiated from measured centres of mass. No inertia, no " +
+          "friction, no contact, no impact, no payload beyond the masses " +
+          "listed. It sizes a hinge or a servo at stall; it is not a " +
+          "dynamics simulation, and it is refused outright if any moving " +
+          "part has no density.\n\nThis drives an assembly the human " +
+          "built; it does not author joints.",
+        displayMessage:
+          "\u{2699} FreeCAD motion \u00b7 {{mode|default:check}}" +
+          "{{#joint}} \u00b7 {{joint}}{{/joint}}",
+        tier: "mutating",
+        inputSchema: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["check", "joints", "sweep", "torque"],
+              description:
+                "check: grounding, connectivity, mobility measured against " +
+                "Kutzbach-Grubler, and interference at the pose it sits in " +
+                "now. joints: what each joint is and which property can be " +
+                "driven. sweep: drive one joint through a range and watch " +
+                "every pose. torque: the sweep plus the holding torque. " +
+                "Default check.",
+            },
+            assembly: {
+              type: "string",
+              description:
+                "Which assembly, if the document has more than one.",
+            },
+            joint: {
+              type: "string",
+              description:
+                "The joint to drive, by name or label. Required for sweep " +
+                "and torque.",
+            },
+            property: {
+              type: "string",
+              description:
+                "Which property of that joint to drive (Rotation, Distance, " +
+                "Offset...). Omitted, the first drivable one is used and the " +
+                "reply says which — nothing is guessed silently, because " +
+                "driving the wrong property moves the mechanism somewhere " +
+                "real and reports success.",
+            },
+            from: {
+              type: "number",
+              description:
+                "Start of the travel, in degrees or mm depending on the " +
+                "property. Defaults to where the joint is now.",
+            },
+            to: {
+              type: "number",
+              description: "End of the travel. Required for sweep and torque.",
+            },
+            steps: {
+              type: "number",
+              description:
+                "How many intervals to sample, 2 to 200. Default 24. A " +
+                "collision narrower than one step is a collision this does " +
+                "not see, so sweep the tight range finely rather than the " +
+                "whole range coarsely.",
+            },
+            interference: {
+              type: "boolean",
+              description:
+                "Test every pair of parts at every pose. Default true, and " +
+                "it is the slow half. Pairs joined by a joint are skipped " +
+                "(a pin overlaps its hole by design) and the skip is " +
+                "reported.",
+            },
+            leaveAt: {
+              type: "number",
+              description:
+                "Park the mechanism at this value instead of putting it back " +
+                "where it started. Useful for showing the user the pose that " +
+                "fouls.",
+            },
+            gravity: {
+              type: "string",
+              description:
+                "Which way is down for mode 'torque'. Default -Z.",
+            },
+            massOverrides: {
+              type: "object",
+              description:
+                "kg per part name, for anything bought rather than made — a " +
+                "motor, a battery, the payload. Everything else needs a " +
+                "density from fn 'material', and a part with neither is a " +
+                "refusal rather than a zero.",
+            },
+            name: { type: "string", description: "Undo entry label." },
+            dryRun: {
+              type: "boolean",
+              description:
+                "Sweep, measure, roll back. The honest default for a " +
+                "mechanism you were only asked about.",
+            },
+            detail: { type: "string", enum: ["delta", "full"] },
+            timeoutMs: {
+              type: "number",
+              description: "Default 900000 for sweep and torque.",
+            },
+          },
+        },
+      },
+      {
+        name: "freecad_draw",
+        description:
+          "The 2D SHEET — the artefact the part is actually handed over as. " +
+          "A machinist receives a drawing, not a STEP file and a " +
+          "conversation, and everything not dimensioned on it is a decision " +
+          "somebody else makes on the shop floor.\n\nA drawing is the " +
+          "easiest artefact in CAD to get wrong while it still looks right. " +
+          "All of these print and pass a glance: a view whose source " +
+          "projected nothing, so the sheet is a title block around white " +
+          "space; a dimension attached to the PROJECTED edge instead of the " +
+          "model, reading 46.19 on a 50 mm edge because the projection " +
+          "foreshortened it; a dimension attached to Edge7, which becomes a " +
+          "different edge after the next recompute and goes on displaying a " +
+          "number; a sheet whose views are at three different scales while " +
+          "the title block names one.\n\nSo every dimension made here is " +
+          "attached to the MODEL in 3D and cross-checked against what the " +
+          "model measures, and mode 'check' re-audits the whole page. Two " +
+          "things are REFUSED rather than reported — an empty view and a " +
+          "dimension that disagrees with the part — because both are " +
+          "internally consistent and both survive review.\n\nWhat it does " +
+          "NOT do: GD&T feature control frames, datums, surface finish and " +
+          "tolerance callouts are not created or checked, and it will not " +
+          "judge whether a drawing is complete enough to make the part — " +
+          "that is a question about design intent, and counting is not that " +
+          "judgement.",
+        displayMessage:
+          "\u{1F4D0} FreeCAD draw \u00b7 {{mode|default:check}}" +
+          "{{#id}} \u2192 {{id}}{{/id}}",
+        tier: "mutating",
+        inputSchema: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["templates", "page", "view", "dimension", "check",
+                     "export"],
+              description:
+                "templates: which sheet templates this install carries, " +
+                "writes nothing. page: a sheet with a template. view: " +
+                "project an object onto it. dimension: measure model " +
+                "geometry. check: re-audit the page, writes nothing. " +
+                "export: DXF always, SVG and PDF only where a GUI is " +
+                "present. Default check.",
+            },
+            page: { type: "string", description: "Which page, if several." },
+            source: {
+              type: "array",
+              items: { type: "string" },
+              description: "Objects to project, for mode 'view'.",
+            },
+            target: {
+              type: "string",
+              description: "A single object to project. Same as source.",
+            },
+            direction: {
+              type: "string",
+              description:
+                "front, rear, top, bottom, left, right or iso — or an axis " +
+                "name. Default front. A direction edge-on to a flat part " +
+                "projects a line and is refused as an empty view.",
+            },
+            scale: {
+              type: "number",
+              description:
+                "View scale. Omitted, the page's default is used and the " +
+                "reply reports what it turned out to be — a sheet at 1:2.37 " +
+                "reads as 1:1 to anybody who does not check.",
+            },
+            refs: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Model geometry the dimension measures: refs from query, or " +
+                "a user pick from fn 'ref'. Never an authored index.",
+            },
+            dimType: {
+              type: "string",
+              enum: ["Distance", "DistanceX", "DistanceY", "Radius",
+                     "Diameter", "Angle", "Angle3Pt"],
+              description: "Default Distance.",
+            },
+            template: {
+              type: "string",
+              description:
+                "Template SVG filename, e.g. A4_LandscapeTD.svg. mode " +
+                "'templates' lists what is actually installed.",
+            },
+            format: {
+              type: "string",
+              enum: ["dxf", "svg", "pdf"],
+              description: "Export format. Default dxf.",
+            },
+            savePath: { type: "string", description: "Filename to write." },
+            x: { type: "number", description: "Position on the sheet, mm." },
+            y: { type: "number", description: "Position on the sheet, mm." },
+            props: {
+              type: "object",
+              description: "Extra properties to set on the view.",
+            },
+            id: {
+              type: "string",
+              description:
+                "Handle for what this creates. Required for page, view and " +
+                "dimension.",
+            },
+            name: { type: "string", description: "Undo entry label." },
+            dryRun: { type: "boolean" },
+            detail: { type: "string", enum: ["delta", "full"] },
+            timeoutMs: { type: "number", description: "Default 180000." },
+          },
+        },
+      },
+      {
         name: "freecad_export",
         description:
           "Write the document out to the user's filesystem: FCStd " +
@@ -18526,6 +20628,12 @@ return {
           break;
         case "freecad_fem":
           result = await toolFem(args);
+          break;
+        case "freecad_motion":
+          result = await toolMotion(args);
+          break;
+        case "freecad_draw":
+          result = await toolDraw(args);
           break;
         case "freecad_call":
           result = await toolCall(args);

@@ -1,48 +1,16 @@
 # FreeCAD Live Skill For Koi™ Assistant
 
-Based on 100% FreeCAD official release.
+Human/AI co-design on a live FreeCAD document, built on the official FreeCAD release and exposing native CAD, CAE (FEM), and CAM capabilities directly to the AI agent.
 
-Human/AI co-design on **one** live FreeCAD document: you drive the GUI in a
-browser tab, the agent drives the same document through a bridge, in the same
-interpreter, on the same undo stack.
+Instead of running scripts blindly against a headless kernel, this skill connects the AI directly to your **live, browser-streamed FreeCAD session**:
 
-This skill provides a minimal yet complete toolset for AI to perform CAD work,
-plus enough CAM to answer the question CAD cannot: **can this actually be
-made?** A part can be dimensionally perfect, recompute clean, pass interference
-and weigh exactly what the bill of materials says, and still be a shape no
-cutter can produce — an internal corner with a zero radius is valid geometry
-and does not exist in metal. So the skill measures manufacturability rather
-than asserting it: corner radii against real cutter sizes, tool reach per setup
-direction, undercuts, enclosed voids, and the volume of material no cutter can
-reach. Where the FreeCAD CAM workbench is available it will also build a real
-machining Job and generate the toolpaths, because an operation that produces
-zero path commands is the workbench saying it could not cut that feature — and
-that is a fact no language model can supply.
+- **One process, one document, one undo stack.** The bridge runs directly inside FreeCAD's GUI process. The AI edits through FreeCAD's Python interface while you interact through the 3D GUI on the exact same document.
+- **Take the mouse at any moment.** Orbit, tweak a sketch, or delete an AI-generated feature. The agent syncs changes every turn and respects your manual edits rather than rebuilding over them.
+- **Shared assistant context.** As a native Koi™ Assistant skill, the AI can query your design specifications, component catalogs, documents, or databases alongside the active CAD workflow.
 
-It answers the other question CAD cannot, on the same terms. Asked whether a
-3 mm wall is strong enough, a language model will produce a confident sentence,
-and the user cannot tell that apart from a number. So where gmsh and CalculiX
-are installed the skill runs a real **linear static solve** and reports a
-measured stress — or refuses. A model with no restraint, no load or no volume
-elements is rejected before the solver runs, because each of those returns a
-plausible number that means nothing. A peak stress sitting on a sharp internal
-corner is reported as the singularity it is rather than as a stress, and no
-factor of safety is divided out of it. Solved once, `converged` comes back
-`null`: one mesh is one number with no error bar.
+A wrong turn costs one turn: if a feature isn't what you intended, adjust it immediately in place rather than starting a script from scratch.
 
-Most of CAM is still out of scope: no simulation of material removal, no work
-holding or fixtures, no speeds, feeds or cycle time, and the G-code that comes
-out is machine-specific and unverified. The FEM is linear static and nothing
-else — no contact, plasticity, buckling, fatigue, dynamics or thermal — so what
-it produces is evidence, never a certificate. See §12 of `SKILL.md` for the
-full list of what is deliberately absent.
-
-Click to watch a 30s demo:
 [![Watch a 30s demo](./docs/demo.png)](https://www.youtube.com/watch?v=4SxjvQZKdXU)
-
-This guide gets you from nothing to a working session. Follow Part I in order.
-Part II explains what you just built — security model, maintenance, GPU,
-troubleshooting — and is worth reading once you are up.
 
 ---
 
@@ -428,7 +396,7 @@ If not, review the Koi extension's console log:
 At this point you have a working environment. Everything below is optional or
 explanatory.
 
-## Step 7: Run it as a service (recommended)
+## Step 7: Run it as a service (optional but recommended)
 
 So FreeCAD comes back on boot and after a crash.
 
@@ -617,9 +585,27 @@ under `binaries` rather than assuming. Everything else in the skill works
 without them.
 
 ```bash
-# Inside the FreeCAD container (or on the host, for a native install):
-apt-get update && apt-get install -y gmsh calculix-ccx
+# Get into the FreeCAD container shell from the server:
+podman exec -it freecad-stream bash
+# 1. Add bookworm repository with non-free
+echo "deb http://deb.debian.org/debian bookworm main contrib non-free" > /etc/apt/sources.list.d/bookworm.list
+
+# 2. Update and install both packages
+apt-get update
+apt-get install -y gmsh calculix-ccx
+
+# 3. (Optional) Remove the bookworm list to prevent future package mix-ups
+rm /etc/apt/sources.list.d/bookworm.list
+apt-get update
 ```
+
+Verify that both binaries are present:
+
+```bash
+which gmsh && which ccx
+```
+
+To make this permanent, you need to rebuild the container image (omitted for brevity)
 
 FreeCAD finds them on `PATH`. If yours are somewhere else, set the paths in
 Edit → Preferences → FEM → Gmsh / CalculiX; the skill reads those preferences
@@ -672,6 +658,8 @@ The skill is maintained with a full test suite, you can run them in batch from K
 /skill freecad-live/scripts/test_inspect.js --full-auto
 /skill freecad-live/scripts/test_cam.js --full-auto
 /skill freecad-live/scripts/test_fem.js --full-auto
+/skill freecad-live/scripts/test_draw.js --full-auto
+/skill freecad-live/scripts/test_motion.js --full-auto
 ```
 
 `test_fem.js` is the one suite that is mostly about **refusals**, because that
@@ -686,30 +674,66 @@ proves a bracket solves proves the part of this that was never in doubt.
 
 You need to turn on the `probe-exec` switch, and reinstall the freecad-live skill, so it can run these scripts.
 
-```
+```diff
 --- a/skills/freecad-live/SKILL.md
 +++ b/skills/freecad-live/SKILL.md
-@@ -125,7 +125,7 @@ mcp-servers:
-     # !! freecad_script, which is exactly the surface the call/script split
-     # !! exists to keep away from it. Turn it on to run the suites in
-     # !! scripts/, turn it off before handing the session to a model.
+@@ -91,7 +91,7 @@ mcp-servers:
+     # scripts/test_probes.js, test_koi_cad.js and test_koi_call.js need them
+     # to set up conditions the envelope is meant to handle.
+     # !! MUST be off for any LLM-facing session.
 -    probe-exec: off
 +    probe-exec: on
+
  guardrails: scripts/guardrail.js
- allowed-tools:
-   - freecad_config
 ```
+
+`probe-exec: on` adds `freecad_exec` and `freecad_edit` to the tool list —
+arbitrary Python at `mutating` tier, which is the exact surface the
+`freecad_call`/`freecad_script` split exists to keep a model away from. Turn it
+back off before handing the session to one.
 
 Make sure your change does not break the existing test suites.
 
-### Sample end to end test prompt
+### End-to-end test prompts
 
-#### Prompt 1 — MTB Stem
+Five sessions, not five scripts. Paste one into the freecad-live skill's
+**Additional Instructions (Optional)** box and press Run Skill with the stream
+open in another tab — these are written to be **watched**, and each one has at
+least one **HAND THE MOUSE OVER** beat where the agent must stop and wait for you
+to click something in FreeCAD. That beat is the part of this skill a headless CAD
+agent does not have, and it is the part most worth testing: an element reference
+the model authored is blocked by the guardrail, so "this face" has to come from
+your selection or from a stored `query`, and nowhere else.
 
-To make the mountain bike stem in the demo video, just copy this prompt to the freecad-live skill's "Additional Instructions (Optional)" input box and run:
+Between them they exercise every tool the skill ships.
+
+| #   | Part         | Exercises                                                                                     | You do                                         |
+| :-- | :----------- | :-------------------------------------------------------------------------------------------- | :--------------------------------------------- |
+| 1   | MTB stem     | sketch, params, `split_body`, fasteners, `freecad_dfm`, `freecad_cam`, `freecad_draw`         | pick the chamfer edges; read the sheet         |
+| 2   | NEMA housing | catalog parts, `bind`, swap propagation, `bom`, DFM before/after                              | pick the mating face; delete a feature it made |
+| 3   | Drone arm    | `loft`, `subtractive_pipe`, `draft`, `shell`, `deepLint`, `freecad_fem`                       | pick the fixed face and the loaded face        |
+| 4   | Crank-rocker | `freecad_motion` — mobility, sweep, branch flip, holding torque                               | **build the Assembly joints yourself**         |
+| 5   | Roundtrip    | `save` / `open_document` / `import_geometry` / `freecad_export`, id durability, the guardrail | delete an AI object mid-session                |
+
+Prompt 3's solve needs gmsh and CalculiX (see "Optional: gmsh and CalculiX for
+FEM"); it reports `binaries` and skips cleanly if they are absent. Prompt 4 needs
+the native Assembly workbench, FreeCAD 1.0+.
+
+---
+
+#### Prompt 1 — MTB stem: sketching, parameters, fasteners, and the handover sheet
+
+**Focus**: _Parametric sketching, `split_body`, `fastener_pattern`, a user-picked
+reference, manufacturability against a real cutter, a real toolpath, and the 2D
+drawing the part is actually made from._
+
+This is the part in the demo video.
 
 ```markdown
 Design a 2-piece CNC MTB stem (Atomlab direct/threadless style) in FreeCAD.
+
+Open with your attach status line, then start. Batch what is already decided;
+stop the batch wherever the next step depends on a measurement.
 
 ### Parameters — create these FIRST, bind everything to them
 
@@ -719,7 +743,7 @@ Set each with `fn:"param"` and quote the value the sheet reads BACK.
 
 ### Build sequence
 
-A. `new_document` (id `doc.stem`), `body` (id `body.stem`).
+A. `new_document` (id `doc.stem`), then `body` (id `body.stem`).
 Sketch `sk.base_profile` on XY: use `rect` with `anchor:"center"`. Bind w/h
 to the parameters as expression strings. `pad.base` length
 `"koi_params.StackHeight"`, symmetric.
@@ -737,13 +761,17 @@ computed polyline), TWO slots in ONE sketch, both bound to parameters.
 NOTE: `fn:"mirror"` mirrors a whole solid, not a feature. If you believe you
 need a mirrored feature, log that as a capability gap rather than substituting
 `mirror` or `pattern` blindly.
-E. Chamfers: `chamfer` with a `query` (`{kind:"edge", direction:"+Z",
-   expect:"many"}`), size 3. Use query, NOT refs — the model is still moving and
-the stored filter is the point.
+
+E. Chamfer:
+Apply a 3 mm chamfer to the four top outer perimeter edges of the main body.
+Use a stored query (`fn: "chamfer"` with `query: {kind: "edge", surface: "Line", at: {z: 20}, expect: "many"}`, `size: 3`, `id: "chamfer.top"`)
+rather than hardcoded topological edge indices or manual selection, ensuring the feature self-heals across downstream body splits and parameter changes.
+
 F. Faceplate separation: `split_body` on `body.stem`, plane through the
 handlebar clamp, `gap:"koi_params.PinchGap"`, `ids:["part.body","part.face"]`.
 Read `sides.positive` / `sides.negative` — do not assume `ids[0]`.
-Report `asBodies`.
+Report `asBodies`, and report whether the chamfer from step E survived, was
+`rehealed`, or aborted the write.
 G. Steerer pinch slot: rear cut of width `"koi_params.PinchGap"` into the
 steerer bore.
 H. Fasteners:
@@ -754,8 +782,8 @@ H. Fasteners:
 - `fastener_pattern({hole:"hole.face_bolts", fastener:"M5", length:16})` —
   ONE call for all four. Do not use four `insert`+`mate` pairs.
 - Same for the 2 steerer pinch bolts (M5x18).
-  I. `material` — assign `aluminium-6061` to both bodies. (If you cannot find a
-  call for this, that is a defect; log it.)
+
+I. `material` — assign `aluminium-6061` to both bodies.
 
 ### Acceptance — all of these must be measured, not asserted
 
@@ -772,33 +800,53 @@ H. Fasteners:
 5. `view_section({plane:"XZ", offset:0})` then `freecad_render({view:"iso"})`
    and one section render. Then turn the clip OFF and `view_restore`.
    Confirm `drawn` per target; if anything is in `notDrawn`, say so instead of
-   describing the model.
-6. `freecad_dfm({targets:["part.body","part.face"], process:"mill3axis",
-tool:6})`. This is a CNC part and the design has to survive a cutter, not
-   just a recompute. You should be able to predict two of the findings before
-   you read the reply: `PinchGap` is 2 mm, and a 2 mm slot admits a 2 mm
-   cutter and nothing wider; `FluteDepth` is 3.5 mm. Quote `manufacturable`,
-   the residual `method`, and `maxToolDiameter` per body.
-   If it comes back `obstructed`, name the FEATURE and say what dimension
-   would clear it. Do not quietly shrink the `tool` argument until the check
-   passes — that is fitting the test to the answer. Then re-run at `tool:2`
-   and report what changed and what it costs (a 2 mm cutter in aluminium is a
-   different machining plan, not a smaller number).
+   describing the model. Leaving my view clipped or my model isolated is a
+   defect even if the geometry is perfect.
+6. `freecad_dfm({targets:["part.body","part.face"], process:"mill3axis", tool:6})`.
+   This is a CNC part and the design has to survive a cutter, not just a
+   recompute. You should be able to predict two of the findings before you read
+   the reply: `PinchGap` is 2 mm, and a 2 mm slot admits a 2 mm cutter and
+   nothing wider; `FluteDepth` is 3.5 mm. Quote `manufacturable`, the residual
+   `method`, and `maxToolDiameter` per body.
+   If it comes back `obstructed`, name the FEATURE and say what dimension would
+   clear it. Do not quietly shrink the `tool` argument until the check passes —
+   that is fitting the test to the answer. Then re-run at `tool:2` and report
+   what changed and what it costs (a 2 mm cutter in aluminium is a different
+   machining plan, not a smaller number).
 7. `freecad_cam({mode:"job", target:"part.face", id:"cam.face"})`, then
    `{mode:"op", job:"cam.face", op:"profile", id:"camop.face_profile"}`, then
    `{mode:"verify", job:"cam.face"}`. Quote `api` — which spelling of the CAM
    modules this build actually has — and the command count. An operation that
    generated ZERO commands recomputes clean and looks like nothing on screen;
    it is the workbench saying it could not cut that feature with that tool, so
-   report it as that rather than as a tool error. Finish with
-   `{mode:"clear", job:"cam.face"}` and leave the tree the way you found it.
+   report it as that rather than as a tool error.
+   Tell me BEFORE you start: toolpath generation runs in the geometry kernel and
+   my window will stop responding for the duration.
+   Finish with `{mode:"clear", job:"cam.face"}` and leave the tree the way you
+   found it.
+8. **The sheet.** `freecad_draw({mode:"templates"})` first — quote what this
+   install actually carries; do not name a template from memory.
+   `{mode:"page"}`, then three views of `part.face` (`front`, `top`, `iso`),
+   then at least four dimensions with `{mode:"dimension"}` whose `refs` come
+   from `query` or from a pick of mine — never an authored edge index.
+   Then `{mode:"check"}` and quote, one by one: `dimensionsDisagree`,
+   `projectionReferenced`, `emptyViews`, `templateMissing`, `mixedScales`,
+   `dimensionsUnchecked`. Say what each one means for the person who makes the
+   part from this sheet, not just whether it is set.
+   Then `{mode:"export", format:"pdf"}` and quote the path.
+   Finally: do NOT tell me the drawing is complete. Tell me what is missing —
+   the tool reports a dimension count and refuses that verdict on purpose, and
+   there is no GD&T, no datum frame, no surface finish and no tolerance on this
+   sheet at all.
 ```
 
 ---
 
-#### Prompt 2 — NEMA housing + associative cover: Multi-Body Parametric Motor Drive & Associative Enclosure
+#### Prompt 2 — NEMA housing + associative cover: multi-body parametric drive and enclosure
 
-**Focus**: _Catalog components, parametric swap propagation, cross-body SubShapeBinder (`bind`), multi-body assembly BOM, manufacturability across a parametric change._
+**Focus**: _Catalog components, parametric swap propagation, cross-body
+SubShapeBinder (`bind`), multi-body BOM, manufacturability across a parametric
+change, and what happens when the human rejects something._
 
 ```markdown
 Design a modular NEMA stepper reducer housing with an associatively-bound cover
@@ -820,31 +868,51 @@ plate. The real test here is PARAMETRIC SWAP PROPAGATION.
    Then `hole({sketch:"sk.motor_mount", id:"hole.motor_mount"})` with NO
    `spec` and NO `diameter` — the size comes from the profile circles
    (`diameterFrom` in the reply). Quote it.
-4. Cover plate, associative:
-   - `query({of:"pad.housing", kind:"face", normal:"+Z"})` to find the mating
-     face. Report how many matched. Do not author `Face2` yourself.
-   - `body.cover`, then `bind({body:"body.cover", of:"<the queried ref>",
+
+4. Cover plate, associative. **HAND THE MOUSE OVER for the mating face.**
+   - First do it the machine way: `query({of:"pad.housing", kind:"face",
+normal:"+Z"})`. Report how many matched and whether it is `ambiguous`.
+   - Then STOP and ask me to click the face you believe you found. Wait.
+     `freecad_sync()`, read `selection`, capture it with
+     `fn:"ref"` as `pick.rim`, and tell me whether my pick and your query
+     resolved to the SAME element. If they did not, my pick wins and you say so.
+   - `body.cover`, then `bind({body:"body.cover", of:"pick.rim",
 id:"bind.housing_rim"})`.
    - `sketch({on:"bind.housing_rim", query:{...}})` projecting the rim edges,
      then constrain to the PROJECTION — a literal `w:80` here defeats the test.
-     Report the `geoId` per projection and the constraint count.
+     Report the `geoId` per projection (external geometry starts at -3) and the
+     constraint count.
    - `pad.cover` 6 mm. `fastener_pattern` for 4x M4x16.
+
 5. **THE TEST — swap and verify propagation:**
    - First `dryRun:true`: `swap({target:"motor.nema", catalog:"NEMA23_envelope"})`
      with `dryRun`. Report the full blast radius from `report` — which objects
-     moved and by how much. "N objects changed" is not an answer.
+     moved and by how much. "N objects changed" is not an answer, and no
+     engineer accepts a parametric change from an AI without one.
    - Then apply it for real.
    - `measure_between` on two diagonal mounting holes' cylindrical faces
-     (via `query`), BEFORE and AFTER. Expected pitch 31.0 mm -> 47.14 mm.
+     (via `query`), BEFORE and AFTER. Expected pitch 31.0 mm → 47.14 mm.
      If the pitch did not move, the binding was a literal — log it as the
      primary defect of this test.
+   - `freecad_resolve()` — did `pick.rim` survive the swap? `stored`,
+     `rederived`, `broken` or `ambiguous`, and what each one obliges you to do.
+     `rederived` is not "fine".
    - Check `rehealedExternal` on the cover sketch. If constraints were lost,
      the cover is now the wrong shape even though it recomputed clean.
      Say so explicitly.
-6. `freecad_measure({interference:true, partsOnly:true})` — motor envelope vs
-   housing must be 0 mm³, or `allow` it with a stated reason.
-7. `bom` with masses for both bodies plus the motor's catalog mass.
-8. `freecad_dfm({targets:["body.housing","body.cover"], tool:6})`, run BOTH
+
+6. **HAND THE MOUSE OVER — the rejection.** STOP. I am going to delete one of
+   the objects you made, in the GUI, while you wait. When I say go,
+   `freecad_sync()` and read `userDiff`.
+   Name what is in `revertedAiObjects`. That is a rejection, not a glitch: do
+   NOT re-create it, do not "restore" it, and do not carry on as though the
+   design still has it. Ask me what I want instead, and quote `dofChanges` if a
+   sketch came loose when it went.
+
+7. `freecad_measure({interference:true, partsOnly:true})` — motor envelope vs
+   housing must be 0 mm³, or `allow` it with a stated `why` and an `upTo`.
+8. `bom` with masses for both bodies plus the motor's catalog mass.
+9. `freecad_dfm({targets:["body.housing","body.cover"], tool:6})`, run BOTH
    before and after the swap in step 5.
    - Before: the gearbox cavity as specified is a rectangle, so expect
      `dfm-sharp-corner`. A rotating cutter leaves its own radius; a square
@@ -855,22 +923,22 @@ id:"bind.housing_rim"})`.
      changing `process`.
    - After: say whether the swap changed the verdict. A NEMA23 bolt circle is
      47.14 mm against 31.0 mm, so a mount hole may now sit close enough to a
-     cavity wall to matter. If it does, that is precisely the failure this
-     whole design exists to catch, and it has to be caught by the number
-     rather than by looking at the render — the render will look fine either
-     way.
+     cavity wall to matter. If it does, that is precisely the failure this whole
+     design exists to catch, and it has to be caught by the number rather than
+     by looking at the render — the render will look fine either way.
 ```
 
 ---
 
-#### Prompt 3 — Drone arm: loft / sweep / draft / shell (Lofts, Sweeps, Shell & Draft)
+#### Prompt 3 — Drone arm: lofts, sweeps, shell, draft, and a real stress number
 
-**Focus**: _Advanced 3D modeling (`loft`, `pipe`, `shell`, `draft`), mold release verification, sliver face linting, and knowing when a manufacturability check is the wrong question._
+**Focus**: _Advanced 3D modelling (`loft`, `pipe`, `shell`, `draft`), sliver-face
+linting, knowing when a manufacturability check is the wrong question, and a
+linear static solve that has to refuse rather than reassure._
 
 ```markdown
 Design a lightweight drone motor arm with an internal wire conduit and mould
-release drafts. This test targets the 3D ops: loft, subtractive_pipe, draft,
-shell, and deepLint.
+release drafts, then find out whether it survives its motor.
 
 ### Build
 
@@ -901,7 +969,7 @@ query:{kind:"face", normal:"+Y"}})`. Report `taper` and `volumeDelta` —
    like "FaceTop" does not exist. Report how many faces matched before you
    commit.
 
-### Acceptance
+### Acceptance, part 1 — is it the shape I meant
 
 1. `freecad_measure({deepLint:true})` — zero sliver faces and no unclosed
    solids. If slivers appear, run `recompute({refine:true})` and report the
@@ -912,85 +980,202 @@ query:{kind:"face", normal:"+Y"}})`. Report `taper` and `volumeDelta` —
    it cannot tell you the thickness.
 3. `view_section({plane:"YZ", offset:0})` + `freecad_render` from two angles,
    then clip OFF and `view_restore`.
+
+### Acceptance, part 2 — can it be made, and is that even the question
+
 4. `freecad_dfm({targets:["body.arm"], process:"mill_any", tool:4})`.
    Expect this to FAIL, and expect the swept conduit to be why: an internal
    channel that opens only at its two ends is not reachable by a cutter from
    any direction, and `residual.obstructed` should say so with a volume.
-   **That finding is correct.** The right response is that this part is
-   moulded or printed and a milling check is the wrong question — NOT to
-   change the geometry until the check goes green. Say which, in those terms.
+   **That finding is correct.** The right response is that this part is moulded
+   or printed and a milling check is the wrong question — NOT to change the
+   geometry until the check goes green. Say which, in those terms.
    Every other prompt in this set rewards fixing the model when a measurement
    complains; this one is here to see whether that reflex has a brake on it.
    If instead it comes back manufacturable, the check is not measuring what it
    claims and THAT is the defect to report.
-   The `draft` in step 6 is the mould-release half of the same question, and
-   nothing in this skill verifies a mould — no parting line, no slide, no
+   Then re-run at `process:"print_fdm"` and say what changed and what it does
+   not tell you. The `draft` in step 6 is the mould-release half of the same
+   question, and nothing here verifies a mould — no parting line, no slide, no
    ejection. Say that too.
+
+### Acceptance, part 3 — does it survive the motor
+
+5. `freecad_fem({mode:"materials"})` FIRST. Quote whether `nylon-pa12` carries
+   an E and a nu in this table. If it does not, you supply them explicitly with
+   a source — nothing here defaults a modulus, every stress and displacement
+   scales with it, and a modulus recalled from memory is the exact failure this
+   skill exists to prevent. Also report `binaries`: if gmsh or CalculiX is
+   missing, say the solver is not available on this install and STOP here —
+   do not report the design as unchecked for some other reason.
+6. **HAND THE MOUSE OVER — the boundary conditions.** STOP and ask me to click
+   the root face (the one that bolts to the airframe). Wait. Capture it with
+   `fn:"ref"`. Then ask me to click the motor mount face at the tip and capture
+   that too. A load on a face index you authored solves perfectly cleanly and
+   is wrong, so neither of these may come from you.
+7. `{mode:"study", target:"body.arm", material:..., id:"fea.arm"}`, then
+   `{mode:"constrain", kind:"fixed", refs:[<root pick>], id:"bc.root"}`, then
+   `{mode:"constrain", kind:"force", refs:[<tip pick>], magnitude:25,
+id:"load.motor"}` — 25 N is roughly a 2.5 kg thrust unit at the tip.
+   Before you mesh, try `{mode:"solve"}` with only the restraint and confirm it
+   is REFUSED for having no load. Quote the refusal. Then add the load.
+   Tell me before you mesh and solve: this runs on the thread that owns the
+   document and my window will freeze for the duration.
+8. `{mode:"mesh", elementSize:2}` then `{mode:"solve"}`.
+   Read the reply in this order and say each out loud:
+   - `singularitySuspect` — the loft meets the root at a sharp corner, so
+     expect this to fire. If it does: quote `p99VonMisesMPa`, say the peak was
+     discarded and WHY (a linear elastic peak on a sharp re-entrant corner rises
+     without bound as the mesh refines — it is a property of the mesh), and
+     offer the fillet, which is what the part wanted anyway.
+   - `factorOfSafety` — expect `null` here, and expect it for a reason that is
+     not the singularity: a polymer's strength is rate- and temperature-
+     dependent and it creeps under a sustained load, so there is no single yield
+     to divide by. Say which reason applies. `null` is a refusal with a reason
+     attached and is never a pass.
+   - `converged` — `null` after one solve. Report it as an unfinished check.
+   - `displacementImplausible` — if it fires, suspect a missing restraint
+     before you suspect a bendy part.
+9. Add a root fillet bound to a new parameter, `{mode:"converge", factor:0.6}`,
+   and report what moved: the peak, the p99, or neither. A peak that keeps
+   climbing while the p99 settles is the signature of a corner singularity, not
+   of a mesh that is too coarse.
+10. Now `feature_edit` the loft to make the arm 10 mm longer and run
+    `freecad_measure` — `fem-stale` must appear in lint, and it must keep
+    appearing every turn until the analysis is re-solved or removed. Any stress
+    number you quote after this describes the OLD shape; say so.
+11. Close by stating what this solve cannot see. One load case, small
+    displacements, linear elastic, everything bonded: no contact, no plasticity,
+    no buckling, no fatigue, no vibration, no thermal, no anisotropy — and a
+    printed nylon part's layer adhesion is anisotropic, which is not a footnote
+    here. This is evidence, not a certificate.
 ```
 
 ---
 
-#### Prompt 4 — Kinematic clearance sweep
+#### Prompt 4 — Crank-rocker: the mechanism, driven
 
-**Focus**: _Multi-position clash detection (`freecad_measure`), collision allowances (`allow`), dry-run validation._
+**Focus**: _`freecad_motion` end to end — grounding and mobility, joint
+discovery, a swept range with lock and branch-flip detection, self-interference
+in travel, and gravity holding torque. Also the clearest test of the division of
+labour: the agent cannot author joints, and must not try._
+
+Needs the native Assembly workbench (FreeCAD 1.0+). This one is the most
+interactive of the five — the middle of it is you, in the GUI, with the mouse.
 
 ```markdown
-Verify kinematic clearance for a flange-mounted crank-rocker. This test targets
-`allow`, repeated `place` + `freecad_measure`, and dry-run discipline.
+Design and then VERIFY a flange-mounted crank-rocker. The design half is
+ordinary; the verification half is the point.
 
-NOTE UP FRONT: this skill has no continuous motion/sweep interference. You are
-sampling discrete positions. State that limitation in your final report, and
-state that the true minimum clearance may fall between samples.
+### Phase 1 — the parts (you)
 
-### Build
+1. `doc.crankrocker`. Four bodies, each with `material` (`steel-1018`):
+   - `body.base` — a flange with two pivot towers 90 mm apart, Ø8 bores.
+   - `body.crank` — 60 mm centres, Ø8 bores at each end.
+   - `body.coupler` — 140 mm centres, Ø8 bores.
+   - `body.rocker` — 80 mm centres, Ø8 bores.
+     Bind every length to a `param` so I can change one later.
+2. Four Ø8 dowel pins with `primitive({kind:"cylinder", d:8, ...})`, ids
+   `pin.a` … `pin.d`.
+3. `allow({pairs:[["body.crank","pin.a"]], upTo:0.05,
+why:"m6/h7 press fit dowel"})` and the equivalents. Then run
+   `freecad_measure({interference:true, partsOnly:true})` ONCE and confirm the
+   press fits appear under `expectedOverlaps` rather than as hits — and confirm
+   in words that anything past 0.05 mm³ would still be a hit. `allow` bounds an
+   overlap; it does not hide one.
+4. `freecad_render` two views so I can see what I am about to joint.
 
-1. `body.base` (flange + pivot tower at origin), `body.crank` (60 mm),
-   `body.link` (140 mm), as three independent bodies. `material` on all three.
-2. Two Ø8 dowel pins — `primitive({kind:"cylinder", d:8, ...})` or `insert`
-   with an inline spec. Press fit in the crank, clearance fit in the link.
-3. Position everything at theta = 0 degrees.
+### Phase 2 — HAND THE MOUSE OVER (me)
 
-### Tolerance declaration
+STOP HERE. Say plainly, in one or two sentences, that you cannot create the
+Assembly or its joints: a joint is made by clicking the two features that mate,
+and inventing which geometry it attaches to from your side is exactly the guess
+the rest of this skill exists to prevent. Then tell me precisely what to build:
+which four revolute joints, between which parts, and which one to ground.
+Then WAIT. Do not poll, do not proceed on a timer, do not "helpfully" try
+`freecad_script` to write joints while I am working. When I say go, continue.
 
-`allow({pairs:[["body.crank","pin.pivot"]], upTo:0.05,
-       why:"m6/h7 press fit dowel pin"})`
-Confirm the reply and confirm this persists across turns. Then run
-interference ONCE and confirm the press fit shows under `expectedOverlaps`
-rather than as a hit — and that anything past 0.05 mm³ would still be a hit.
+### Phase 3 — is it a mechanism at all
 
-### Sweep
+5. `freecad_motion({mode:"check"})`. Report, each in its own sentence:
+   - what is grounded, and whether every part reaches ground through joints
+     (`ungrounded:true` means placements are measured off a floating frame);
+   - the mobility from the solver AND from the Kutzbach-Grübler count of the
+     same joint list — TWO numbers from TWO methods. `mobility.mismatch` means
+     redundant constraints, which the solver absorbs silently while the geometry
+     is exactly aligned and which bind on the real machine as soon as it is not.
+     Do not paper over a mismatch; it is the most valuable thing on this screen.
+   - `interference` at the pose it is sitting in now, and whether
+     `interference.checked` is even true.
+6. `{mode:"joints"}`. Quote what each joint is and WHICH property this build
+   lets you drive. Do not guess a property name: driving the wrong one moves the
+   mechanism somewhere real and reports success.
 
-Step the crank through theta = 0, 30, 60, 90, 120, 150, 180, 210, 240, 270,
-300, 330 (twelve samples, not four — a crank-rocker's minimum rarely lands on
-a quadrant).
-At each step:
+### Phase 4 — the travel
 
-- `place({target:"body.crank", rotate:{axis:"Z", angle:30}, relative:true})`
-- `freecad_measure({interference:true, clearance:true, partsOnly:true})`
-  Record a table: theta | min clearance (mm) | interference volume (mm³) | which pair.
+7. Coarse first: `{mode:"sweep", joint:<the crank>, from:0, to:360, steps:36}`.
+   Read, in this order, before you say anything about how it moves:
+   `sweepIncomplete`, `lockedNote`, `branchFlip`, `collides`.
+   - `collides` — name the PAIR and the ANGLE, not just that it collides.
+   - `branchFlip` — every pose past the flip satisfies every constraint and the
+     physical linkage would have to come apart to get there, so the far side is
+     NOT reachable travel. Say that in those words and do not report the range
+     as swept.
+   - `lockedNote` — the driving value changed and nothing moved. A toggle or a
+     dead point, reported as success by the solver.
+     Explicitly state that a collision narrower than one step is a collision this
+     did not see: at 36 steps you sampled every 10°.
+8. Now go fine where it matters: re-sweep the 30° window around anything found
+   in step 7 at `steps:60` (0.5° resolution) and say what changed. Sweeping a
+   tight range finely beats sweeping the whole range coarsely, and the report
+   should show you know why.
+9. **Park it so I can look.** `{mode:"sweep", ..., leaveAt:<the worst angle>}`
+   — leave the mechanism AT the pose that fouls, `freecad_render` two views of
+   it, and tell me what I am looking at and what to change. If nothing fouled,
+   park it at the pose with the minimum clearance instead and quote the number.
+   Then hand the mouse back: tell me I can drag the joint myself from here.
+
+### Phase 5 — what holds it
+
+10. `{mode:"torque", joint:<the crank>, from:0, to:360, steps:36,
+gravity:"-Z"}`.
+    First: run it with one part's density deliberately cleared
+    (`material({target:..., clear:true})`) and confirm it is REFUSED rather than
+    returning a smooth, plausible, wrong curve that quietly dropped a link.
+    Quote the refusal, restore the material, re-run.
+    Report the peak holding torque and the angle it occurs at — that is the
+    number a servo is sized on, at stall.
+11. State the boundaries without being asked: quasi-static, gravity only. No
+    inertia, no friction, no bearing drag, no spring, no backlash, no payload
+    beyond the masses listed, and no time in it at all. It answers where the
+    mechanism can go and what holds it there, not what happens when something
+    hits it.
 
 ### Acceptance
 
-1. Interference outside the allowed press fit must be exactly 0.000 mm³ at
-   every sample.
-2. Minimum link-flank-to-base clearance >= 3.0 mm at every sample. Report the
-   worst theta and its value.
-3. Coaxial check: `measure_between` the pin's CYLINDRICAL FACE and the crank
-   bore's CYLINDRICAL FACE, both obtained via `query`. Do NOT pass the `hole.*`
-   feature id — a PartDesign feature's shape is the whole body and the answer
-   will be a meaningless 0.
-4. Before the sweep, `dryRun` one crank rotation and show the report.
-5. Return the crank to theta = 0 when finished.
+- Nothing in this session authored a joint.
+- Mobility is reported from two methods and any mismatch is named, not smoothed.
+- Every collision is reported with a pair AND an angle.
+- A branch flip, if present, is described as unreachable travel rather than as
+  range.
+- The torque run refused the missing density before it produced a curve.
+- The mechanism is left parked where I asked and my camera is restored.
+- If `freecad_motion` reports no Assembly on this build, say so and STOP. Do NOT
+  fall back to stepping `place` through angles and calling that a sweep — that
+  samples a continuum and the true minimum falls between samples. Offer it as a
+  clearly-labelled second best if I ask for it.
 ```
 
 ---
 
-#### Prompt 5 — I/O roundtrip and ID durability
+#### Prompt 5 — Roundtrip: ids that outlive the file, and a guardrail that means it
 
-**Focus**: _`open_document`, `save`, `import_geometry`, `freecad_export`, metadata ID persistence across sessions, and which checks survive the loss of the feature tree._
+**Focus**: _`open_document`, `save`, `import_geometry`, `freecad_export`, koi-id
+persistence across a save/reopen boundary, which checks survive the loss of the
+feature tree, and the one rule the guardrail enforces rather than requests._
 
 ```markdown
-Verify file interchange and koi-id durability across a save/reopen boundary.
+Verify file interchange, koi-id durability, and the banned-reference gate.
 
 IMPORTANT PATH RULE (verify this yourself first): `open_document` and
 `import_geometry` only accept paths under the bridge's export directory,
@@ -998,51 +1183,75 @@ anything KOI_OPEN_DIRS names, or the folder of a document the human already has
 open. Establish what those roots are before you plan any path — and if you had
 to discover this from an error rather than from documentation, log that.
 
-### Phase 1 — Build and save
+### Phase 0 — the gate
+
+1. Build nothing yet. First, deliberately call
+   `freecad_call({fn:"fillet", args:{refs:["Pad:Edge4"], radius:2}, id:"f.x"})`
+   with an edge index you have NEVER seen in a tool result. It must be BLOCKED
+   before it reaches FreeCAD. Quote the block message verbatim and explain, in
+   your own words, why an authored index is the one error this skill cannot
+   detect after the fact.
+2. Then do the same thing through `freecad_fem({mode:"constrain", refs:
+["Pad:Face3"], ...})` and through `freecad_draw({mode:"dimension", refs:
+["Pad:Edge4"], ...})`. Report honestly whether those were blocked too. If
+   either went through, that is a finding about the GUARD, not about you — log
+   it as one and still do not use the reference.
+
+### Phase 1 — build and save
 
 Build a bored bracket in `doc.roundtrip` with at least four features
 (`sk.base`, `pad.base`, `sk.bore`, `pocket.bore`) plus a `chamfer` driven by a
 stored `query`, and a `param` the pad length is bound to. `material` it.
 Then `save({path:"BracketMaster.FCStd", overwrite:true})`.
 The reply distinguishes save-in-place from Save-As, and Save-As REBINDS the
-document. Quote which one happened, in those words.
+document so every later save goes to the new file. Quote which one happened, in
+those words.
 State clearly how `fn:"save"` differs from `freecad_export({format:"FCStd"})`
 and confirm you picked the right one.
 
 ### Phase 2 — ID durability
 
-1. `freecad_call({fn:"ids"})` — capture the full id list and
-   `revertedAiObjects`.
+1. `freecad_call({fn:"ids"})` — capture the full id list.
 2. Reopen from disk with `open_document`.
 3. `ids` again. Every id must be restored from `doc.Meta`. Diff the two lists
    and report any loss.
 4. `feature_edit({target:"pad.base", props:{Length:25}})` — by HANDLE, not by
    internal name. Confirm the DAG recomputed cleanly and, critically, that the
    stored chamfer `query` re-resolved. If the reply carries `rehealed`, the
-   edges were re-derived rather than preserved — check them before reporting.
+   edges were re-derived rather than preserved — check what the chamfer now
+   touches before you report it as fine.
 5. Confirm the parameter binding survived the roundtrip: change the param and
-   confirm the pad follows.
+   confirm the pad follows. A quoted number is still a number.
 
-### Phase 3 — Export
+### Phase 3 — HAND THE MOUSE OVER (the rejection, again, after a reopen)
+
+STOP. I am going to delete one of your features in the GUI. Wait for me.
+Then `freecad_sync()`: name `revertedAiObjects`, name any `dofChanges`, and do
+NOT re-create it. Tell me what is now downstream of nothing, and offer
+`suppress` versus `delete` for whatever is left dangling — including why
+`delete` refuses a feature in the middle of a body in the first place.
+
+### Phase 4 — export
 
 Before either export, run `freecad_dfm({targets:["body.bracket"]})` and quote
 the verdict alongside the paths. Export is the moment the question stops being
 "is the model what I meant" and becomes "can this be made", because whoever
-receives the STEP cannot ask the model anything. Note whether the skill
-prompted you to do this or whether you remembered on your own.
+receives the STEP cannot ask the model anything. Note whether the skill prompted
+you to do this or whether you remembered on your own.
 
 `freecad_export({format:"STEP", targets:["body.bracket"]})` and
 `freecad_export({format:"STL", targets:["body.bracket"]})`.
 Quote both paths and confirm they are inside the export directory.
 
-### Phase 4 — Import and boolean
+### Phase 5 — import and boolean
 
 1. `import_geometry({path:"<the STEP path>", at:[100,0,0]})`.
    The reply should say plainly that what arrived is a SHAPE — no features, no
    sketches, nothing to bind an expression to. Confirm it does.
    Note whether multiple solids arrived under a single `App::Part`.
 2. Cut a clearance pocket from the imported shape with
-   `boolean({op:"cut", base:..., tool:...})`.
+   `boolean({op:"cut", base:..., tool:...})`, using `primitive` for the tool
+   solid.
    If `base` is an `App::Part` container rather than a solid and the boolean
    refuses or misbehaves, LOG IT — do not work around it by unpacking the
    container with `freecad_script`.
@@ -1059,15 +1268,17 @@ Quote both paths and confirm they are inside the export directory.
 
 ### Acceptance
 
+- The authored reference in Phase 0 was blocked, and you said why.
 - Zero id loss across the save/reopen boundary.
 - The `query`-driven chamfer survived a dimensional change.
+- Nothing deleted in Phase 3 was re-created.
 - The imported shape is correctly described as non-parametric.
 - The boolean's `removed` is non-zero and stated.
 - The DFM verdict on the imported shape MATCHES the verdict on the body it was
   exported from. A roundtrip through STEP does not change what a cutter can
-  reach, so if the two disagree, either the export dropped geometry or the
-  check is reading something other than the shape. Either one is a defect and
-  the two are distinguishable — say which.
+  reach, so if the two disagree, either the export dropped geometry or the check
+  is reading something other than the shape. Either one is a defect and the two
+  are distinguishable — say which.
 ```
 
 ## References

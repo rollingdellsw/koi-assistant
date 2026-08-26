@@ -189,6 +189,46 @@ reminders:
     strategy: "persistent"
     priority: "high"
 
+  - id: "freecad-live:drawing-findings"
+    description: A sheet that agrees with itself and disagrees with the part.
+    trigger:
+      type: "tool_result"
+      toolName: "freecad_draw"
+      outputPattern: "dimensionsDisagree|projectionReferenced|emptyViews|templateMissing|mixedScales|undimensioned|dimensionsUnchecked"
+    content: |
+      This sheet carries a finding that prints. `dimensionsDisagree` means a
+      dimension shows a number the model does not measure — somebody will make
+      the part to the sheet, so name it and stop. `projectionReferenced` means
+      a dimension is attached to the projected edge: it reads short on
+      anything not parallel to the sheet and migrates when the view
+      regenerates. `emptyViews` prints blank. `templateMissing` means no
+      border, no title block, no scale field. `mixedScales` is legitimate and
+      is also how a part gets made at the wrong size. `dimensionsUnchecked` is
+      unchecked, not correct. And never call a drawing complete — the tool
+      reports a count and refuses that verdict on purpose.
+    strategy: "persistent"
+    priority: "high"
+
+  - id: "freecad-live:motion-findings"
+    description: A mechanism that solves at one pose and fails at another.
+    trigger:
+      type: "tool_result"
+      toolName: "freecad_motion"
+      outputPattern: 'collides":true|branchFlip":true|sweepIncomplete|lockedNote|ungrounded":true|mismatch":true|checked":false'
+    content: |
+      This mechanism carries a finding that outranks the pose in any render.
+      `collides` means it fouls itself in travel — name the pair AND the
+      angle. `branchFlip` means the solver walked onto the other assembly
+      configuration: every pose is valid and the physical linkage cannot get
+      there, so the far side is not reachable travel. `sweepIncomplete` and
+      `lockedNote` mean it does not go as far as it was asked to. `ungrounded`
+      means every placement is measured off a floating frame.
+      `interference.checked:false` is not a clean bill — it means nothing was
+      looked at. Say which one applies before describing how the mechanism
+      moves.
+    strategy: "persistent"
+    priority: "high"
+
   - id: "freecad-live:fem-findings"
     description: A stress number that is a property of the mesh, not the part.
     trigger:
@@ -289,6 +329,8 @@ allowed-tools:
   - freecad_dfm
   - freecad_cam
   - freecad_fem
+  - freecad_motion
+  - freecad_draw
   - freecad_resolve
   - freecad_export
   - freecad_call
@@ -493,6 +535,8 @@ needs something not on this list, say it is absent rather than improvising.**
 | Purchased      | `insert`, `swap`, `hole`, `mate`, `fastener_pattern`, `param`, `material`                                  |
 | Manufacturing  | `cam` (Job, operations, toolpaths, G-code — see §8)                                                        |
 | Analysis       | `fem` (analysis, restraints, loads, mesh, CalculiX solve — see §8)                                         |
+| Mechanism      | `motion` (grounding, mobility, sweep a joint, interference in travel, holding torque — see §8)             |
+| Handover       | `draw` (page, views, dimensions cross-checked against the model, DXF/PDF — see §8)                         |
 | Lifecycle      | `feature_edit`, `suppress`, `delete`, `allow`, `batch`                                                     |
 | Presentation   | `isolate`, `show`, `view_set`, `view_fit`, `view_section`, `view_restore`, `render`                        |
 
@@ -883,6 +927,83 @@ check did not run and nothing blocking was found** — an OCC offset that failed
 a hard shape is reported as a failure, not resolved in favour of a pass — and
 `null` must be relayed as an unfinished check.
 
+### The sheet
+
+The part leaves the building as a **drawing**, not as a STEP file and a
+conversation, and everything not dimensioned on it is a decision somebody else
+makes on the shop floor. A drawing is also the easiest artefact in CAD to get
+wrong while it still looks right, because the wrongness is internally
+consistent: the sheet agrees with itself and disagrees with the part.
+
+`freecad_draw` builds one and measures it. `{mode: "page"}`, then
+`{mode: "view", source: ["body.x"], direction: "top"}`, then
+`{mode: "dimension", refs: [...], dimType: "Distance"}` — where `refs` follows
+the `fillet` rule exactly: a `query` result or a user pick, never an authored
+edge index. **Every dimension is attached to the model in 3D and cross-checked
+against what the model measures**, and `{mode: "check"}` re-audits the page.
+
+Two things are **refused rather than reported**, which is unusual here and
+deliberate — both survive a review that consists of looking at the tree:
+
+- a **view that projected nothing**, which prints a title block around white
+  space;
+- a **dimension that disagrees with the model**, which is the one drawing error
+  that survives everything, because the sheet is consistent and only wrong
+  against the part.
+
+Also read `projectionReferenced` (attached to the projected edge: reads short
+on anything not parallel to the sheet, and migrates when the view regenerates),
+`templateMissing`, `mixedScales` and `dimensionsUnchecked` — unchecked is not
+correct.
+
+**It will not tell you a drawing is complete.** Whether a part is fully
+constrained by its dimensions is a judgement about design intent; counting
+dimensions is not that judgement, so it reports the count and refuses the
+verdict. GD&T feature control frames, datums, surface finish and tolerance
+callouts are not created or checked at all — say so rather than implying the
+sheet is ready to release.
+
+### Motion
+
+An assembly render shows **one pose**. The mechanism was designed for a range,
+and every interesting failure lives at an angle nobody screenshotted. Do not
+describe how a mechanism moves from a picture of it standing still.
+
+`freecad_motion` drives a native Assembly (FreeCAD 1.0+) and watches:
+
+- `{mode: "check"}` — what is grounded, what reaches ground through joints,
+  and **mobility measured against a Kutzbach-Grübler count of the same joint
+  list**. Two numbers from two methods; `mobility.mismatch` means redundant
+  constraints, which the solver absorbs silently while the geometry is exactly
+  aligned and which bind on the real machine as soon as it is not.
+- `{mode: "joints"}` — what each joint is and which of its properties this
+  build lets you drive. Nothing is guessed: driving the wrong property moves
+  the mechanism somewhere real and reports success.
+- `{mode: "sweep", joint: "Joint", from: 0, to: 90, steps: 24}` — every pose,
+  checked for solve failure, for **lock** (the driving value changed and
+  nothing moved — a toggle or a dead point, reported as success by the
+  solver), for **branch flip** (the solver walked onto the linkage's other
+  assembly configuration; every pose satisfies every constraint and the
+  physical mechanism would have to come apart to get there, so the far side is
+  not reachable travel), and for **self-interference**.
+- `{mode: "torque", ...}` — the sweep plus the gravity torque needed to
+  **hold** each pose, by virtual work over measured centres of mass.
+
+Read `collides`, `branchFlip`, `sweepIncomplete` and `lockedNote` before
+anything else, and treat `interference.checked: false` or
+`interferenceIncomplete` as _nothing was looked at_ rather than as clear. A
+collision narrower than one step is a collision this does not see, so sweep a
+tight range finely rather than the whole range coarsely.
+
+Two boundaries. The torque is **quasi-static and gravity only** — no inertia,
+friction, bearing drag, spring, backlash or payload beyond the masses listed,
+and it is refused outright if any moving part has no density, because a sum
+that silently drops a link is smooth, plausible and wrong. And this **drives
+an assembly; it does not author one.** A joint is made by clicking the two
+features that mate — that is the human's job in the window they are already
+looking at, and inventing which geometry it attaches to from this side is
+exactly the kind of guess the rest of this file exists to prevent.
+
 ### Strength
 
 `freecad_dfm` and `freecad_cam` answer whether the shape can be made. Neither
@@ -1134,7 +1255,10 @@ Say it plainly rather than improvising a substitute:
   discrete positions and measure at each one, and that is a legitimate check —
   but it samples a continuum, and the true minimum can fall between samples.
   Say which angles you sampled.
-- **Drawings and dimensioned output.** No TechDraw.
+- **GD&T, datums, surface finish and tolerance callouts.** `freecad_draw`
+  makes a dimensioned sheet and checks the dimensions against the model; it
+  does not create or verify a feature control frame, a datum reference frame
+  or a finish symbol, and a drawing without those is not a released drawing.
 - **Material-removal simulation.** `freecad_cam` proves a toolpath exists and
   measures it; it does not sweep the tool through the stock and compare the
   result with the model. Leftover material between passes, a stepover that
@@ -1154,6 +1278,10 @@ Say it plainly rather than improvising a substitute:
   printed part's layer adhesion and a welded or bolted joint are all outside
   it. It does not know your service load, your shock case or your safety
   factor policy, and it certifies nothing.
+- **Dynamics.** `freecad_motion` has no time in it: no inertia, no contact, no
+  friction, no impact, no compliance, no backlash, no control loop. It answers
+  where a mechanism can go and what holds it there, not what happens when
+  something hits it.
 - **Threads as geometry**, and sheet metal.
 - **An ellipse sketch primitive**, and a mirrored _feature_ (`mirror` is a whole
   solid).
