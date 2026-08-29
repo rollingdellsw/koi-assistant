@@ -11,7 +11,7 @@ Instead of running scripts blindly against a headless kernel, this skill connect
 
 A wrong turn costs one turn: if a feature isn't what you intended, adjust it immediately in place rather than starting a script from scratch.
 
-[![Watch a 30s demo](./docs/demo.png)](https://www.youtube.com/watch?v=4SxjvQZKdXU)
+[![Click to watch a 50s demo](./docs/freecad-jet-fan.png)](https://youtu.be/x_JI_yhrWeM)
 
 ---
 
@@ -697,7 +697,7 @@ Make sure your change does not break the existing test suites.
 
 ### End-to-end test prompts
 
-Five sessions, not five scripts. Paste one into the freecad-live skill's
+Six sessions, not six scripts. Paste one into the freecad-live skill's
 **Additional Instructions (Optional)** box and press Run Skill with the stream
 open in another tab — these are written to be **watched**, and each one has at
 least one **HAND THE MOUSE OVER** beat where the agent must stop and wait for you
@@ -710,25 +710,177 @@ Between them they exercise every tool the skill ships.
 
 | #   | Part         | Exercises                                                                                     | You do                                         |
 | :-- | :----------- | :-------------------------------------------------------------------------------------------- | :--------------------------------------------- |
-| 1   | MTB stem     | sketch, params, `split_body`, fasteners, `freecad_dfm`, `freecad_cam`, `freecad_draw`         | pick the chamfer edges; read the sheet         |
-| 2   | NEMA housing | catalog parts, `bind`, swap propagation, `bom`, DFM before/after                              | pick the mating face; delete a feature it made |
-| 3   | Drone arm    | `loft`, `subtractive_pipe`, `draft`, `shell`, `deepLint`, `freecad_fem`                       | pick the fixed face and the loaded face        |
-| 4   | Crank-rocker | `freecad_motion` — mobility, sweep, branch flip, holding torque                               | **build the Assembly joints yourself**         |
-| 5   | Roundtrip    | `save` / `open_document` / `import_geometry` / `freecad_export`, id durability, the guardrail | delete an AI object mid-session                |
+| 1   | GEnx fan     | raw OCC via `freecad_script`, waisted loft, 18-blade array, a GUI macro the agent writes      | watch it spin; nothing to click                |
+| 2   | MTB stem     | sketch, params, `split_body`, fasteners, `freecad_dfm`, `freecad_cam`, `freecad_draw`         | pick the chamfer edges; read the sheet         |
+| 3   | NEMA housing | catalog parts, `bind`, swap propagation, `bom`, DFM before/after                              | pick the mating face; delete a feature it made |
+| 4   | Drone arm    | `loft`, `subtractive_pipe`, `draft`, `shell`, `deepLint`, `freecad_fem`                       | pick the fixed face and the loaded face        |
+| 5   | Crank-rocker | `freecad_motion` — mobility, sweep, branch flip, holding torque                               | **build the Assembly joints yourself**         |
+| 6   | Roundtrip    | `save` / `open_document` / `import_geometry` / `freecad_export`, id durability, the guardrail | delete an AI object mid-session                |
 
-Prompt 3's solve needs gmsh and CalculiX (see "Optional: gmsh and CalculiX for
-FEM"); it reports `binaries` and skips cleanly if they are absent. Prompt 4 needs
-the native Assembly workbench, FreeCAD 1.0+.
+Prompt 1 is the only one with no **HAND THE MOUSE OVER** beat — it is the
+showcase, and the thing it tests is what the agent does when PartDesign is the
+wrong tool and it has to drop to raw OpenCASCADE. Prompt 4's solve needs gmsh and
+CalculiX (see "Optional: gmsh and CalculiX for FEM"); it reports `binaries` and
+skips cleanly if they are absent. Prompt 5 needs the native Assembly workbench,
+FreeCAD 1.0+.
 
 ---
 
-#### Prompt 1 — MTB stem: sketching, parameters, fasteners, and the handover sheet
+#### Prompt 1 — GEnx-1B fan rotor: raw OpenCASCADE, and a macro that spins it
+
+**Focus**: _When PartDesign is the wrong tool. A waisted loft it refuses, an
+18-blade array, verification that pixels cannot give, and a GUI macro the agent
+writes, tests and hardens against the crash the last one caused._
+
+This is the showcase. It has no **HAND THE MOUSE OVER** beat: the point is what
+the agent does when the parametric workbench cannot express the shape, and
+whether it verifies by measuring or by looking.
+
+The last third is the interesting part. A spin macro is a `QTimer` writing to
+document objects from the GUI thread, outside the transaction envelope — the one
+place in this skill where the agent can author code that outlives its own turn
+and crash FreeCAD minutes later. Getting it right needs API probing, a live
+test, and a deliberate attempt to break it.
+
+```markdown
+Build a General Electric GEnx-1B fan rotor in FreeCAD (18-blade fan, Boeing 787),
+then write me a macro that spins it.
+
+Published spec (Wikipedia, the only real numbers):
+
+- Fan diameter 2822 mm (111.1 in) — GEnx-1B. The 747-8's GEnx-2B is 2660 mm.
+- 18 swept composite blades, composite fan case, steel alloy leading edges
+
+Everything else — aerofoil sections, twist, sweep, chord — is proprietary and
+unpublished. State that once, then build a representative wide-chord swept fan
+blade at the correct published envelope. Do not present it as the real GEnx
+aerofoil.
+
+### Build method — raw OpenCASCADE, not PartDesign
+
+Use `Part.makeLoft`, `Part.Face(...).revolve`, `.cut`, `.fuse` via
+`freecad_script`. PartDesign cannot express this part, and the failures are
+silent rather than loud:
+
+- `AdditiveLoft` REFUSES a non-monotonic (waisted) section stack, and a dovetail
+  root is waisted by definition — wide, narrow, wide. That is what retains the
+  blade against centrifugal load.
+- Splitting it into two lofts to dodge that recomputes `Up-to-date` while
+  collapsing the blade to ZERO volume. Lint catches it as `added-nothing`; a
+  screenshot does not.
+- Closed periodic B-splines will not loft across many sections
+  (`BRep_API: command not done`) because the seam vertex drifts. Build each
+  section NON-periodic, ordered trailing edge -> upper -> LE -> lower, with the
+  last point set exactly equal to the first.
+- `Part.Face` raises `Standard_ConstructionError` if a spline profile touches the
+  revolve axis at r=0. Use a polygon profile for the spinner.
+
+Register every real part with `koi.register(doc, "blade.master", obj)` — a
+script-created object with no id cannot be edited by a later turn.
+
+### Build
+
+1. Document `GEnx_Fan_v2`.
+2. Blade, one script: 14 sections r=405 -> 1411 mm, NACA 4-digit camber +
+   thickness, 44 points, cosine spacing. Chord `300 + 140f - 40f²`; t/c
+   `0.135(1-f)^1.35 + 0.022`; camber `0.060(1-f)^1.6 + 0.008`; max camber at
+   `0.42 + 0.10f`; stagger `24° + 40f^0.85`. Swept stacking line
+   `x = 150f² - 320f^2.6`, `y = 70f³`, stacked at 30% chord.
+   Waisted dovetail, rectangles at 24°, length 300, centre x=-30:
+   `64 @ r=270 -> 84 @ r=295 -> 54 @ r=335 -> 58 @ r=395`.
+   Platform 118 wide. Fuse, `removeSplitter()`, then TRIM the tips with
+   `Part.makeCylinder` along +X and `.common()` — without the trim the swept
+   diameter comes out ~2894 mm, not 2822.
+3. Disc: axisymmetric polygon revolved 360° about X, rim outer r=268, bore
+   r=150. Cut 18 slots from one dovetail-shaped cutter +0.4 mm clearance,
+   rotated 20° per slot in a bounded loop.
+4. Array: 18 `App::Link` copies, `App.Rotation(App.Vector(1,0,0), i*20°)`. Hide
+   the master, group them. The engine axis is X; Z is radial.
+5. Spinner: polygon profile revolved about X, faired into the disc hub.
+
+### Check these BEFORE committing to geometry, not after
+
+- **Tangential pitch at every section radius.** Available pitch is `2πr/18`. A
+  platform 120 mm wide where only 118.7 mm exists overlaps all 18 neighbours —
+  and a single blade cannot reveal it. Only the array can.
+- **That the dovetail narrows outward.** An inverted wedge retains nothing.
+- **That the disc rim is deep enough for the slots** before revolving it.
+
+### Verify — geometry, never pixels
+
+`freecad_measure({partsOnly: true, interference: true})`, plus `distToShape` and
+`common().Volume` per adjacent pair in a bounded loop. A plate with a hole and a
+plate without one render identically. Report what you measured, not what you
+expected to measure — if a number disagrees with the target, say so and say why
+rather than restating the target.
+
+Expected: swept diameter 2822.0 mm exactly; blade-to-blade gap ~9.1 mm;
+blade/disc/spinner interference 0 / 0 / 0. Masses are volume × density on solid
+bodies — real fan blades are hollow composite with titanium LE sheaths, so quote
+them as upper bounds. `material` names come from the built-in table:
+`titanium-grade5` is refused, it is `titanium-6al4v`.
+
+### Then: the showcase macro
+
+Write me a macro I can click to spin the rotor — and make the camera orbit it in
+3D at the same time, so it shows the fan off from a changing angle rather than
+one fixed view. Toggle: click to start, click again to stop.
+
+This is a `QTimer` mutating document objects from the GUI thread, OUTSIDE the
+transaction envelope. Nothing in this skill can protect you there, so:
+
+- **Probe the API before you write against it.** `getCameraNode()` raises
+  `RuntimeError: No SWIG wrapped library loaded` on a build without pivy. Find
+  out which camera calls exist on THIS build first — `setCameraOrientation` and
+  `getCamera`/`setCamera` need no SWIG.
+- **Never cache a C++ object pointer across frames.** Re-resolve every object BY
+  NAME inside the tick. A cached proxy whose object is deleted underneath it is
+  a null dereference, and it segfaults FreeCAD — SIGSEGV, `mov rax,[r13+0x0]`
+  with `r13 = 0`, the whole process and the bridge with it.
+- **Wrap the tick body in try/except that STOPS the timer.** Qt swallows
+  exceptions from a timer callback and keeps firing, so an error becomes an
+  infinite loop into freed memory rather than a traceback.
+- Add a `DocumentObserver` that stops the spin if the document closes, and
+  restore both the placements and the camera on stop.
+
+Then TEST it, live, and show me the results:
+
+1. Start it, let the timer actually fire, confirm the rotor angle AND the camera
+   both progressed. Assert nothing you did not measure.
+2. Toggle it off; confirm all placements and the full camera state are restored
+   exactly. Capturing the camera AFTER a `fitAll()` restores orientation but not
+   framing — check the numbers, do not assume.
+3. **Delete an object out from under the running timer.** That is the exact
+   operation that segfaults a naive implementation. FreeCAD must survive it, the
+   timer must skip the missing object and keep running. Rebuild what you deleted
+   afterwards and verify the count.
+
+Tell me plainly that I should stop the spin before asking for geometry changes:
+the hardening stops it crashing, but a timer writing placements while the bridge
+runs transactions on the same objects is still a race the envelope cannot see.
+```
+
+**What it is really testing**: whether the agent measures or looks. Every failure
+mode above is invisible in a render — the zero-volume loft, the overlapping
+platform, the inverted dovetail, the untrimmed tip that is 72 mm too big. And the
+macro section tests something no other prompt does: code the agent writes that
+keeps running after the turn ends, on the thread that owns the document.
+
+**Known limits it should state rather than paper over**: not the real GEnx
+aerofoil; masses are upper bounds on solid bodies; no root fillets, retention
+hardware, annulus fillers, balance lands or bolt flange; `freecad_dfm` is
+meaningless on a composite blade that is laid up rather than milled — though the
+titanium disc is a real machined part and worth checking.
+
+---
+
+#### Prompt 2 — MTB stem: sketching, parameters, fasteners, and the handover sheet
 
 **Focus**: _Parametric sketching, `split_body`, `fastener_pattern`, a user-picked
 reference, manufacturability against a real cutter, a real toolpath, and the 2D
 drawing the part is actually made from._
 
-This is the part in the demo video.
+[![Watch the live recording](./docs/demo.png)](https://www.youtube.com/watch?v=4SxjvQZKdXU)
 
 ```markdown
 Design a 2-piece CNC MTB stem (Atomlab direct/threadless style) in FreeCAD.
@@ -802,7 +954,7 @@ H. Material & Verification:
 
 ---
 
-#### Prompt 2 — NEMA housing + associative cover: multi-body parametric drive and enclosure
+#### Prompt 3 — NEMA housing + associative cover: multi-body parametric drive and enclosure
 
 **Focus**: _Catalog components, parametric swap propagation, cross-body
 SubShapeBinder (`bind`), multi-body BOM, manufacturability across a parametric
@@ -865,13 +1017,18 @@ Validate parametric swap propagation, cross-body SubShapeBinder associativity, O
 
 ---
 
-#### Prompt 3 — Drone arm: lofts, sweeps, shell, draft, and a real stress number
+#### Prompt 4 — Drone arm: lofts, sweeps, shell, draft, and a real stress number
 
 **Focus**: _Advanced 3D modelling (`loft`, `pipe`, `shell`, `draft`), sliver-face
 linting, knowing when a manufacturability check is the wrong question, and a
 linear static solve that has to refuse rather than reassure._
 
 The FEM function depends on gmsh and ccx to run, [install them](#optional-gmsh-and-calculix-for-fem) to the FreeCAD container first.
+<div align="center">
+  <img src="./docs/fem.png" width="100%" alt="Drone ARM FEM">
+  <br>
+</div>
+
 
 ```markdown
 Design a lightweight drone motor arm with an internal wire conduit and mould
@@ -990,7 +1147,7 @@ id:"load.motor"}` — 25 N is roughly a 2.5 kg thrust unit at the tip.
 
 ---
 
-#### Prompt 4 — Crank-rocker: the mechanism, driven
+#### Prompt 5 — Crank-rocker: the mechanism, driven
 
 **Focus**: _`freecad_motion` end to end — grounding and mobility, joint
 discovery, a swept range with lock and branch-flip detection, self-interference
@@ -1070,7 +1227,7 @@ ordinary; the verification half is the point.
 
 ---
 
-#### Prompt 5 — Roundtrip: ids that outlive the file, and a guardrail that means it
+#### Prompt 6 — Roundtrip: ids that outlive the file, and a guardrail that means it
 
 **Focus**: _`open_document`, `save`, `import_geometry`, `freecad_export`, koi-id
 persistence across a save/reopen boundary, which checks survive the loss of the
