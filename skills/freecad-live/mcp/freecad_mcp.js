@@ -3179,7 +3179,14 @@ EXTERNAL_GEOID_BASE = -3
 
 def _ext_count(sk):
     try:
-        return len(list(getattr(sk, "ExternalGeometry", []) or []))
+        eg = getattr(sk, "ExternalGeometry", []) or []
+        count = 0
+        for item in eg:
+            if isinstance(item, (tuple, list)) and len(item) >= 2 and isinstance(item[1], (tuple, list)):
+                count += len(item[1])
+            else:
+                count += 1
+        return count
     except Exception:
         return 0
 
@@ -3657,8 +3664,7 @@ def _op_sketch_get(doc, args, kid):
     out = {"name": sk.Name, "label": sk.Label,
            "geometry": _sk_geometry_rows(sk),
            "constraints": _sk_constraint_rows(sk),
-           "external": int(getattr(sk, "ExternalGeometry", None) is not None
-                           and len(sk.ExternalGeometry) or 0),
+           "external": _ext_count(sk),
            "conflicts": [int(x) for x in
                          (getattr(sk, "ConflictingConstraints", None) or [])],
            "redundancies": [int(x) for x in
@@ -10432,7 +10438,7 @@ def _pick_instance(circles, args, what):
         % (what, len(circles), [c["at"] for c in circles]))
 
 
-def _hole_axis_circles(doc, hole):
+def _hole_axis_circles(doc, hole, seat_on="outerFace"):
     """(outward axis, every hole instance, source) for a hole feature.
 
     Lifted out of _mate_frame because it was already computing all of this
@@ -10458,7 +10464,34 @@ def _hole_axis_circles(doc, hole):
     # fitted to the un-flipped answer points into thin air.
     if bool(getattr(feat, "Reversed", False)):
         n = n.negative()
-    return _unit(n), circles, "sketch:" + sk.Name
+    n = _unit(n)
+
+    # When seat_on != "sketch", project the seating coordinates onto the solid's
+    # outer entry boundary if the profile sketch stands off or is on an origin plane.
+    if str(seat_on).lower() != "sketch":
+        lump = _cut_lump(feat) if feat is not sk else None
+        if lump is not None and not lump.isNull():
+            import Part
+            nv = App.Vector(*n)
+            adjusted = []
+            for c in circles:
+                p0 = App.Vector(*c["at"])
+                p1 = p0 + nv * 5000.0
+                p2 = p0 - nv * 5000.0
+                try:
+                    seg = Part.makeLine(p1, p2)
+                    inter = lump.common(seg)
+                    if not inter.isNull() and inter.Vertexes:
+                        dots = [(v.Point, (v.Point - p0).dot(nv)) for v in inter.Vertexes]
+                        best_v, _ = max(dots, key=lambda x: x[1])
+                        adjusted.append({"at": _vec3(best_v), "d": c["d"]})
+                    else:
+                        adjusted.append(c)
+                except Exception:
+                    adjusted.append(c)
+            circles = adjusted
+
+    return n, circles, "sketch:" + sk.Name
 
 
 def _mate_frame(doc, args):
@@ -10477,7 +10510,7 @@ def _mate_frame(doc, args):
             "mate needs hole=<id of a hole, pocket or its profile sketch> or "
             "ref=<a cylindrical face the user picked>")
     if hole:
-        axis, circles, source = _hole_axis_circles(doc, hole)
+        axis, circles, source = _hole_axis_circles(doc, hole, args.get("seatOn", "outerFace"))
         chosen, others = _pick_instance(circles, args, source.split(":")[-1])
         return {"axis": axis, "at": chosen["at"], "d": chosen["d"],
                 "source": source, "others": others,
@@ -10637,7 +10670,7 @@ def _op_fastener_pattern(doc, args, kid):
     """
     size = str(_need(args, "fastener"))
     length = float(_num(args, "length", 16.0))
-    axis, circles, source = _hole_axis_circles(doc, _need(args, "hole"))
+    axis, circles, source = _hole_axis_circles(doc, _need(args, "hole"), args.get("seatOn", "outerFace"))
     if len(circles) > FASTENER_PATTERN_LIMIT:
         raise KoiOpError(
             "%s has %d instances, over the %d-fastener bound for one call; "
@@ -17971,7 +18004,7 @@ const OP_SPECS = {
       "pattern rather than one of them.",
     props: { hole: "string", fastener: "string", length: "number",
              offset: "number", spin: "number", flip: "boolean",
-             label: "string" },
+             label: "string", seatOn: "string" },
     required: ["hole", "fastener"],
   },
   mate: {
@@ -17988,7 +18021,7 @@ const OP_SPECS = {
       "bolt where it was. A hole with several instances refuses until near " +
       "says which one.",
     props: { target: "string", hole: "string", ref: "string", near: "array",
-             offset: "number", spin: "number", flip: "boolean" },
+             offset: "number", spin: "number", flip: "boolean", seatOn: "string" },
     required: ["target"],
   },
   split_body: {

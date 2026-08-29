@@ -309,6 +309,45 @@ return {"ok": True, "type": b.TypeId, "label": b.Label,
   }
 
   // ======================================================================
+  console.log("\n--- Section 2b: multi-edge projection from a single binder (FreeCAD 1.1 grouped tuple test) ---");
+
+  // FreeCAD 1.1 groups external edges on the same object under a single tuple
+  // [(obj, ('Edge1', 'Edge2', ...))]. _ext_count and _add_externals must count
+  // each sub-element so multi-edge projections assign successive GeoIds (-3, -4, ...).
+  const MULTI_Q = {
+    of: "bind.housing", kind: "edge", surface: "Line",
+    expect: "many",
+  };
+  const qMulti = await call("query", MULTI_Q, null);
+  assert("query matches multiple edges on binder",
+    (qMulti.result || {}).matched >= 4, JSON.stringify(qMulti.result));
+
+  const multiCover = await call("sketch", {
+    body: "body.cover", on: "XY", query: MULTI_Q,
+    geometry: [{ type: "circle", x: 0, y: 0, r: 1 }],
+  }, "sk.multi_cover");
+  const okMulti = assert("sketch with multi-edge projection applies without KoiOpError",
+    multiCover && multiCover.ok === true, JSON.stringify(multiCover && multiCover.error));
+
+  if (okMulti) {
+    const mcr = multiCover.result || {};
+    assert("multi-edge projection returns all projected elements",
+      Array.isArray(mcr.external) && mcr.external.length >= 4,
+      JSON.stringify(mcr.external));
+    assert("multi-edge projections get sequential geoIds -3, -4, -5, -6",
+      ((mcr.external || [])[0] || {}).geoId === -3 &&
+      ((mcr.external || [])[1] || {}).geoId === -4 &&
+      ((mcr.external || [])[2] || {}).geoId === -5 &&
+      ((mcr.external || [])[3] || {}).geoId === -6,
+      JSON.stringify(mcr.external));
+
+    const skGet = await call("sketch_get", { target: "sk.multi_cover" });
+    assert("sketch_get reports exact total external count",
+      (skGet.result || {}).external >= 4,
+      JSON.stringify(skGet.result));
+  }
+
+  // ======================================================================
   console.log("\n--- Section 3: a constraint AGAINST the projection ---");
 
   // The assertion the feature exists for. The cover's width is written

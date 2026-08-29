@@ -6,6 +6,7 @@ Instead of running scripts blindly against a headless kernel, this skill connect
 
 - **One process, one document, one undo stack.** The bridge runs directly inside FreeCAD's GUI process. The AI edits through FreeCAD's Python interface while you interact through the 3D GUI on the exact same document.
 - **Take the mouse at any moment.** Orbit, tweak a sketch, or delete an AI-generated feature. The agent syncs changes every turn and respects your manual edits rather than rebuilding over them.
+- **Shared visual canvas** Use the [visual workspace](./docs/visual-interaction.png) feature of Koi™ Assistant, freely select any content from FreeCAD GUI to interact with AI.
 - **Shared assistant context.** As a native Koi™ Assistant skill, the AI can query your design specifications, component catalogs, documents, or databases alongside the active CAD workflow.
 
 A wrong turn costs one turn: if a feature isn't what you intended, adjust it immediately in place rather than starting a script from scratch.
@@ -732,112 +733,71 @@ This is the part in the demo video.
 ```markdown
 Design a 2-piece CNC MTB stem (Atomlab direct/threadless style) in FreeCAD.
 
-Open with your attach status line, then start. Batch what is already decided;
-stop the batch wherever the next step depends on a measurement.
+Open with your attach status line, then start.
 
-### Parameters — create these FIRST, bind everything to them
+### Parameters — create these FIRST and bind everything to them:
 
-Reach=45mm, StackHeight=40mm, HandlebarDia=31.8mm, SteererDia=28.6mm,
-BodyWidth=48mm, PinchGap=2mm, FluteDepth=3.5mm.
-Set each with `fn:"param"` and quote the value the sheet reads BACK.
+- Reach = 45mm
+- StackHeight = 50mm <-- [Increased from 40mm to clear Ø31.8mm bore + M5 counterbores]
+- HandlebarDia = 31.8mm
+- SteererDia = 28.6mm
+- BodyWidth = 48mm
+- PinchGap = 2mm
+- FluteDepth = 3.5mm
+- FacePitchY = 32mm <-- [Horizontal bolt spacing across faceplate]
+- FacePitchZ = 40mm <-- [Vertical bolt spacing derived: 31.8 + 5.5 + 2*1.35 = 40mm]
 
-### Build sequence
+### Virtual Tubes (Continuous Clearance Verification):
+
+Immediately after creating the steerer bore and handlebar bore:
+
+1. Create `gauge.steerer` (cylinder Ø`SteererDia`, length 120mm) along Z at origin.
+2. Create `gauge.handlebar` (cylinder Ø`HandlebarDia`, length 120mm) along Y at x=`Reach`.
+3. Keep these active in the tree (or declare allowances) and verify after creating ANY fastener or pocket that interference with both gauges remains exactly 0.000 mm³.
+
+### Build Sequence:
 
 A. `new_document` (id `doc.stem`), then `body` (id `body.stem`).
-Sketch `sk.base_profile` on XY: use `rect` with `anchor:"center"`. Bind w/h
-to the parameters as expression strings. `pad.base` length
-`"koi_params.StackHeight"`, symmetric.
-B. `sk.steerer_bore` (circle d `"koi_params.SteererDia"` at origin) →
-`pocket.steerer_bore` `through:true`. Report whether the reply says it was
-made symmetric and why.
-`sk.handlebar_bore` (circle d `"koi_params.HandlebarDia"` at
-x `"koi_params.Reach"`) on the appropriate plane → `pocket.handlebar_bore`
-`through:true`.
-C. Underside relief: `sk.bottom_cut` → `pocket.bottom_cut`. If the reply's
-`removed` is 0, log it and fix the profile — do not accept a clean recompute.
-D. Lightening flutes: `sk.side_flutes` using the `slot` primitive (NOT a
-computed polyline), TWO slots in ONE sketch, both bound to parameters.
-`pocket.side_flutes` depth `"koi_params.FluteDepth"`.
-NOTE: `fn:"mirror"` mirrors a whole solid, not a feature. If you believe you
-need a mirrored feature, log that as a capability gap rather than substituting
-`mirror` or `pattern` blindly.
+Sketch `sk.base_profile` on XY: `rect` anchor:"center", w="koi_params.Reach \* 2", h="koi_params.BodyWidth", x="koi_params.Reach / 2", y=0.
+`pad.base` length "koi_params.StackHeight", symmetric: true.
 
-E. Chamfer:
-Apply a 3 mm chamfer to the four top outer perimeter edges of the main body.
-Use a stored query (`fn: "chamfer"` with `query: {kind: "edge", surface: "Line", at: {z: 20}, expect: "many"}`, `size: 3`, `id: "chamfer.top"`)
-rather than hardcoded topological edge indices or manual selection, ensuring the feature self-heals across downstream body splits and parameter changes.
+B. Bores & Early Clearance:
 
-F. Faceplate separation: `split_body` on `body.stem`, plane through the
-handlebar clamp, `gap:"koi_params.PinchGap"`, `ids:["part.body","part.face"]`.
-Read `sides.positive` / `sides.negative` — do not assume `ids[0]`.
-Report `asBodies`, and report whether the chamfer from step E survived, was
-`rehealed`, or aborted the write.
-G. Steerer pinch slot: rear cut of width `"koi_params.PinchGap"` into the
-steerer bore.
-H. Fasteners:
+- `sk.steerer_bore` (circle d "koi_params.SteererDia" at origin) -> `pocket.steerer_bore` through:true.
+- `sk.handlebar_bore` (circle d "koi_params.HandlebarDia" at x "koi_params.Reach" on XZ) -> `pocket.handlebar_bore` through:true.
 
-- `sk.face_holes` — 4 circles, 32x32 pitch, bound to parameters.
-- `hole` id `hole.face_bolts`, `counterbore:"M5"`, `spec:{clearance:"M5"}`.
-  Quote the readback diameter and the counterbore depth.
-- `fastener_pattern({hole:"hole.face_bolts", fastener:"M5", length:16})` —
-  ONE call for all four. Do not use four `insert`+`mate` pairs.
-- Same for the 2 steerer pinch bolts (M5x18).
+C. Underside relief & Lightening:
 
-I. `material` — assign `aluminium-6061` to both bodies.
+- `sk.bottom_cut` on XZ -> `pocket.bottom_cut` through:true (verify removed > 0).
+- `sk.side_flutes` on XY using TWO `slot` primitives -> `pocket.side_flutes` depth "koi_params.FluteDepth".
 
-### Acceptance — all of these must be measured, not asserted
+D. Top Chamfer:
 
-1. `measure_between` between the STEERER BORE AXIS and the HANDLEBAR BORE AXIS.
-   Get those refs from `fn:"query"` (`{kind:"face", surface:"Cylinder", radius:...}`)
-   — do NOT pass the pocket feature ids, which resolve to the whole body shape.
-   Expect 45.000 mm.
-2. `freecad_measure({interference:true, clearance:true, partsOnly:true})`.
-   Expect 0 mm³ interference and the faceplate/pinch gaps at 2.0 mm.
-3. `freecad_measure({deepLint:true})`. If sliver faces are reported, try
-   `recompute({refine:true})` and report the volume before/after.
-4. `bom` — expect TWO fastener LINES (one of 4, one of 2), not six line items,
-   plus two fabricated bodies WITH mass. A body reporting no mass is a defect.
-5. `view_section({plane:"XZ", offset:0})` then `freecad_render({view:"iso"})`
-   and one section render. Then turn the clip OFF and `view_restore`.
-   Confirm `drawn` per target; if anything is in `notDrawn`, say so instead of
-   describing the model. Leaving my view clipped or my model isolated is a
-   defect even if the geometry is perfect.
-6. `freecad_dfm({targets:["part.body","part.face"], process:"mill3axis", tool:6})`.
-   This is a CNC part and the design has to survive a cutter, not just a
-   recompute. You should be able to predict two of the findings before you read
-   the reply: `PinchGap` is 2 mm, and a 2 mm slot admits a 2 mm cutter and
-   nothing wider; `FluteDepth` is 3.5 mm. Quote `manufacturable`, the residual
-   `method`, and `maxToolDiameter` per body.
-   If it comes back `obstructed`, name the FEATURE and say what dimension would
-   clear it. Do not quietly shrink the `tool` argument until the check passes —
-   that is fitting the test to the answer. Then re-run at `tool:2` and report
-   what changed and what it costs (a 2 mm cutter in aluminium is a different
-   machining plan, not a smaller number).
-7. `freecad_cam({mode:"job", target:"part.face", id:"cam.face"})`, then
-   `{mode:"op", job:"cam.face", op:"profile", id:"camop.face_profile"}`, then
-   `{mode:"verify", job:"cam.face"}`. Quote `api` — which spelling of the CAM
-   modules this build actually has — and the command count. An operation that
-   generated ZERO commands recomputes clean and looks like nothing on screen;
-   it is the workbench saying it could not cut that feature with that tool, so
-   report it as that rather than as a tool error.
-   Tell me BEFORE you start: toolpath generation runs in the geometry kernel and
-   my window will stop responding for the duration.
-   Finish with `{mode:"clear", job:"cam.face"}` and leave the tree the way you
-   found it.
-8. **The sheet.** `freecad_draw({mode:"templates"})` first — quote what this
-   install actually carries; do not name a template from memory.
-   `{mode:"page"}`, then three views of `part.face` (`front`, `top`, `iso`),
-   then at least four dimensions with `{mode:"dimension"}` whose `refs` come
-   from `query` or from a pick of mine — never an authored edge index.
-   Then `{mode:"check"}` and quote, one by one: `dimensionsDisagree`,
-   `projectionReferenced`, `emptyViews`, `templateMissing`, `mixedScales`,
-   `dimensionsUnchecked`. Say what each one means for the person who makes the
-   part from this sheet, not just whether it is set.
-   Then `{mode:"export", format:"pdf"}` and quote the path.
-   Finally: do NOT tell me the drawing is complete. Tell me what is missing —
-   the tool reports a dimension count and refuses that verdict on purpose, and
-   there is no GD&T, no datum frame, no surface finish and no tolerance on this
-   sheet at all.
+- `chamfer.top` (3mm) using stored query {kind:"edge", surface:"Line", at:{z:25}, expect:"many"}.
+
+E. Faceplate Separation:
+
+- `split_body` on `body.stem` at plane YZ, offset "koi_params.Reach", gap "koi_params.PinchGap", ids:["part.face", "part.body"].
+
+F. Steerer Pinch Slot:
+
+- Rear slot cut of width "koi_params.PinchGap" into the steerer bore.
+
+G. Fasteners:
+
+- `sk.face_holes` on faceplate front: 4 circles at Y = ±("koi_params.FacePitchY / 2"), Z = ±("koi_params.FacePitchZ / 2").
+- `hole.face_bolts`: counterbore:"M5", spec:{clearance:"M5"}, through:true.
+- `fastener_pattern`: 4× M5x16 bolts.
+- `sk.pinch_holes` on body side: 2 circles at X = -18mm, Z = ±10mm.
+- `hole.pinch_bolts`: counterbore:"M5", spec:{clearance:"M5"}, through:true.
+- `fastener_pattern`: 2× M5x18 pinch bolts.
+
+H. Material & Verification:
+
+- Assign `aluminium-6061` to both bodies.
+- Run `freecad_measure({interference:true, clearance:true, partsOnly:true})`.
+- Verify every gauge × fastener pair = 0.000 mm³.
+- Delete gauge cylinders, recompute, run `bom`, DFM, CAM, and 2D drawing export.
 ```
 
 ---
@@ -849,83 +809,58 @@ SubShapeBinder (`bind`), multi-body BOM, manufacturability across a parametric
 change, and what happens when the human rejects something._
 
 ```markdown
-Design a modular NEMA stepper reducer housing with an associatively-bound cover
-plate. The real test here is PARAMETRIC SWAP PROPAGATION.
+# Goal: Modular NEMA Stepper Reducer Housing with Associative Cover Plate
 
-### Build
+Validate parametric swap propagation, cross-body SubShapeBinder associativity, OCC DFM analysis, and human-in-the-loop co-design.
 
-1. `new_document` (`doc.geardrive`). `insert({catalog:"NEMA17_envelope"})` as
-   `motor.nema`. Then `lookup({what:"params"})` and QUOTE exactly which aliases
-   the motor published. You will need this in step 3.
-2. `body.housing`: `sk.housing_profile` (80x80 rect, `anchor:"center"`) →
-   `pad.housing` 50 mm. Pocket the gearbox cavity (`cut.cavity`, 40 mm).
-   `material` = `aluminium-6061`.
-3. `bolt_sketch({component:"motor.nema", on:"XY", id:"sk.motor_mount"})` — this
-   is the call that binds hole POSITIONS to the motor's published pitch by
-   expression. Check `bindingVerified` in the reply. If it is false, the
-   positions are literals, the swap in step 5 will not move them, and you must
-   say so rather than reporting a parametric pattern.
-   Then `hole({sketch:"sk.motor_mount", id:"hole.motor_mount"})` with NO
-   `spec` and NO `diameter` — the size comes from the profile circles
-   (`diameterFrom` in the reply). Quote it.
+### Phase 1: Base Housing & Catalog Interface
 
-4. Cover plate, associative. **HAND THE MOUSE OVER for the mating face.**
-   - First do it the machine way: `query({of:"pad.housing", kind:"face",
-normal:"+Z"})`. Report how many matched and whether it is `ambiguous`.
-   - Then STOP and ask me to click the face you believe you found. Wait.
-     `freecad_sync()`, read `selection`, capture it with
-     `fn:"ref"` as `pick.rim`, and tell me whether my pick and your query
-     resolved to the SAME element. If they did not, my pick wins and you say so.
-   - `body.cover`, then `bind({body:"body.cover", of:"pick.rim",
-id:"bind.housing_rim"})`.
-   - `sketch({on:"bind.housing_rim", query:{...}})` projecting the rim edges,
-     then constrain to the PROJECTION — a literal `w:80` here defeats the test.
-     Report the `geoId` per projection (external geometry starts at -3) and the
-     constraint count.
-   - `pad.cover` 6 mm. `fastener_pattern` for 4x M4x16.
+1. **New Document & Motor:** Create `doc.geardrive`. Insert `catalog:"NEMA17_envelope"` as `motor.nema`. Quote the published parameter aliases from `lookup({what:"params"})`.
+2. **Housing Body (`body.housing`):**
+   - Sketch centered 80x80 mm rectangle on `XY` (`sk.housing_profile`) → pad 50 mm (`pad.housing`).
+   - Create 60x60 mm centered cavity sketch (`sk.cavity`) on top face datum → pocket 40 mm (`cut.cavity`).
+   - Set material `aluminium-6061`.
+3. **Pre-Swap DFM & In-Place Fillet Fix:**
+   - Run `freecad_dfm({targets:["body.housing"], tool:6})` to detect sharp corners (`dfm-sharp-corner`).
+   - Add parameter `CornerR = 5` and use `sketch_edit` on `sk.cavity` to add 4 corner arcs bound to `koi_params.CornerR` (`dof:0`). Re-verify DFM (`sharpCount: 0`, residual $0\text{ mm}^3$).
+4. **Motor Mount Pattern:**
+   - Create `bolt_sketch({component:"motor.nema", on:"XY", id:"sk.motor_mount"})`. Verify `bindingVerified: true`.
+   - Cut through-holes with `hole({sketch:"sk.motor_mount", id:"hole.motor_mount"})`. Quote `diameterFrom`.
 
-5. **THE TEST — swap and verify propagation:**
-   - First `dryRun:true`: `swap({target:"motor.nema", catalog:"NEMA23_envelope"})`
-     with `dryRun`. Report the full blast radius from `report` — which objects
-     moved and by how much. "N objects changed" is not an answer, and no
-     engineer accepts a parametric change from an AI without one.
-   - Then apply it for real.
-   - `measure_between` on two diagonal mounting holes' cylindrical faces
-     (via `query`), BEFORE and AFTER. Expected pitch 31.0 mm → 47.14 mm.
-     If the pitch did not move, the binding was a literal — log it as the
-     primary defect of this test.
-   - `freecad_resolve()` — did `pick.rim` survive the swap? `stored`,
-     `rederived`, `broken` or `ambiguous`, and what each one obliges you to do.
-     `rederived` is not "fine".
-   - Check `rehealedExternal` on the cover sketch. If constraints were lost,
-     the cover is now the wrong shape even though it recomputed clean.
-     Say so explicitly.
+### Phase 2: Interactive Handover & Associative Cover
 
-6. **HAND THE MOUSE OVER — the rejection.** STOP. I am going to delete one of
-   the objects you made, in the GUI, while you wait. When I say go,
-   `freecad_sync()` and read `userDiff`.
-   Name what is in `revertedAiObjects`. That is a rejection, not a glitch: do
-   NOT re-create it, do not "restore" it, and do not carry on as though the
-   design still has it. Ask me what I want instead, and quote `dofChanges` if a
-   sketch came loose when it went.
+5. **Mating Face Disambiguation:**
+   - Query machine candidate: `query({of:"pad.housing", kind:"face", normal:"+Z"})`.
+   - STOP and request human to click top mating rim in GUI. Capture selection via `ref` as `pick.rim`. Verify agreement with query.
+6. **Associative Cover Plate (`body.cover`):**
+   - Create `body.cover` and bind mating face via `bind({body:"body.cover", of:"pick.rim", id:"bind.housing_rim"})`.
+   - Create associative sketch `sk.cover_profile` on binder, project outer edges via query, and constrain profile to projections (`dof:0`, no hardcoded width).
+   - Pad 6 mm (`pad.cover`), set material `aluminium-6061`.
+   - Add 4x M4 counterbored corner holes (`hole.cover_bolts`) and seat 4x ISO 4762 M4x16 bolts via `fastener_pattern`.
 
-7. `freecad_measure({interference:true, partsOnly:true})` — motor envelope vs
-   housing must be 0 mm³, or `allow` it with a stated `why` and an `upTo`.
-8. `bom` with masses for both bodies plus the motor's catalog mass.
-9. `freecad_dfm({targets:["body.housing","body.cover"], tool:6})`, run BOTH
-   before and after the swap in step 5.
-   - Before: the gearbox cavity as specified is a rectangle, so expect
-     `dfm-sharp-corner`. A rotating cutter leaves its own radius; a square
-     internal corner is not a case for a smaller tool, it is a corner relief,
-     EDM, or a radius. Fix it the way the rest of this test is built — a new
-     `CornerR` parameter and `sketch_edit` on the cavity sketch to add fillets
-     bound to it. Do not delete and rebuild the sketch, and do not "fix" it by
-     changing `process`.
-   - After: say whether the swap changed the verdict. A NEMA23 bolt circle is
-     47.14 mm against 31.0 mm, so a mount hole may now sit close enough to a
-     cavity wall to matter. If it does, that is precisely the failure this whole
-     design exists to catch, and it has to be caught by the number rather than
-     by looking at the render — the render will look fine either way.
+### Phase 3: Parametric Swap Propagation (The Core Test)
+
+7. **Dry Run & Swap Execution:**
+   - Dry-run `swap({target:"motor.nema", catalog:"NEMA23_envelope", dryRun:true})`. Report blast radius (volume delta and modified parameters).
+   - Apply swap live.
+8. **Verification:**
+   - `measure_between` diagonal mount hole cylinders before vs after swap (verify pitch moved 31.0 mm → 47.14 mm).
+   - Verify `pick.rim` status via `freecad_resolve()` (`stored`).
+   - Confirm `rehealedExternal` on `sk.cover_profile` kept all constraints (`dof:0`).
+   - Run post-swap `freecad_dfm` to verify cavity clearance against the larger bolt circle.
+
+### Phase 4: Verification, BOM & Presentation
+
+9. **Interference & BOM:**
+   - Run `freecad_measure({interference:true, partsOnly:true})`. Apply `allow` for intentional overlaps (motor envelope in cavity, cover seated on rim, fasteners engaged).
+   - Run `bom` and quote total fabricated vs purchased mass.
+   - Render isometric viewport via `freecad_render`.
+
+### Phase 5: Human Rejection Handover
+
+10. **Rejection Handling:**
+    - STOP. Prompt human to delete any object in GUI tree.
+    - On reply "go", run `freecad_sync()`, report deleted items from `userDiff.revertedAiObjects`, check `dofChanges`, and ask for design redirection rather than re-creating it.
 ```
 
 ---
@@ -935,6 +870,8 @@ id:"bind.housing_rim"})`.
 **Focus**: _Advanced 3D modelling (`loft`, `pipe`, `shell`, `draft`), sliver-face
 linting, knowing when a manufacturability check is the wrong question, and a
 linear static solve that has to refuse rather than reassure._
+
+The FEM function depends on gmsh and ccx to run, [install them](#optional-gmsh-and-calculix-for-fem) to the FreeCAD container first.
 
 ```markdown
 Design a lightweight drone motor arm with an internal wire conduit and mould
@@ -1067,103 +1004,68 @@ interactive of the five — the middle of it is you, in the GUI, with the mouse.
 Design and then VERIFY a flange-mounted crank-rocker. The design half is
 ordinary; the verification half is the point.
 
-### Phase 1 — the parts (you)
+### Phase 1 — the parts (AI)
 
 1. `doc.crankrocker`. Four bodies, each with `material` (`steel-1018`):
    - `body.base` — a flange with two pivot towers 90 mm apart, Ø8 bores.
    - `body.crank` — 60 mm centres, Ø8 bores at each end.
    - `body.coupler` — 140 mm centres, Ø8 bores.
    - `body.rocker` — 80 mm centres, Ø8 bores.
-     Bind every length to a `param` so I can change one later.
+     Bind every length to a `param` so it can be changed parametrically.
 2. Four Ø8 dowel pins with `primitive({kind:"cylinder", d:8, ...})`, ids
    `pin.a` … `pin.d`.
-3. `allow({pairs:[["body.crank","pin.a"]], upTo:0.05,
-why:"m6/h7 press fit dowel"})` and the equivalents. Then run
-   `freecad_measure({interference:true, partsOnly:true})` ONCE and confirm the
-   press fits appear under `expectedOverlaps` rather than as hits — and confirm
-   in words that anything past 0.05 mm³ would still be a hit. `allow` bounds an
-   overlap; it does not hide one.
-4. `freecad_render` two views so I can see what I am about to joint.
+3. `allow({pairs:[["body.crank","pin.a"]], upTo:0.05, why:"m6/h7 press fit dowel"})`
+   and equivalents. Run `freecad_measure({interference:true, partsOnly:true})` ONCE
+   and confirm press fits appear under `expectedOverlaps`.
+4. `freecad_render` two views (isometric and top).
 
-### Phase 2 — HAND THE MOUSE OVER (me)
+### Phase 2 — Visual Workspace Handover & Interactive Guidance (AI + User)
 
-STOP HERE. Say plainly, in one or two sentences, that you cannot create the
-Assembly or its joints: a joint is made by clicking the two features that mate,
-and inventing which geometry it attaches to from your side is exactly the guess
-the rest of this skill exists to prevent. Then tell me precisely what to build:
-which four revolute joints, between which parts, and which one to ground.
-Then WAIT. Do not poll, do not proceed on a timer, do not "helpfully" try
-`freecad_script` to write joints while I am working. When I say go, continue.
+1. **AI stops program authoring**: Explain in 1–2 sentences why assembly joints must
+   be picked interactively in CAD rather than guessed from code.
+2. **Visual Workspace Guidance**: Use the `visual-workspace` skill to capture the
+   current viewport (`createWorkspace` / `addWorkspaceAnnotation`) and visually annotate:
+   - The **Assembly** workbench switcher and **Revolute Joint** tool icon in the toolbar/panel.
+   - Labeled visual arrows/boxes over each of the four mating hole locations in the 3D model:
+     - Joint 1: `body_base` ($X=0$) $\leftrightarrow$ `body_crank`
+     - Joint 2: `body_crank` ($X=60$) $\leftrightarrow$ `body_coupler`
+     - Joint 3: `body_coupler` ($X=140$) $\leftrightarrow$ `body_rocker`
+     - Joint 4: `body_rocker` ($X=80$) $\leftrightarrow$ `body_base` ($X=90$)
+   - The **Grounding** button to anchor `body_base`.
+3. **Wait for user confirmation**: Instruct the user to click the annotated features
+   and reply with `go` when all joints are committed and the task panel is closed.
 
-### Phase 3 — is it a mechanism at all
+### Phase 3 — Kinematic Mobility Verification (AI)
 
-5. `freecad_motion({mode:"check"})`. Report, each in its own sentence:
-   - what is grounded, and whether every part reaches ground through joints
-     (`ungrounded:true` means placements are measured off a floating frame);
-   - the mobility from the solver AND from the Kutzbach-Grübler count of the
-     same joint list — TWO numbers from TWO methods. `mobility.mismatch` means
-     redundant constraints, which the solver absorbs silently while the geometry
-     is exactly aligned and which bind on the real machine as soon as it is not.
-     Do not paper over a mismatch; it is the most valuable thing on this screen.
-   - `interference` at the pose it is sitting in now, and whether
-     `interference.checked` is even true.
-6. `{mode:"joints"}`. Quote what each joint is and WHICH property this build
-   lets you drive. Do not guess a property name: driving the wrong one moves the
-   mechanism somewhere real and reports success.
+5. `freecad_motion({mode:"check"})`. Report:
+   - Grounded status of all parts and whether any link is floating (`ungrounded:true`).
+   - Mobility from the solver AND from the Kutzbach-Grübler count (two numbers from
+     two methods, explicitly highlighting any `mobility.mismatch`).
+   - Static interference at default pose.
+6. `{mode:"joints"}`. List each joint and quote the exact drivable property.
 
-### Phase 4 — the travel
+### Phase 4 — Motion Sweep & Collision Analysis (AI)
 
-7. Coarse first: `{mode:"sweep", joint:<the crank>, from:0, to:360, steps:36}`.
-   Read, in this order, before you say anything about how it moves:
-   `sweepIncomplete`, `lockedNote`, `branchFlip`, `collides`.
-   - `collides` — name the PAIR and the ANGLE, not just that it collides.
-   - `branchFlip` — every pose past the flip satisfies every constraint and the
-     physical linkage would have to come apart to get there, so the far side is
-     NOT reachable travel. Say that in those words and do not report the range
-     as swept.
-   - `lockedNote` — the driving value changed and nothing moved. A toggle or a
-     dead point, reported as success by the solver.
-     Explicitly state that a collision narrower than one step is a collision this
-     did not see: at 36 steps you sampled every 10°.
-8. Now go fine where it matters: re-sweep the 30° window around anything found
-   in step 7 at `steps:60` (0.5° resolution) and say what changed. Sweeping a
-   tight range finely beats sweeping the whole range coarsely, and the report
-   should show you know why.
-9. **Park it so I can look.** `{mode:"sweep", ..., leaveAt:<the worst angle>}`
-   — leave the mechanism AT the pose that fouls, `freecad_render` two views of
-   it, and tell me what I am looking at and what to change. If nothing fouled,
-   park it at the pose with the minimum clearance instead and quote the number.
-   Then hand the mouse back: tell me I can drag the joint myself from here.
+7. **Coarse sweep**: `{mode:"sweep", joint:<the crank>, from:0, to:360, steps:36}`.
+   Evaluate in order: `sweepIncomplete`, `lockedNote`, `branchFlip`, `collides`.
+   - Report collisions with exact body pair and angle.
+   - If a `branchFlip` occurs, explain that poses beyond it represent physically
+     unreachable travel.
+   - Note sampling resolution ($10^\circ$).
+8. **Fine sweep**: Re-sweep a $30^\circ$ window around points of interest at `steps:60`
+   ($0.5^\circ$ resolution) and explain the refined findings.
+9. **Park & Render**: `{mode:"sweep", ..., leaveAt:<worst angle>}`.
+   Park the mechanism at the collision angle (or minimum clearance pose if clear),
+   generate two `freecad_render` views, and describe the geometric clearance.
 
-### Phase 5 — what holds it
+### Phase 5 — Quasi-Static Holding Torque (AI)
 
-10. `{mode:"torque", joint:<the crank>, from:0, to:360, steps:36,
-gravity:"-Z"}`.
-    First: run it with one part's density deliberately cleared
-    (`material({target:..., clear:true})`) and confirm it is REFUSED rather than
-    returning a smooth, plausible, wrong curve that quietly dropped a link.
-    Quote the refusal, restore the material, re-run.
-    Report the peak holding torque and the angle it occurs at — that is the
-    number a servo is sized on, at stall.
-11. State the boundaries without being asked: quasi-static, gravity only. No
-    inertia, no friction, no bearing drag, no spring, no backlash, no payload
-    beyond the masses listed, and no time in it at all. It answers where the
-    mechanism can go and what holds it there, not what happens when something
-    hits it.
-
-### Acceptance
-
-- Nothing in this session authored a joint.
-- Mobility is reported from two methods and any mismatch is named, not smoothed.
-- Every collision is reported with a pair AND an angle.
-- A branch flip, if present, is described as unreachable travel rather than as
-  range.
-- The torque run refused the missing density before it produced a curve.
-- The mechanism is left parked where I asked and my camera is restored.
-- If `freecad_motion` reports no Assembly on this build, say so and STOP. Do NOT
-  fall back to stepping `place` through angles and calling that a sweep — that
-  samples a continuum and the true minimum falls between samples. Offer it as a
-  clearly-labelled second best if I ask for it.
+10. `{mode:"torque", joint:<the crank>, from:0, to:360, steps:36, gravity:"-Z"}`.
+    - Test guardrails: Clear one part's material (`material({target:..., clear:true})`),
+      confirm torque solve is refused, restore material, and re-run.
+    - Report peak holding torque and the crank angle where peak stall torque occurs.
+11. State fundamental physics assumptions: quasi-static, gravity-only (no dynamics,
+    inertia, friction, bearing drag, or backlash).
 ```
 
 ---

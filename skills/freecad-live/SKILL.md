@@ -762,14 +762,17 @@ you look at it.
   request means "a bigger bolt", swap the bolt — do not edit the hole.**
 - `mate` seats an inserted part in a hole: `{target: "bolt.a", hole:
 "hole.mount", near: [x,y,z]}`. It takes the axis and the seat from the hole's
-  own profile sketch, so nothing here is a hand-computed position or a
+  own profile sketch and automatically projects to the solid's outer entry
+  face when the sketch stands off or sits on an origin plane (pass `seatOn: "sketch"`
+  to force sketch plane), so nothing here is a hand-computed position or a
   quaternion. `offset` lifts along the axis (a washer), `spin` turns about it,
   `flip` seats from the other side. A hole with several instances refuses until
   `near` says which one.
 - **`fastener_pattern` seats every instance at once** — `{hole:
 "hole.face_bolts", fastener: "M5", length: 16}` — and is what you want any
   time the answer is "a bolt in each of those". It reads all the seats out of
-  the same profile sketch `mate` reads one from: no `near` per bolt and no
+  the same profile sketch `mate` reads one from (with the same automatic outer-face
+  boundary projection when the sketch stands off): no `near` per bolt and no
   coordinate typed by hand. One hidden master and N links, so the BOM reads it
   as one line of N. `offset` defaults to the counterbore depth so heads seat
   instead of standing on the face. Reach for `mate` only when a single part goes
@@ -1316,6 +1319,9 @@ available here — importable is not wired.
   heading that way and say it before they find out.
 
 ## 14. Reporting to the user
+
+Use `visual-workspace` skill to draw on canvas for exact components you want user
+confirmation/actions.
 
 Open with `freecad_attach`'s one-line `status` — _Connected to FreeCAD 1.1.3
 (GUI), build 4c8a2f1b90, pinned build matches._ — then ask what they want to

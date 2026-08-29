@@ -527,6 +527,47 @@ return {"ok": True,
   await refused("mate needs something to read an axis from", "mate",
     { target: "bolt.a" }, null, "hole");
 
+  // Standoff/offset hole: sketch on origin plane YZ (X=0), while pad is at X in [10, 25]
+  console.log("\n--- mate / fastener_pattern on offset/standoff hole sketch ---");
+  const offsetHoleBatch = await call("batch", {
+    ops: [
+      { fn: "body", args: { label: "OffsetBody" }, id: "body.offset" },
+      { fn: "datum_plane",
+        args: { on: "YZ", offset: 10, body: "body.offset" },
+        id: "dp.offset" },
+      { fn: "sketch",
+        args: { on: "dp.offset", body: "body.offset",
+                geometry: [{ type: "rect", x: 200, y: 0, w: 30, h: 20 }] },
+        id: "sk.offset_base" },
+      { fn: "pad", args: { sketch: "sk.offset_base", length: 15, body: "body.offset" },
+        id: "pad.offset" },
+      { fn: "sketch",
+        args: { on: "YZ", body: "body.offset",
+                geometry: [{ type: "circle", x: 210, y: 10, d: HOLE_D }] },
+        id: "sk.offset_hole" },
+      { fn: "hole",
+        args: { sketch: "sk.offset_hole", through: true, body: "body.offset" },
+        id: "hole.offset" },
+    ],
+  }, "batch.offset_hole");
+
+  if (assert("a body with a hole sketched on origin plane YZ",
+      offsetHoleBatch && offsetHoleBatch.ok === true,
+      JSON.stringify({ error: (offsetHoleBatch || {}).error }))) {
+    await call("insert", { fastener: "M5", length: 16 }, "bolt.offset");
+    const mateOffsetAuto = await call("mate", { target: "bolt.offset", hole: "hole.offset" });
+    const moAuto = (mateOffsetAuto || {}).result || {};
+    assert("mate automatically projects seat to the outer boundary face at X=10",
+      mateOffsetAuto && mateOffsetAuto.ok === true && nearVec(moAuto.at, [10, 210, 10]),
+      JSON.stringify({ at: moAuto.at, want: [10, 210, 10], error: (mateOffsetAuto || {}).error }));
+
+    const mateOffsetSketch = await call("mate", { target: "bolt.offset", hole: "hole.offset", seatOn: "sketch" });
+    const moSketch = (mateOffsetSketch || {}).result || {};
+    assert("mate with seatOn:'sketch' preserves the sketch plane at X=0",
+      mateOffsetSketch && mateOffsetSketch.ok === true && nearVec(moSketch.at, [0, 210, 10]),
+      JSON.stringify({ at: moSketch.at, want: [0, 210, 10], error: (mateOffsetSketch || {}).error }));
+  }
+
   // ======================================================================
   // split_body
   // ======================================================================
