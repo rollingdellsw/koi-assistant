@@ -64,3 +64,10 @@
 # --- shell history (often holds pasted secrets) ---
 ~/.bash_history
 ~/.zsh_history
+
+# --- koi's own state ---
+# The gateway config holds backend credentials in cleartext, and under
+# --net policy this directory also holds network-policy.json. An agent that
+# can edit its own allowlist has no allowlist.
+~/.koi
+

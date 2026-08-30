@@ -3,7 +3,9 @@
   "auth": {
     "mode": "none"
   },
-  "allowedOrigins": ["chrome-extension://ckcmgcddobmmbcneegigkkdfljiademi"],
+  "allowedOrigins": [
+    "chrome-extension://ckcmgcddobmmbcneegigkkdfljiademi"
+  ],
   "servers": {
     "postgres": {
       "command": "npx",
@@ -17,14 +19,19 @@
       "command": "node",
       "args": [
         "./sandbox-shell-mcp.mjs",
-        "--net", "host",
-        "--max-overlay-size", "10GB"
+        "--max-overlay-size",
+        "10GB",
+        "--net",
+        "policy"
       ],
       "autoBuild": {
         "dir": "./lsp_search",
         "check": "dist/index.js",
         "srcDir": "src",
-        "commands": ["npm install", "npm run build"]
+        "commands": [
+          "npm install",
+          "npm run build"
+        ]
       }
     }
   }

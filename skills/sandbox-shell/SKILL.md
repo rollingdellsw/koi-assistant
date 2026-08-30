@@ -18,6 +18,7 @@ description: >-
   (structural/boundary-aware, via the optional ast-grep CLI), and ripgrep
   (text). Not needed for purely in-browser/web tasks with no local-file
   or local-execution component.
+runnable: true
 mcp-servers:
   - name: sandbox
     type: remote
@@ -43,6 +44,7 @@ allowed-tools:
   - sandbox_stop_service
   - sandbox_reset
   - sandbox_info
+  - sandbox_network_policy
   - search
   - search_ast
   - read_ast_node

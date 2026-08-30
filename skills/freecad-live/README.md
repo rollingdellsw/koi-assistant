@@ -8,6 +8,7 @@ Instead of running scripts blindly against a headless kernel, this skill connect
 - **Take the mouse at any moment.** Orbit, tweak a sketch, or delete an AI-generated feature. The agent syncs changes every turn and respects your manual edits rather than rebuilding over them.
 - **Shared visual canvas** Use the [visual workspace](./docs/visual-interaction.png) feature of Koi™ Assistant, freely select any content from FreeCAD GUI to interact with AI.
 - **Shared assistant context.** As a native Koi™ Assistant skill, the AI can query your design specifications, component catalogs, documents, or databases alongside the active CAD workflow.
+- **Works with any AI model** As a model-agnostic assistant, Koi™ Assistant lets you freely choose any model from any provider—cloud or local—using your existing subscriptions.
 
 A wrong turn costs one turn: if a feature isn't what you intended, adjust it immediately in place rather than starting a script from scratch.
 
@@ -1024,11 +1025,11 @@ linting, knowing when a manufacturability check is the wrong question, and a
 linear static solve that has to refuse rather than reassure._
 
 The FEM function depends on gmsh and ccx to run, [install them](#optional-gmsh-and-calculix-for-fem) to the FreeCAD container first.
+
 <div align="center">
   <img src="./docs/fem.png" width="100%" alt="Drone ARM FEM">
   <br>
 </div>
-
 
 ```markdown
 Design a lightweight drone motor arm with an internal wire conduit and mould

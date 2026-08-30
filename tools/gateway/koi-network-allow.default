@@ -1,0 +1,68 @@
+# koi-network-allow.default — hosts the sandbox may reach without asking.
+#
+# Sibling of sandbox-exclude.default, same deal: this is DEPLOYMENT policy, not
+# server policy. The installer seeds ~/.koi/network-policy.json from this file
+# the first time it runs and never touches it again — after that the file the
+# user (or the approval dialog) edits is the JSON, not this one.
+#
+# Format: one host pattern per line. `#` comments and blank lines ignored.
+#   example.com          exact host
+#   *.example.com        host and any subdomain
+#   example.com:443      narrow to specific ports (comma-separated)
+#   !example.com         explicit DENY — always wins over any allow, including
+#                        a later approval dialog
+#   192.0.2.10           a bare IP is just another host string
+#
+# IP addresses are matched EXACTLY and do not inherit a name's grant: allowing
+# `github.com` does not allow the address it resolves to, because a CDN can
+# move that address to someone else. Approve an IP only if you mean that IP.
+#
+# CIDR ranges are NOT supported. `10.0.0.0/8` is compared as a literal string
+# and therefore matches nothing — list each address you need on its own line.
+#
+# Everything not matched here falls through to the policy's `default`, which is
+# "ask": the request is held and the side panel prompts. In an unattended run
+# (TopicRunner worker, --full-auto) there is nobody to ask, so it is denied.
+#
+# In a locked-down corporate environment, empty this file and add only your
+# internal mirrors.
+
+# --- source hosting ---
+github.com
+*.github.com
+codeload.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+gitlab.com
+*.gitlab.com
+bitbucket.org
+
+# --- node ---
+registry.npmjs.org
+*.npmjs.org
+registry.yarnpkg.com
+
+# --- python ---
+pypi.org
+files.pythonhosted.org
+*.pythonhosted.org
+
+# --- rust ---
+crates.io
+static.crates.io
+index.crates.io
+
+# --- go ---
+proxy.golang.org
+sum.golang.org
+
+# --- distro packages (build deps inside the overlay) ---
+archive.ubuntu.com
+security.ubuntu.com
+deb.debian.org
+
+# --- explicit denials -------------------------------------------------------
+# Cloud instance metadata: a read of this endpoint is a credential theft, and
+# it is reachable from anything running on a cloud dev box.
+!169.254.169.254
+!metadata.google.internal

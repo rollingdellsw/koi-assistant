@@ -64,6 +64,10 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import {
+  DEFAULT_POLICY_PATH, DEFAULT_BROKER_SOCK, KOI_HOME,
+  ensurePolicy, loadPolicy, ApprovalBroker,
+} from './koi-net-policy.mjs';
 
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SELF_PATH = fileURLToPath(import.meta.url);
@@ -300,9 +304,19 @@ function mainUsage() {
     '                        Without it the server boots projectless scoped to $HOME',
     '                        and the session opens a project at runtime with',
     '                        sandbox_open_project({ path }).',
-    '  --net host|loopback   host-network visibility for sandboxed processes',
-    '                        (default: host — dev servers started inside are visible',
-    '                        on localhost so the extension can operate them).',
+    '  --net MODE            egress mode for sandboxed processes. One of:',
+    '                          host      (default) full host network, no filtering.',
+    '                          loopback  no network at all.',
+    '                          policy    default-deny egress through a filtering',
+    '                                    proxy; unknown destinations prompt the user.',
+    '                                    Needs pasta, nft and squid — check with',
+    '                                    `koi-net-setup.sh preflight`.',
+    '  --net-policy FILE     policy file for --net policy',
+    `                        (default ${DEFAULT_POLICY_PATH}).`,
+    '  --net-allow FILE      allowlist used to SEED the policy file on first run',
+    '                        (default koi-network-allow.default next to this script).',
+    '  --proxy-port N        egress proxy port for --net policy (default 3129 —',
+    '                        NOT 3128, which is the distro squid default).',
     '  --allow-creds         allow access to host credentials (~/.ssh, ~/.npmrc, etc)',
     '  --state DIR           state base dir for overlays/sessions (default: ~/.koi/sandbox).',
     '  --max-overlay-size SZ disk cap for ALL session overlays under --state',
@@ -394,6 +408,12 @@ function parseArgs() {
     allowCreds: false,
     project: process.env.KOI_PROJECT || null,
     net: 'host',
+    netPolicy: process.env.KOI_NETWORK_POLICY || DEFAULT_POLICY_PATH,
+    netAllow: process.env.KOI_NETWORK_ALLOW || path.join(SELF_DIR, 'koi-network-allow.default'),
+    netSock: process.env.KOI_NETWORK_SOCK || DEFAULT_BROKER_SOCK,
+    // 3129, not 3128: the sandbox proxy runs as the user next to whatever
+    // squid.service the distro already has on the default port.
+    proxyPort: Number(process.env.KOI_PROXY_PORT || 3129),
     state: null,
     // Disk budget for the session-overlay cache under --state. Deployment
     // policy, so it is set in the gateway config (args) or the unit (env);
@@ -420,6 +440,9 @@ function parseArgs() {
       process.env.KOI_ALLOW_CREDS = '1';
     }
     else if (args[i] === '--net' && args[i + 1]) out.net = args[++i];
+    else if (args[i] === '--net-policy' && args[i + 1]) out.netPolicy = path.resolve(args[++i]);
+    else if (args[i] === '--net-allow' && args[i + 1]) out.netAllow = path.resolve(args[++i]);
+    else if (args[i] === '--proxy-port' && args[i + 1]) out.proxyPort = Number(args[++i]);
     else if (args[i] === '--state' && args[i + 1]) out.state = path.resolve(args[++i]);
     else if ((args[i] === '--max-overlay-size' || args[i] === '--max-overlay') && args[i + 1]) {
       out.maxOverlayBytes = parseSizeSpec(args[++i], DEFAULT_MAX_OVERLAY_BYTES);
@@ -431,6 +454,41 @@ function parseArgs() {
     else if (args[i] === '--no-lsp') out.lsp = '';
     else if (args[i] === '--exclude' && args[i + 1]) out.exclude.push(args[++i]);
     else if (args[i].startsWith('--exclude=')) out.exclude.push(args[i].slice('--exclude='.length));
+  }
+  if (!['host', 'loopback', 'policy'].includes(out.net)) {
+    process.stderr.write(
+      `sandbox-shell-mcp: unknown --net mode '${out.net}' (expected host|loopback|policy)\n`);
+    process.exit(1);
+  }
+  if (out.net === 'policy') {
+    if (process.env.KOI_NET_TEST === '1') {
+      // Approval-path test harness (test-network-approval.mjs). Skips ONLY the
+      // enforcement preflight so the broker/elicitation round trip can be
+      // exercised without pasta/nft/squid installed. Nothing is confined in
+      // this mode, so it must never be how a real session starts — hence a
+      // flag nobody sets by accident, and a banner in every sandbox_info.
+      process.stderr.write(
+        '[sandbox-shell] *** KOI_NET_TEST=1: egress enforcement preflight SKIPPED. ***\n' +
+        '[sandbox-shell] *** The sandbox is NOT network-confined in this mode. ***\n');
+    } else {
+      // Fail at boot, not at the first blocked command: a "policy" sandbox
+      // whose enforcement tools are missing would silently be a `host` sandbox.
+      // --running, not the plain setup check: by the time this server boots the
+      // proxy is supposed to be UP, so "port free" would be the failure and
+      // "port busy" the success. Using the wrong mode here made a correctly
+      // running proxy abort the sandbox with "port is already in use".
+      const probe = spawnSync(path.join(SELF_DIR, 'koi-net-setup.sh'), ['preflight', '--running'], { encoding: 'utf8' });
+      const report = `${probe.stdout || ''}${probe.stderr || ''}`;
+      if (probe.error || probe.status !== 0) {
+        process.stderr.write(
+          '[sandbox-shell] --net policy requires a RUNNING egress proxy' +
+          (process.platform === 'darwin' ? '' : ', pasta and nft') + ':\n' + report +
+          'Install the missing pieces, or start with --net host / --net loopback.\n');
+        process.exit(1);
+
+      }
+      process.stderr.write(report);
+    }
   }
   if (out.project && out.project.includes('${')) {
     process.stderr.write(
@@ -828,6 +886,31 @@ function overlayBudgetStatus() {
  * shrink further — i.e. when THIS session's writes are the problem. Silent
  * otherwise, so the normal path costs nothing.
  */
+/**
+ * Current egress policy, for sandbox_info and sandbox_network_policy. Read from
+ * disk each time: an "always" grant from the approval dialog is written by the
+ * ACL helper, not by this process, so a cached copy would go stale the moment
+ * the user approves something.
+ */
+function networkPolicySummary() {
+  let policy;
+  try {
+    policy = loadPolicy(OPTS.netPolicy);
+  } catch (e) {
+    return { error: `policy unreadable (${e.message}) — every request will prompt` };
+  }
+  const fmt = (r) => (Array.isArray(r.ports) && r.ports.length ? `${r.host}:${r.ports.join(',')}` : r.host);
+  return {
+    file: OPTS.netPolicy,
+    proxyPort: OPTS.proxyPort,
+    unmatched: policy.default === 'ask'
+      ? 'prompts the user (denied when no session is attached to answer)'
+      : policy.default,
+    allowed: policy.rules.filter((r) => r.decision === 'allow').map(fmt),
+    denied: policy.rules.filter((r) => r.decision === 'deny').map(fmt),
+  };
+}
+
 function overlayPressureMeta() {
   if (!LAST_OVERLAY_GC || !LAST_OVERLAY_GC.overBudget) return {};
   return {
@@ -1156,6 +1239,11 @@ function composeSandboxPath(wrapperPrefix) {
 // the host (the thing we are deliberately avoiding).
 const GREENFIELD_MOUNT = '/tmp/koi/project';
 
+// Host paths, used as-is inside the sandbox: the whole host tree is ro-bound at
+// /, so the scripts shipped next to this server are visible at their real path.
+const NET_SETUP = path.join(SELF_DIR, 'koi-net-setup.sh');
+const PASTA_BIN = process.env.KOI_PASTA_BIN || 'pasta';
+
 class BwrapBackend {
   constructor() {
     this.name = 'bwrap-overlay';
@@ -1212,16 +1300,38 @@ class BwrapBackend {
       }
     }
 
+    // Egress modes:
+    //   loopback  own netns with only lo — no network at all.
+    //   policy    pasta OWNS the netns (see below), so bwrap must NOT unshare
+    //             it here; the filtering happens inside via koi-net-setup.sh.
+    //   host      unchanged: the host's network namespace.
     if (OPTS.net === 'loopback') argv.push('--unshare-net'); // lo only, fully offline
     argv.push('--clearenv');
     const env = {
       ...BASE_ENV,
       PATH: composeSandboxPath('/tmp/koi/bin'),
       KOI_OUTBOX: this.outboxInside, // git format-patch -o "$KOI_OUTBOX" lands on the host
+      ...(OPTS.net === 'policy' ? { KOI_PROXY_PORT: String(OPTS.proxyPort) } : {}),
     };
     for (const [k, v] of Object.entries(env)) argv.push('--setenv', k, String(v));
     argv.push('--chdir', cwd || this.root);
-    argv.push(SHELL_BIN, '-c', shCmd);
+    if (OPTS.net === 'policy') {
+      // koi-net-setup.sh installs the nftables egress filter inside the
+      // namespace and exports HTTPS_PROXY, then execs the real command. It
+      // refuses to exec if the filter cannot be installed, so a command never
+      // runs believing it is confined when it is not.
+      argv.push(NET_SETUP, 'confine', '--', SHELL_BIN, '-c', shCmd);
+    } else {
+      argv.push(SHELL_BIN, '-c', shCmd);
+    }
+    if (OPTS.net === 'policy') {
+      // pasta creates the network namespace, gives it usermode networking, and
+      // (`-t auto`) republishes ports the namespace binds onto host loopback —
+      // which is how dev servers stay reachable from the browser without
+      // handing the sandbox the host's own network stack.
+      const pasta = [PASTA_BIN, '--config-net', '-t', 'auto', '-q', '--'];
+      return { cmd: pasta[0], args: [...pasta.slice(1), ...argv], spawnEnv: process.env };
+    }
     return { cmd: argv[0], args: argv.slice(1), spawnEnv: process.env };
   }
 
@@ -1244,9 +1354,36 @@ class SeatbeltBackend {
     this.outboxInside = PROJ.dirs.outbox; // host path; writable per seatbelt profile
     this.ensureWorkspace();
     this.profile = path.join(PROJ.state, 'sandbox.sb');
+    // macOS has no netns, so the proxy runs on host loopback and seatbelt just
+    // narrows outbound to it. Same policy engine, same dialog; only the
+    // enforcement primitive differs.
     const netRules = OPTS.net === 'loopback'
       ? `(deny network-outbound)\n(allow network-outbound (remote ip "localhost:*"))`
-      : '';
+      : OPTS.net === 'policy'
+        ? `(deny network-outbound)\n(allow network-outbound (remote ip "localhost:${OPTS.proxyPort}"))`
+        : '';
+    // Credential masking. On Linux these paths are replaced with a tmpfs or a
+    // /dev/null bind, so they are ABSENT. Seatbelt cannot swap a mount, but it
+    // can refuse the read — and it must, because `(allow default)` above
+    // permits file-read* everywhere. Without this a macOS session reads
+    // ~/.ssh/id_ed25519 and ~/.aws/credentials as easily as any other file,
+    // while sandbox_info cheerfully reported them as "masked".
+    //
+    // SBPL is LAST-match-wins, so these denies must come after (allow default)
+    // to take effect. Paths are realpath'd: subpath matches literally, and
+    // /tmp -> /private/tmp (etc.) would otherwise silently match nothing.
+    // `subpath` covers a directory tree; a single file needs `literal`. Using
+    // subpath on a file matches nothing, which would have left ~/.netrc,
+    // ~/.npmrc and the other credential FILES readable while looking masked.
+    const rp = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+    const maskRules = [
+      ...CRED_DIRS.map((p) => `  (subpath ${JSON.stringify(rp(p))})`),
+      ...CRED_FILES.map((p) => `  (literal ${JSON.stringify(rp(p))})`),
+    ].join('\n');
+    const credRules = maskRules === ''
+      ? ''
+      : `(deny file-read* file-write*\n${maskRules})`;
+
     fs.writeFileSync(this.profile, `(version 1)
 (allow default)
 (deny file-write*)
@@ -1256,6 +1393,7 @@ class SeatbeltBackend {
   (subpath "/private/tmp")
   (subpath "/private/var/folders")
   (subpath "/dev"))
+${credRules}
 ${netRules}
 `);
   }
@@ -1305,6 +1443,13 @@ ${netRules}
     };
     // Mask credentials by pointing tools at empty config where env allows.
     env.GIT_SSH_COMMAND = 'false'; // ssh-based fetch/push both blocked on mac backend
+    if (OPTS.net === 'policy') {
+      const proxy = `http://127.0.0.1:${OPTS.proxyPort}`;
+      Object.assign(env, {
+        HTTP_PROXY: proxy, HTTPS_PROXY: proxy, http_proxy: proxy, https_proxy: proxy,
+        NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost',
+      });
+    }
     return {
       cmd: 'sandbox-exec',
       args: ['-f', this.profile, SHELL_BIN, '-c', `cd ${JSON.stringify(cwd || this.root)} && ${shCmd}`],
@@ -1349,6 +1494,109 @@ function pickBackend() {
 }
 BACKEND = pickBackend();
 log(`backend=${BACKEND.name} project=${PROJ.path} net=${OPTS.net} state=${PROJ.state} overlayCap=${formatBytes(MAX_OVERLAY_BYTES)}`);
+
+// =============================================================================
+// Network approval bridge (--net policy)
+// -----------------------------------------------------------------------------
+// The Squid ACL helper decides everything it can from the policy file. When the
+// policy says "ask" it opens the broker socket below, and this server turns
+// that into an MCP `elicitation/create` request on the live client connection —
+// i.e. the side panel's existing confirmation dialog.
+//
+// Nothing here enforces anything. If this bridge is down, the helper's ask
+// fails and the request is DENIED; the sandbox does not fall open.
+// =============================================================================
+
+/** Server-initiated JSON-RPC requests, keyed by id, awaiting a client reply. */
+const outbound = new Map();
+let outboundSeq = 0;
+
+/**
+ * Ask the connected client something. String ids ("koi-net-N") so they can
+ * never collide with the client's own numeric ids on the shared channel.
+ */
+function sendServerRequest(method, params, timeoutMs = 330_000) {
+  const id = `koi-net-${++outboundSeq}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      outbound.delete(id);
+      reject(new Error(`no answer to ${method} within ${timeoutMs}ms`));
+    }, timeoutMs);
+    outbound.set(id, (msg) => {
+      clearTimeout(timer);
+      if (msg.error) reject(new Error(msg.error.message || 'client error'));
+      else resolve(msg.result);
+    });
+    send({ jsonrpc: '2.0', id, method, params });
+  });
+}
+
+let NET_BROKER = null;
+
+/**
+ * Whether the connected client said it can prompt the user (MCP `elicitation`
+ * capability, sent on initialize). Without it there is nobody to ask, so an
+ * "ask" verdict is a denial — and saying so immediately is much better than
+ * parking a real connection for five minutes first while a build times out.
+ */
+let CLIENT_CAN_PROMPT = false;
+
+if (OPTS.net === 'policy') {
+  try {
+    ensurePolicy(OPTS.netPolicy, OPTS.netAllow);
+  } catch (e) {
+    log(`WARNING: could not seed network policy ${OPTS.netPolicy}: ${e.message}`);
+  }
+  NET_BROKER = new ApprovalBroker({
+    socketPath: OPTS.netSock,
+    log,
+    asker: async (req) => {
+      if (!CLIENT_CAN_PROMPT) {
+        return {
+          decision: 'deny',
+          scope: 'once',
+          reason: 'no client able to prompt the user (unattended run, or a client that did not declare the MCP elicitation capability)',
+        };
+      }
+      const summary = req.method === 'CONNECT' || !req.method
+        ? `${req.host}:${req.port}`
+        : `${req.method} ${req.host}:${req.port}`;
+      const result = await sendServerRequest('elicitation/create', {
+        message: `The sandbox wants to connect to ${summary}.`,
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            decision: { type: 'string', enum: ['allow', 'deny'] },
+            scope: { type: 'string', enum: ['once', 'session', 'always'] },
+          },
+          required: ['decision', 'scope'],
+        },
+        // Structured payload for the network dialog. Clients that only know
+        // generic elicitation still render `message` and can answer.
+        'koi/network': {
+          host: req.host,
+          port: req.port,
+          method: req.method || null,
+          uri: req.uri || null,
+          project: PROJ.path,
+          session: PROJ.sessionId,
+          // Honest about what the proxy can and cannot see: over TLS it gets
+          // CONNECT host:port and nothing else, so a pull/push choice here
+          // would be unenforceable.
+          directionKnown: Boolean(req.method) && req.method !== 'CONNECT',
+        },
+      });
+      const content = result?.content ?? result ?? {};
+      if (result?.action === 'decline' || result?.action === 'cancel') {
+        return { decision: 'deny', scope: 'once', reason: 'user declined' };
+      }
+      return {
+        decision: content.decision === 'allow' ? 'allow' : 'deny',
+        scope: content.scope || 'once',
+      };
+    },
+  }).start();
+}
 
 // =============================================================================
 // Merged code intelligence (lsp_search)
@@ -1894,7 +2142,11 @@ function stopAllServices() {
 }
 
 
-function shutdownChildren() { stopAllServices(); try { LSP.stop(); } catch { /* ignore */ } }
+function shutdownChildren() {
+  stopAllServices();
+  try { LSP.stop(); } catch { /* ignore */ }
+  try { NET_BROKER?.stop(); } catch { /* ignore */ }
+}
 process.on('exit', shutdownChildren);
 process.on('SIGINT', () => { shutdownChildren(); process.exit(0); });
 process.on('SIGTERM', () => { shutdownChildren(); process.exit(0); });
@@ -1926,6 +2178,18 @@ const TOOLS = [
       },
       required: ['command'],
     },
+  },
+  {
+    name: 'sandbox_network_policy',
+    tier: 'safe',
+    description:
+      'Show the sandbox network egress policy: which hosts are allowed without asking, ' +
+      'which are denied outright, and what happens to everything else. Read-only — the ' +
+      'policy is the user\'s, and is changed only by them (in the file) or by answering ' +
+      'an approval prompt. Call this when a fetch/install fails with a policy message, so ' +
+      'you can tell the user which host to approve instead of retrying blindly.',
+    displayMessage: '🛡️ Reading network policy',
+    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'sandbox_start_service',
@@ -2205,6 +2469,7 @@ const handlers = {
       project: PROJ.path,
       sandboxRoot: BACKEND.root,
       network: OPTS.net,
+      ...(OPTS.net === 'policy' ? { networkPolicy: networkPolicySummary() } : {}),
       state: PROJ.state,
       session: PROJ.sessionId,
       ...(PROJ.sessionLabel ? { sessionLabel: PROJ.sessionLabel } : {}),
@@ -2222,7 +2487,18 @@ const handlers = {
       overlayBudget: overlayBudgetStatus(),
       outbox: PROJ.dirs.outbox,
       reviewCommand: `node ${SELF_PATH} review --watch`,
-      maskedCredentials: [...CRED_DIRS, ...CRED_FILES],
+      // Report what is ACTUALLY enforced by the live backend, not the
+      // configured wish-list. The exec backend masks nothing at all, and
+      // saying otherwise is worse than the gap itself: the session is told
+      // ~/.ssh is unreadable and reports that to the user.
+      maskedCredentials: BACKEND?.name === 'exec-UNSAFE'
+        ? []
+        : [...CRED_DIRS, ...CRED_FILES],
+      credentialMasking: BACKEND?.name === 'exec-UNSAFE'
+        ? 'NONE — the exec backend has no isolation; every host secret is readable.'
+        : BACKEND?.name === 'seatbelt-clone'
+          ? 'seatbelt deny-read rules (macOS): the paths above are unreadable, but they still EXIST on disk, unlike the Linux tmpfs masking.'
+          : 'tmpfs / /dev/null binds (Linux): the paths above are absent from the sandbox filesystem.',
       services: listRunningServices(),
       servicesAll: listAllServices(),
       outboxInside: BACKEND.outboxInside,
@@ -2265,8 +2541,27 @@ const handlers = {
         'Each session starts from a FRESH overlay over the host tree (the stable base on disk). Previous sessions do not leak in — pass resume:"<session>" to sandbox_open_project to reattach one deliberately.',
         'Overlay writes may not reach already-running services; use sandbox_restart_service after edits.',
         'git push is blocked; commits are cheap local checkpoints — use them freely.',
+        ...(OPTS.net === 'policy' && process.env.KOI_NET_TEST === '1'
+          ? ['TEST MODE (KOI_NET_TEST=1): the approval path is live but NOTHING IS ENFORCED — egress is not confined. Do not use this mode for real work.']
+          : []),
+        ...(OPTS.net === 'policy'
+          ? ['NETWORK IS FILTERED: egress goes through a policy proxy. Hosts outside the allowlist prompt the user and block until they answer, so a failing fetch may be a policy denial rather than a network fault — check the error text and call sandbox_network_policy to see the current rules. Do not try to edit the policy file; it is masked from the sandbox.']
+          : []),
       ],
     };
+  },
+
+  async sandbox_network_policy() {
+    if (OPTS.net !== 'policy') {
+      return {
+        success: true,
+        mode: OPTS.net,
+        note: OPTS.net === 'host'
+          ? 'Egress is unfiltered in host network mode; there is no policy to show.'
+          : 'Network is fully disabled (loopback mode).',
+      };
+    }
+    return { success: true, mode: 'policy', ...networkPolicySummary() };
   },
 
   async overlay_fs_sync() {
@@ -2334,6 +2629,16 @@ async function handleMessage(msg) {
         // caller explicitly resumes). This holds even when the gateway pools
         // this process across connections.
         SESSION_ID = newSessionId();
+        // A client that cannot show a dialog must not be asked. Re-read on
+        // every initialize: the same pooled server process is reused across
+        // connections, and the next client may be a headless one.
+        CLIENT_CAN_PROMPT = params?.capabilities?.elicitation !== undefined;
+        if (OPTS.net === 'policy' && !CLIENT_CAN_PROMPT) {
+          log('client did not declare the elicitation capability — network prompts are unavailable, so anything outside the allowlist will be denied.');
+        }
+        // Session-scoped network grants belong to the connection that made
+        // them; a new client must not inherit "allow evil.example.com".
+        NET_BROKER?.resetSession(SESSION_ID);
         // The previous connection's overlay just became garbage — good moment
         // to check the cache budget.
         scheduleOverlayGc('initialize');
@@ -2402,6 +2707,16 @@ process.stdin.on('data', (chunk) => {
     if (!line.trim()) continue;
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
+    // Reply to a request WE sent (a network-approval elicitation). It must NOT
+    // enter the in-order queue: the sandbox_exec whose network access is being
+    // approved is sitting at the head of that queue, so queueing the answer
+    // behind it deadlocks both, and the approval expires unanswered.
+    if (msg.method === undefined && msg.id !== undefined && outbound.has(msg.id)) {
+      const settle = outbound.get(msg.id);
+      outbound.delete(msg.id);
+      try { settle(msg); } catch (e) { log(`approval reply handler threw: ${e.message}`); }
+      continue;
+    }
     inFlight++;
     queue = queue.then(() => handleMessage(msg)).catch(() => {}).finally(() => { inFlight--; });
   }

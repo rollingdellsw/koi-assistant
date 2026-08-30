@@ -1,0 +1,93 @@
+# koi-squid.conf — egress proxy for the Koi sandbox.
+#
+# Substitutions performed by koi-net-setup.sh:
+#   @PORT@       proxy listen port (default 3128)
+#   @HELPER@     absolute path to koi-net-acl.mjs
+#   @NODE@       absolute path to the node binary
+#   @POLICY@     absolute path to network-policy.json
+#   @SOCK@       absolute path to the approval broker socket
+#   @CACHEDIR@   scratch dir for squid state
+#
+# Start with:  squid -N -f <this file>      (foreground, for a user service)
+#
+# Design note: there are no dstdomain ACLs here on purpose. Squid reloads
+# dstdomain lists only on `squid -k reconfigure`, whereas the approval dialog
+# mutates the policy on every "always" grant. Putting the WHOLE decision in the
+# helper — which re-reads the policy file on mtime change — means a grant takes
+# effect on the next request with no daemon signalling at all.
+
+# Not 3128: that is the distro squid's port, and this proxy runs as the user
+# alongside whatever squid.service the system already has.
+http_port 127.0.0.1:@PORT@
+
+# Only the sandbox namespace talks to this proxy. pasta maps the host at the
+# namespace gateway, so requests arrive from loopback.
+acl koi_local src 127.0.0.1/32
+acl koi_local src ::1/128
+
+# The full set of CONNECT ports we are willing to consider at all. This is a
+# coarse pre-filter; the helper makes the actual decision.
+acl koi_ports port 80 443
+acl CONNECT method CONNECT
+
+# The policy helper. concurrency=32 so one parked approval dialog does not
+# stall the other 31 requests a package install has in flight. ttl=0 because
+# the helper owns caching — Squid caching a decision would outlive a "once"
+# grant and silently upgrade it to a session grant.
+# grace=0 as well as ttl=0: with a grace period Squid may serve the previous
+# answer while re-checking, which would quietly extend a one-time grant.
+external_acl_type koi_policy \
+  ttl=0 negative_ttl=0 grace=0 concurrency=32 children-max=1 children-startup=1 \
+  %DST %PORT %METHOD %URI \
+  @NODE@ @HELPER@ --policy @POLICY@ --sock @SOCK@
+
+acl koi_allowed external koi_policy
+
+http_access deny !koi_local
+http_access deny CONNECT !koi_ports
+http_access allow koi_allowed
+http_access deny all
+
+# NOTE ON ERROR CODES, because they are the main diagnostic here:
+#   403  the helper answered ERR — a real policy decision (allowlist miss,
+#        standing deny, or the user clicking Deny).
+#   500  Squid gave up waiting for the helper, or the helper died. This is NOT
+#        a policy decision; check `journalctl --user -u koi-egress`. The helper
+#        now answers within 45s by default to stay ahead of this.
+#   503  the request was allowed and then DNS or the origin failed — i.e. the
+#        policy said yes and the far side is the problem.
+#
+# There is deliberately no `deny_info` line. It only fires when the LAST acl on
+# a denying rule matches, and the denying rule below ends in `all`, so a
+# deny_info on koi_allowed never applied — it just looked like it did.
+
+# The user is waiting on a dialog: do not time the request out from under them.
+# Must exceed the helper's --timeout-ms.
+request_timeout 6 minutes
+read_timeout 6 minutes
+
+# No caching. This proxy is a policy point, not a mirror; a cache would also be
+# a place for sandbox traffic to leave traces on the host.
+#
+# `cache_dir null` is deliberately absent: the null store was removed in modern
+# squid and the line is a fatal config error there. `cache deny all` plus
+# `cache_mem 0` is the supported way to say the same thing, and dropping the
+# memory cache also removes most of the shared-memory segments squid would
+# otherwise want.
+cache deny all
+cache_mem 0 MB
+maximum_object_size_in_memory 0 KB
+access_log stdio:@CACHEDIR@/access.log
+cache_log @CACHEDIR@/cache.log
+pid_filename @CACHEDIR@/squid.pid
+coredump_dir @CACHEDIR@
+
+# Single worker. SMP mode adds shared-memory segments and a coordinator process
+# that this proxy has no use for, and each one is another chance to collide
+# with a system squid.
+workers 1
+
+# Do not advertise the sandbox to the far end.
+via off
+forwarded_for delete
+httpd_suppress_version_string on

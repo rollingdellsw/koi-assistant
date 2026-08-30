@@ -46,9 +46,32 @@ CONFIG="${GATEWAY_DIR}/gateway-config.json"
 EXCLUDE_FILE="${KOI_EXCLUDE_FILE:-${GATEWAY_DIR}/sandbox-exclude.default}"
 DOCS_REL="${GATEWAY_DIR}/../../docs/skill_api.md"
 
+# --- network egress policy (--net policy) ----------------------------------
+# The allowlist is deployment policy in the same sense as sandbox-exclude.default,
+# but unlike the exclude list it is NOT flattened into the unit: it seeds a JSON
+# policy file that the approval dialog then mutates at runtime, so it has to
+# outlive the unit and survive re-running this installer.
+NET_ALLOW_FILE="${KOI_NETWORK_ALLOW:-${GATEWAY_DIR}/koi-network-allow.default}"
+KOI_HOME_DIR="${KOI_HOME:-$HOME/.koi}"
+NET_POLICY_FILE="${KOI_NETWORK_POLICY:-${KOI_HOME_DIR}/network-policy.json}"
+NET_SOCK="${KOI_NETWORK_SOCK:-${KOI_HOME_DIR}/approval.sock}"
+NET_SETUP="${GATEWAY_DIR}/koi-net-setup.sh"
+NET_POLICY_LIB="${GATEWAY_DIR}/koi-net-policy.mjs"
+# Not 3128: that is the distro squid default, and colliding with a running
+# system squid costs both the port and squid's shared-memory namespace.
+PROXY_PORT="${KOI_PROXY_PORT:-3129}"
+
+# The egress proxy is a SEPARATE service from the gateway on purpose: it must
+# survive a gateway restart (otherwise every restart drops approvals that are
+# mid-flight), and it is the piece a user may legitimately stop on its own.
+PROXY_SERVICE="koi-egress"
+PROXY_UNIT="${PROXY_SERVICE}.service"
+PROXY_LAUNCHD_LABEL="com.koi.egress"
+
 # Linux systemd definitions
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT_PATH="${UNIT_DIR}/${UNIT}"
+PROXY_UNIT_PATH="${UNIT_DIR}/${PROXY_UNIT}"
 
 # macOS launchd definitions
 LAUNCHD_LABEL="com.koi.gateway"
@@ -56,6 +79,8 @@ LAUNCHD_DIR="$HOME/Library/LaunchAgents"
 LAUNCHD_PLIST="${LAUNCHD_DIR}/${LAUNCHD_LABEL}.plist"
 LAUNCHD_LOG_DIR="$HOME/Library/Logs"
 LAUNCHD_LOG_PATH="${LAUNCHD_LOG_DIR}/koi-gateway.log"
+PROXY_LAUNCHD_PLIST="${LAUNCHD_DIR}/${PROXY_LAUNCHD_LABEL}.plist"
+PROXY_LOG_PATH="${LAUNCHD_LOG_DIR}/koi-egress.log"
 
 c_reset='\033[0m'; c_b='\033[0;34m'; c_g='\033[0;32m'; c_y='\033[0;33m'; c_r='\033[0;31m'
 info() { printf "${c_b}[INFO]${c_reset} %s\n" "$*"; }
@@ -183,6 +208,357 @@ exclude_count() {
   printf '%s' "$1" | tr ',' '\n' | grep -c . || true
 }
 
+# --- network egress helpers -------------------------------------------------
+
+# Which --net mode gateway-config.json gives the sandbox server. Parsed with
+# node rather than grep: the args array is JSON, and a regex over it silently
+# reports the wrong mode the moment someone reformats the file.
+net_mode() {
+  local node_bin; node_bin="${1:-$(stable_node || command -v node || true)}"
+  [ -n "$node_bin" ] && [ -f "$CONFIG" ] || { printf 'unknown'; return 0; }
+  "$node_bin" -e '
+    const fs = require("fs");
+    try {
+      const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const args = cfg?.servers?.sandbox?.args || [];
+      const i = args.indexOf("--net");
+      process.stdout.write(i >= 0 && args[i + 1] ? String(args[i + 1]) : "host");
+    } catch { process.stdout.write("unknown"); }
+  ' "$CONFIG" 2>/dev/null || printf 'unknown'
+}
+
+# Set --net MODE on the sandbox server in gateway-config.json. Idempotent,
+# preserves every other key, and keeps a .bak of the pre-edit file.
+set_net_mode() {
+  local mode="$1" node_bin; node_bin="$(stable_node || command -v node || true)"
+  [ -n "$node_bin" ] || { err "node not found; cannot edit ${CONFIG}"; return 1; }
+  [ -f "$CONFIG" ] || { err "gateway-config.json not found at ${CONFIG}"; return 1; }
+  "$node_bin" -e '
+    const fs = require("fs");
+    const [file, mode] = process.argv.slice(1);
+    const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+    const srv = cfg && cfg.servers && cfg.servers.sandbox;
+    if (!srv) { console.error("no servers.sandbox entry in " + file); process.exit(1); }
+    const args = Array.isArray(srv.args) ? srv.args.slice() : [];
+    const i = args.indexOf("--net");
+    if (i >= 0) args.splice(i, 2);
+    if (mode !== "") args.push("--net", mode);
+    srv.args = args;
+    if (!fs.existsSync(file + ".bak")) fs.copyFileSync(file, file + ".bak");
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
+  ' "$CONFIG" "$mode"
+}
+
+# Create ~/.koi/network-policy.json from koi-network-allow.default if absent.
+# NEVER overwrites: after the first run that file belongs to the user and to
+# the approval dialog, and clobbering it on reinstall would silently revoke
+# every "always allow" they had granted.
+seed_network_policy() {
+  local node_bin; node_bin="$(stable_node || command -v node || true)"
+  [ -n "$node_bin" ] || { warn "node not found; cannot seed ${NET_POLICY_FILE}"; return 1; }
+  [ -f "$NET_POLICY_LIB" ] || { err "koi-net-policy.mjs not found at ${NET_POLICY_LIB}"; return 1; }
+  if [ -f "$NET_POLICY_FILE" ]; then
+    ok "Network policy already present: ${NET_POLICY_FILE} (left untouched)"
+    return 0
+  fi
+  # Paths go through argv rather than string interpolation so a directory with
+  # a space or a quote in it does not become a syntax error.
+  "$node_bin" --input-type=module -e '
+    const [lib, policyFile, allowFile] = process.argv.slice(1);
+    const { ensurePolicy } = await import("file://" + lib);
+    const p = ensurePolicy(policyFile, allowFile);
+    console.log(`seeded ${p.rules.length} rule(s)`);
+  ' "$NET_POLICY_LIB" "$NET_POLICY_FILE" "$NET_ALLOW_FILE" </dev/null &&
+    ok "Seeded ${NET_POLICY_FILE} from $(basename "$NET_ALLOW_FILE")"
+}
+
+# The packages that make egress filtering possible. Nothing else in the
+# gateway needs them, which is why they are not part of `install`.
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# util-linux (setpriv) is core on every Linux distro, so it is only named when
+# it is genuinely absent — listing it unconditionally would tell almost every
+# user to install something they already have. It is not optional though:
+# without setpriv (or capsh) confine cannot drop CAP_NET_ADMIN and refuses to
+# run at all, because a filter the sandbox can `nft flush` is not a filter.
+net_caps_pkg() {
+  [ "$OS" = "Darwin" ] && return 0
+  have_cmd setpriv || have_cmd capsh || printf ' util-linux'
+}
+
+net_packages() {
+  if [ "$OS" = "Darwin" ]; then printf 'squid'
+  else printf 'passt nftables squid%s' "$(net_caps_pkg)"; fi
+}
+
+net_install_cmd() {
+  if [ "$OS" = "Darwin" ]; then
+    have_cmd brew && printf 'brew install %s' "$(net_packages)"
+  elif have_cmd apt-get; then
+    printf 'sudo apt-get install -y %s' "$(net_packages)"
+  elif have_cmd dnf; then
+    printf 'sudo dnf install -y %s' "$(net_packages)"
+  elif have_cmd pacman; then
+    printf 'sudo pacman -S --needed %s' "$(net_packages)"
+  elif have_cmd zypper; then
+    printf 'sudo zypper install -y %s' "$(net_packages)"
+  fi
+}
+
+# Offer to install what preflight says is missing, instead of printing a list
+# and expecting the user to work out their package manager. KOI_ASSUME_YES=1
+# skips the prompt (for scripted installs).
+net_install_deps() {
+  local cmd; cmd="$(net_install_cmd)"
+  if [ -z "$cmd" ]; then
+    err "Could not detect a package manager. Install these yourself: $(net_packages)"
+    return 1
+  fi
+  echo
+  info "Missing dependencies. This will run:"
+  echo "    ${cmd}"
+  if [ "${KOI_ASSUME_YES:-0}" != "1" ]; then
+    printf '  Proceed? [Y/n] '
+    local reply; read -r reply </dev/tty || reply="n"
+    case "$reply" in [Nn]*) err "Skipped. Install them and re-run: $0 network on"; return 1 ;; esac
+  fi
+  # shellcheck disable=SC2086
+  eval "$cmd" || { err "Package install failed. Run it by hand: ${cmd}"; return 1; }
+
+  # Debian's squid package enables and starts a system squid on 3128. Ours runs
+  # as the user on its own port with its own shared-memory namespace, so the two
+  # coexist — but say so, because a running squid the user did not ask for is
+  # alarming and looks like ours.
+  if [ "$OS" != "Darwin" ] && systemctl is-active --quiet squid 2>/dev/null; then
+    warn "Your distro started a system squid on port 3128. That is unrelated to Koi and"
+    warn "can stay. If you do not want it: sudo systemctl disable --now squid"
+  fi
+  return 0
+}
+
+net_preflight() {
+  chmod +x "$NET_SETUP" 2>/dev/null || true
+  [ -f "$NET_SETUP" ] || { err "koi-net-setup.sh not found at ${NET_SETUP}"; return 1; }
+  KOI_PROXY_PORT="$PROXY_PORT" bash "$NET_SETUP" preflight "$@"
+}
+
+# Pick a port nobody else holds unless the user pinned one. A port collision is
+# the single most common way this setup fails, and it is not a decision worth
+# asking anyone to make.
+net_pick_port() {
+  [ -n "${KOI_PROXY_PORT:-}" ] && return 0   # user pinned it; respect that
+  local picked
+  picked="$(KOI_PROXY_PORT="$PROXY_PORT" bash "$NET_SETUP" free-port 2>/dev/null || true)"
+  if [ -n "$picked" ] && [ "$picked" != "$PROXY_PORT" ]; then
+    info "Port ${PROXY_PORT} is taken; using ${picked} instead."
+    PROXY_PORT="$picked"
+  fi
+}
+
+# Prove the whole chain works before telling the sandbox to rely on it: squid is
+# listening, the ACL helper answers, and the policy is being applied. A denied
+# host must come back 403. Without this, a proxy that starts but cannot run its
+# helper looks identical to success until the first sandbox command fails.
+net_verify() {
+  have_cmd curl || { warn "curl not found; skipping end-to-end proxy check"; return 0; }
+  local code
+  code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' \
+            -x "127.0.0.1:${PROXY_PORT}" "http://169.254.169.254/" 2>/dev/null || true)"
+  case "$code" in
+    403) ok "Proxy check: denied host correctly refused (HTTP 403)" ; return 0 ;;
+    000) err "Proxy check: could not reach the proxy on 127.0.0.1:${PROXY_PORT}"; return 1 ;;
+    *)   err "Proxy check: expected 403 for a denied host, got HTTP ${code}."
+         err "  The policy helper is probably not running. Log: journalctl --user -u ${PROXY_SERVICE} -n 30"
+         return 1 ;;
+  esac
+}
+
+render_proxy_systemd_unit() {
+  local node_bin="$1"
+  cat <<EOF
+# Generated by koi-gateway-installer on $(date -u +%Y-%m-%dT%H:%M:%SZ). Do not edit;
+# re-run the installer to regenerate.
+[Unit]
+Description=Koi sandbox egress proxy (squid + network policy helper)
+# The gateway must not come up before the proxy it depends on, and stopping the
+# gateway should take the proxy with it — they are one feature, not two
+# services. PartOf gives propagation of stop/restart; the gateway's Wants=/
+# After= gives ordering and start-together. Kept as two units only because they are
+# two long-lived processes with different failure modes; from the outside,
+# `systemctl --user restart koi-gateway` now handles both.
+Before=${UNIT}
+PartOf=${UNIT}
+
+[Service]
+Type=simple
+WorkingDirectory=${GATEWAY_DIR}
+ExecStart=/bin/bash ${NET_SETUP} proxy
+Environment=KOI_PROXY_PORT=${PROXY_PORT}
+Environment=KOI_HOME=${KOI_HOME_DIR}
+Environment=KOI_NETWORK_POLICY=${NET_POLICY_FILE}
+Environment=KOI_NETWORK_SOCK=${NET_SOCK}
+EOF
+  [ -n "${node_bin}" ] && printf 'Environment=KOI_NODE_BIN=%s\n' "${node_bin}"
+  cat <<'EOF'
+Restart=on-failure
+RestartSec=3
+SyslogIdentifier=koi-egress
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+render_proxy_launchd_plist() {
+  local node_bin="$1"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PROXY_LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${NET_SETUP}</string>
+        <string>proxy</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${GATEWAY_DIR}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>KOI_PROXY_PORT</key>
+        <string>${PROXY_PORT}</string>
+        <key>KOI_HOME</key>
+        <string>${KOI_HOME_DIR}</string>
+        <key>KOI_NETWORK_POLICY</key>
+        <string>${NET_POLICY_FILE}</string>
+        <key>KOI_NETWORK_SOCK</key>
+        <string>${NET_SOCK}</string>
+EOF
+  [ -n "${node_bin}" ] && printf '        <key>KOI_NODE_BIN</key>\n        <string>%s</string>\n' "${node_bin}"
+  cat <<EOF
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${PROXY_LOG_PATH}</string>
+    <key>StandardErrorPath</key>
+    <string>${PROXY_LOG_PATH}</string>
+</dict>
+</plist>
+EOF
+}
+
+install_proxy_service() {
+  local node_bin; node_bin="$(stable_node || true)"
+  if [ "$OS" = "Darwin" ]; then
+    mkdir -p "$LAUNCHD_DIR" "$LAUNCHD_LOG_DIR"
+    render_proxy_launchd_plist "$node_bin" > "$PROXY_LAUNCHD_PLIST"
+    local user_id; user_id="$(id -u)"
+    launchctl bootout "gui/${user_id}/${PROXY_LAUNCHD_LABEL}" 2>/dev/null || true
+    if launchctl bootstrap "gui/${user_id}" "$PROXY_LAUNCHD_PLIST" 2>/dev/null ||
+       launchctl load -w "$PROXY_LAUNCHD_PLIST" 2>/dev/null; then
+      ok "Egress proxy loaded (${PROXY_LAUNCHD_LABEL}) on 127.0.0.1:${PROXY_PORT}"
+    else
+      err "Failed to load ${PROXY_LAUNCHD_LABEL}"
+      return 1
+    fi
+  else
+    have_systemd_user || { wsl_hint; return 1; }
+    mkdir -p "$UNIT_DIR"
+    render_proxy_systemd_unit "$node_bin" > "$PROXY_UNIT_PATH"
+    systemctl --user daemon-reload
+    systemctl --user enable "$PROXY_UNIT" >/dev/null 2>&1 || true
+    # restart, NOT `enable --now`: if the service is already running, --now is a
+    # no-op, so a regenerated unit (new port, new paths) is written to disk and
+    # never loaded. That is how the sandbox ends up dialling a port the proxy
+    # moved off, and every request comes back "connection refused".
+    systemctl --user restart "$PROXY_UNIT" || { err "could not start ${PROXY_SERVICE}"; return 1; }
+    sleep 1
+    if ! systemctl --user is-active --quiet "$PROXY_UNIT"; then
+      err "${PROXY_SERVICE} is not active. Recent log:"
+      journalctl --user -u "$PROXY_SERVICE" -n 25 --no-pager >&2 || true
+      err "Common causes:"
+      err "  shm_open ... File exists  -> a system squid owns the default shared-memory"
+      err "                               namespace. Ours passes -n ${PROXY_SERVICE}; if this"
+      err "                               squid is too old for -n: sudo systemctl stop squid"
+      err "  Cannot bind ... in use    -> something else holds port ${PROXY_PORT};"
+      err "                               retry with KOI_PROXY_PORT=<free port>"
+      err "  FATAL: ... cache_dir      -> stale ${KOI_HOME_DIR}/squid/koi-squid.conf;"
+      err "                               delete it and re-run"
+      return 1
+    fi
+    ok "Egress proxy running (${PROXY_SERVICE}) on 127.0.0.1:${PROXY_PORT}"
+  fi
+}
+
+remove_proxy_service() {
+  if [ "$OS" = "Darwin" ]; then
+    local user_id; user_id="$(id -u)"
+    launchctl bootout "gui/${user_id}/${PROXY_LAUNCHD_LABEL}" 2>/dev/null || true
+    if [ -f "$PROXY_LAUNCHD_PLIST" ]; then
+      rm -f "$PROXY_LAUNCHD_PLIST"; ok "Removed ${PROXY_LAUNCHD_PLIST}"
+    fi
+  else
+    if have_systemd_user; then systemctl --user disable --now "$PROXY_UNIT" 2>/dev/null || true; fi
+    if [ -f "$PROXY_UNIT_PATH" ]; then
+      rm -f "$PROXY_UNIT_PATH"; ok "Removed ${PROXY_UNIT_PATH}"
+      have_systemd_user && systemctl --user daemon-reload || true
+    fi
+  fi
+  return 0
+}
+
+# Rewrite the gateway's own unit so it carries the (possibly newly chosen)
+# proxy port and policy paths. Without this, `network on` picks a free port for
+# squid while the gateway keeps handing the sandbox the old one, and every
+# request inside the sandbox comes back "connection refused" against a port
+# nothing is listening on.
+refresh_gateway_unit() {
+  local node_bin; node_bin="$(stable_node || true)"
+  [ -n "$node_bin" ] || return 0
+  if [ "$OS" = "Darwin" ]; then
+    [ -f "$LAUNCHD_PLIST" ] || return 0
+    render_launchd_plist "$node_bin" > "$LAUNCHD_PLIST"
+  else
+    [ -f "$UNIT_PATH" ] || return 0
+    render_systemd_unit "$node_bin" > "$UNIT_PATH"
+    have_systemd_user && systemctl --user daemon-reload || true
+  fi
+  return 0
+}
+
+restart_gateway() {
+  if [ "$OS" = "Darwin" ]; then
+    local user_id; user_id="$(id -u)"
+    launchctl kickstart -k "gui/${user_id}/${LAUNCHD_LABEL}" 2>/dev/null || true
+  else
+    have_systemd_user && systemctl --user restart "$UNIT" 2>/dev/null || true
+  fi
+  return 0
+}
+
+print_network_status() {
+  local mode; mode="$(net_mode)"
+  case "$mode" in
+    policy)
+      ok "Sandbox egress: --net policy (default-deny; unknown hosts prompt you)"
+      [ -f "$NET_POLICY_FILE" ] && info "Policy file: ${NET_POLICY_FILE}" ||
+        warn "Policy file ${NET_POLICY_FILE} is missing; every request would prompt."
+      ;;
+    loopback) info "Sandbox egress: --net loopback (no network at all)" ;;
+    host)     warn "Sandbox egress: --net host — UNFILTERED. Anything the sandbox runs can reach the internet, and the whole host tree is readable. Enable filtering with: ./koi-gateway-installer network on" ;;
+    *)        warn "Sandbox egress: could not read ${CONFIG}" ;;
+  esac
+}
+
 wsl_hint() {
   warn "No systemd user instance is available."
   if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
@@ -206,6 +582,11 @@ render_systemd_unit() {
 # re-run the installer to regenerate.
 [Unit]
 Description=Koi Gateway (WebSocket<->MCP bridge for the Koi Assistant extension)
+# Only meaningful when egress filtering is enabled; a missing unit here is
+# simply ignored by systemd, so this is safe to emit unconditionally. Without
+# it the sandbox server can boot before squid is listening and refuse to start.
+Wants=${PROXY_UNIT}
+After=${PROXY_UNIT}
 Documentation=file://${docs}
 
 [Service]
@@ -219,6 +600,13 @@ EOF
   [ "${KOI_ALLOW_CREDS:-}" = "1" ] && printf 'Environment=KOI_ALLOW_CREDS=1\n'
   local excl; excl="$(flatten_excludes)"
   [ -n "${excl}" ] && printf 'Environment=KOI_SANDBOX_EXCLUDE=%s\n' "${excl}"
+  # Both halves of the approval path must agree on these paths or the sandbox
+  # server opens a broker socket the policy helper never finds, and every
+  # prompt silently becomes a denial.
+  printf 'Environment=KOI_HOME=%s\n' "${KOI_HOME_DIR}"
+  printf 'Environment=KOI_NETWORK_POLICY=%s\n' "${NET_POLICY_FILE}"
+  printf 'Environment=KOI_NETWORK_SOCK=%s\n' "${NET_SOCK}"
+  printf 'Environment=KOI_PROXY_PORT=%s\n' "${PROXY_PORT}"
   cat <<'EOF'
 Restart=on-failure
 RestartSec=3
@@ -253,6 +641,11 @@ EOF
   [ -n "${node_bin}" ] && printf '        <key>KOI_NODE_BIN</key>\n        <string>%s</string>\n' "${node_bin}"
   [ "${KOI_ALLOW_CREDS:-}" = "1" ] && printf '        <key>KOI_ALLOW_CREDS</key>\n        <string>1</string>\n'
   [ -n "${excl}" ] && printf '        <key>KOI_SANDBOX_EXCLUDE</key>\n        <string>%s</string>\n' "${excl}"
+  # Must match render_proxy_launchd_plist; see the systemd unit for why.
+  printf '        <key>KOI_HOME</key>\n        <string>%s</string>\n' "${KOI_HOME_DIR}"
+  printf '        <key>KOI_NETWORK_POLICY</key>\n        <string>%s</string>\n' "${NET_POLICY_FILE}"
+  printf '        <key>KOI_NETWORK_SOCK</key>\n        <string>%s</string>\n' "${NET_SOCK}"
+  printf '        <key>KOI_PROXY_PORT</key>\n        <string>%s</string>\n' "${PROXY_PORT}"
   cat <<EOF
     </dict>
     <key>RunAtLoad</key>
@@ -320,6 +713,7 @@ cmd_install_macos() {
   ok "Wrote ${LAUNCHD_PLIST}"
 
   print_exclude_status
+  print_network_status
 
   # Unload old instance if running
   local user_id; user_id="$(id -u)"
@@ -360,6 +754,7 @@ cmd_install_linux() {
   ok "Wrote ${UNIT_PATH}"
 
   print_exclude_status
+  print_network_status
 
   systemctl --user daemon-reload
   ok "Reloaded user systemd"
@@ -410,6 +805,7 @@ cmd_install() {
 }
 
 cmd_uninstall() {
+  remove_proxy_service
   if [ "$OS" = "Darwin" ]; then
     local user_id; user_id="$(id -u)"
     launchctl bootout "gui/${user_id}/${LAUNCHD_LABEL}" 2>/dev/null || launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
@@ -431,6 +827,84 @@ cmd_uninstall() {
       info "No unit installed at ${UNIT_PATH}"
     fi
   fi
+}
+
+# Turn sandbox egress filtering on or off end to end: preflight the enforcement
+# tools, seed the policy, start the proxy service, and point the sandbox server
+# at it. Split out from `install` because it depends on packages (pasta / nft /
+# squid) the base gateway does not need — forcing that on every install would
+# make the gateway unusable on a host that lacks them.
+cmd_network() {
+  local action="${1:-status}"
+  case "$action" in
+    status)
+      print_network_status
+      echo
+      info "Enforcement tools:"
+      net_preflight || true
+      if [ -f "$NET_POLICY_FILE" ]; then
+        echo
+        info "Policy (${NET_POLICY_FILE}):"
+        local node_bin; node_bin="$(stable_node || command -v node || true)"
+        [ -n "$node_bin" ] && "$node_bin" --input-type=module -e '
+          const [lib, file] = process.argv.slice(1);
+          const { loadPolicy } = await import("file://" + lib);
+          const p = loadPolicy(file);
+          const fmt = (r) => (r.ports && r.ports.length ? `${r.host}:${r.ports.join(",")}` : r.host);
+          const a = p.rules.filter((r) => r.decision === "allow");
+          const d = p.rules.filter((r) => r.decision === "deny");
+          console.log(`  unmatched hosts: ${p.default}`);
+          console.log(`  allowed (${a.length}): ${a.map(fmt).join(", ") || "none"}`);
+          console.log(`  denied  (${d.length}): ${d.map(fmt).join(", ") || "none"}`);
+        ' "$NET_POLICY_LIB" "$NET_POLICY_FILE" </dev/null || true
+      fi
+      ;;
+    on|enable)
+      info "Checking dependencies ..."
+      if ! net_preflight; then
+        # Do not make the user decode a list and find their own package manager.
+        net_install_deps || exit 1
+        net_pick_port
+        info "Re-checking ..."
+        net_preflight || { err "Still missing dependencies; see above."; exit 1; }
+      fi
+      net_pick_port
+
+      seed_network_policy || exit 1
+      install_proxy_service || exit 1
+      if ! net_verify; then
+        err "The proxy is not usable, so egress filtering has NOT been enabled."
+        err "gateway-config.json is unchanged; the sandbox keeps working as before."
+        exit 1
+      fi
+
+      set_net_mode policy || exit 1
+      ok "gateway-config.json now starts the sandbox with --net policy"
+      refresh_gateway_unit
+      restart_gateway
+      sleep 1
+      echo
+      print_network_status
+      echo
+      info "Verify it:"
+      info "  node ${GATEWAY_DIR}/test-network-approval.mjs        (no browser needed)"
+      info "  /skill sandbox-shell/scripts/network-policy-test.js  (in the Koi side panel)"
+      ;;
+    off|disable)
+      set_net_mode host || exit 1
+      remove_proxy_service
+      refresh_gateway_unit
+      restart_gateway
+      warn "Sandbox egress is UNFILTERED again (--net host). ${NET_POLICY_FILE} is kept for next time."
+      ;;
+    preflight)
+      net_preflight
+      ;;
+    *)
+      err "Unknown network subcommand: ${action} (expected: status | on | off | preflight)"
+      exit 2
+      ;;
+  esac
 }
 
 cmd_status() {
@@ -485,6 +959,12 @@ Commands:
   deps        install the gateway's dependencies (ws); touches no service unit
   render      print the service configuration that would be installed (dry run)
   excludes    print the credential paths that would be masked (dry run)
+  network     sandbox egress filtering:
+                network status     (default) current mode, tools, and policy
+                network on         preflight, seed policy, start proxy, switch
+                                   the sandbox to --net policy, restart gateway
+                network off        back to --net host, stop the proxy
+                network preflight  just check for pasta / nft / squid
   -h, --help  this help
 
 Env:
@@ -492,6 +972,17 @@ Env:
   KOI_ALLOW_CREDS=1                allow the sandbox to access host credentials
   KOI_EXCLUDE_FILE=/abs/path       use a different exclude list (default: sandbox-exclude.default)
   KOI_SANDBOX_EXCLUDE="a,b,c"      use this list verbatim instead of the file
+  KOI_NETWORK_ALLOW=/abs/path      seed allowlist (default: koi-network-allow.default)
+  KOI_NETWORK_POLICY=/abs/path     policy file (default: ~/.koi/network-policy.json)
+  KOI_PROXY_PORT=3128              egress proxy port
+
+Sandbox egress filtering ('network on'):
+  Off by default. When enabled, the sandbox gets its own network namespace
+  (pasta), a default-drop nftables filter, and an egress proxy (squid) that
+  consults ~/.koi/network-policy.json. Hosts on the allowlist go straight
+  through; anything else prompts you in the Koi side panel, and your answer can
+  be persisted back into the policy. Needs pasta, nftables and squid on Linux
+  (squid only on macOS); 'network preflight' tells you what is missing.
 
 Credential masking:
   The sandbox server has NO built-in credential list — it masks exactly what it
@@ -508,6 +999,7 @@ case "${1:-install}" in
   deps|deps-install) cmd_deps ;;
   render|print) cmd_render ;;
   excludes|exclude) cmd_excludes ;;
+  network|net) shift || true; cmd_network "${1:-status}" ;;
   -h|--help|help) usage ;;
   *) err "Unknown command: $1"; echo; usage; exit 2 ;;
 esac
