@@ -2,19 +2,17 @@
 
 _Koi™ brings peace to your mind_
 
-[Add to Chrome](https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng) · [rollingdell.com](https://rollingdell.com)
+[Add to Chrome](https://chromewebstore.google.com/detail/koi-assistant/aedfofodkbfgnjknkjpockkgajemkbng) · [Visit the home page](https://rollingdell.com)
 
 ---
 
-Koi works alongside you, on the page you are looking at. You watch every step as it happens, point at what you mean, and take over whenever you want. It acts through your own browser session — the accounts you are already signed into — so it can reach everything you can reach, and nothing you cannot.
+Koi™ Assistant is a browser AI assistant. Anything you do with your browser, now AI can assist you on it:
 
-Show it a task once and it can repeat that task on its own, forever. No coding required.
+- **Works with your documents:** PDFs, Google Workspace, Microsoft 365, Gmail/Outlook, Docs/Word, Sheets/Excel, Slides/PowerPoint, Calendar, Slack/Chat, and Meet.
+- **Visual interaction:** Generate [2D diagrams](https://github.com/rollingdellsw/drawio-skill/blob/main/README.md) from your design notes, build 3D [CAD models](https://github.com/rollingdellsw/freecad-skill/blob/main/README.md) from images, or explore a [gigapixel pathology scan](https://youtu.be/UlqHjMf5eUc) side by side with AI.
+- **Automates browser workflows:** Built-in auto-coder — demonstrate a task once in your browser, and the [auto-coder](https://youtu.be/IRM9zQT2aVQ?si=yxYz9gKo6IEuw0rw) generates reliable automation scripts to run on demand.
 
-- **Works on what you see.** Point at a chart, a slide, a scan — you and the AI look at the same screen.
-- **Uses your own credentials.** No service accounts, no shared passwords, no new access to grant.
-- **No data upload.** Documents and pages stay in your browser.
-
----
+Koi™ Assistant works with any AI model with vision capability from any provider (through API or your existing subscription), local or cloud.
 
 ## You and the AI, on the same screen
 
@@ -42,6 +40,7 @@ Google Workspace and Microsoft 365 out of the box — read and write mail, docum
 | [**Gmail**](./skills/gmail-summarizer)                | Summarize a crowded inbox, draft replies, pull the action items out of a long thread. → [video](https://youtu.be/StrJt2bpy8o)                                              |
 | [**Outlook & Microsoft 365**](./skills/microsoft-365) | Read an email together with its PDF, Word and image attachments, then answer questions about all of it. → [video](https://youtu.be/WOCZ1AfRJ5E)                            |
 | [**Diagrams**](./skills/drawio-live)                  | Edit a diagram side by side with the AI on a shared draw.io canvas — it moves the boxes, you steer. → [video](https://youtu.be/s1iDvgQNNjo)                                |
+| [**CAD**](./skills/freecad-live)                      | Build a machine along with AI, in your browser. → [video](https://youtu.be/m05Ef1b3nBk?si=sjsAq60gbEPP7FbR)                                                                |
 | [**Slack**](./skills/slack)                           | Catch up on a channel you have been ignoring for a week and get a summary you can paste back. → [video](https://youtu.be/9kGmSzSxzDw)                                      |
 | [**Meeting notes**](./skills/google-meet-note)        | Live notes from a [Google Meet](https://youtu.be/O2-2u8NG9_Q) or [Zoom](./skills/zoom-meeting-notes) call, taken from the captions — no recording bot, no per-minute cost. |
 | [**Reports in Sheets**](./skills/db-to-gsheet-report) | Query an internal database and write the formatted result straight into a spreadsheet. → [video](https://youtu.be/u_jCS6eENaQ)                                             |
@@ -68,8 +67,6 @@ Most assistants forget everything once the conversation gets too long. Koi start
 - **[One goal, many sessions](https://youtu.be/DOsQnwdI1F4)** — hand over an open-ended task in plain English and let it run. ([topic-runner](./skills/topic-runner))
 - **[Building a working web app](https://youtu.be/NjI4QV28FhM)** — pointed at a folder on your own machine, it reads the code, writes changes, runs the tests and iterates, unattended. ([code-topic](./skills/code-topic))
 
-Under the hood this is `runSubtask`: an independent sub-agent with its own fresh context window does the heavy lifting and returns only the result. A `for` loop in an automation can spawn hundreds of them — one per URL, one per row — without ever overflowing the main conversation.
-
 ---
 
 ## Documents and images too big to read
@@ -84,9 +81,7 @@ Thousand-page PDFs. Hundred-megabyte log files. Medical and satellite imagery me
 
 ## A whole computer, safely handed to the AI
 
-Install one small [gateway service](./docs/skill_api.md#74-the-koi-gateway) on your machine and Koi gets a real computer to work on: a shell, your file system, your editor tooling, your build and test commands, your internal databases. Not a toy terminal — the same environment you work in. It can install packages, start a dev server, read a stack trace, fix the code and run the tests again, on its own, for as long as the job takes.
-
-What makes that safe is the sandbox. Every write lands in a scratch layer on top of your real project, so your actual files are never touched until you say so. You review the finished work as an ordinary patch and apply it — or throw the session away and lose nothing. Access to your credentials is blocked unless you opt in, and database passwords stay on the server, never reaching the browser.
+Install a lightweight local service on your computer and AI gets direct, safe access to your local computer — your shell, files, editor tooling, and databases — with no cloud VM fees required.
 
 - **Build and ship software.** Point it at a project and let it write the feature, run the suite, and hand back a reviewable patch.
 - **Understand a codebase.** It reads structure the way an editor does — definitions, references, types — instead of guessing from text.
@@ -99,7 +94,7 @@ What makes that safe is the sandbox. Every write lands in a scratch layer on top
 
 ## Use the AI subscription you already pay for
 
-You do not need to buy API credits. If you already subscribe to Claude, ChatGPT, Gemini or Grok, Koi can run on that subscription through a small local proxy — the setup most people choose, and the reason running Koi usually costs nothing extra.
+You do not need to buy separate API credits. If you already subscribe to Claude, ChatGPT, Gemini, or Grok, Koi can run on that subscription through a lightweight local proxy.
 
 - **Your existing subscription** — point Koi at a local proxy and it uses the plan you already have. No API key, no per-token bill, no new account. → [how to set it up](./docs/cliproxyapi-howto.md)
 - **Direct API keys** — Anthropic, OpenAI, Google, xAI and OpenRouter are supported directly if you prefer to pay per use.
@@ -111,6 +106,7 @@ Koi follows each provider's official API for interleaved thinking and multimodal
 
 ## Nothing is sent anywhere you did not choose
 
+Koi™ Assistant is designed with enterprise-grade data security in mind.
 There is no Koi cloud. Your conversations, documents and automations are stored in your own browser — sessions in IndexedDB, settings and skills in `chrome.storage.local`. The only thing that ever leaves your machine is what you send to the AI provider you picked — and if you pick a model on your own hardware, not even that.
 
 - **Your own logins.** Koi works inside sessions you have already opened, so it can never see more than you can.
@@ -132,76 +128,4 @@ There is no Koi cloud. Your conversations, documents and automations are stored 
 
 ## For builders
 
-Everything above is built on one extension mechanism. A skill is a folder you drop in:
-
-```
-my-skill/
-├── SKILL.md              # what it does, which tools and servers it may use
-├── mcp/
-│   └── my_api_mcp.js     # an MCP server, running in a sandbox
-└── scripts/
-    ├── automate.js       # browser automation
-    └── guardrail.js      # policy enforcement (optional)
-```
-
-```yaml
-# SKILL.md
----
-name: google-workspace
-description: Google Sheets, Docs, Slides, Gmail, Calendar access
-mcp-servers:
-  - name: google_workspace
-    script: mcp/google_workspace_mcp.js
-    scopes:
-      - https://www.googleapis.com/auth/spreadsheets
-      - https://www.googleapis.com/auth/drive.file
-guardrails: scripts/guardrail.js
----
-```
-
-Skills compose. A [single skill](./skills/db-to-gsheet-report) can query PostgreSQL through a gateway, format the rows, create a Google Sheet, and open it — and the bulk data and the loop logic never reach the LLM, which is what keeps cost low and success rates high.
-
-**Two ways to reach a service.** Local MCP servers run entirely in the browser (sandboxed iframe, `MessageChannel` JSON-RPC, OAuth via `chrome.identity`) with no backend at all. Remote MCP connects over a WebSocket to a gateway for protocols a browser cannot speak — PostgreSQL, MySQL, Redis, Git, RAG — with credentials held server-side.
-
-**Guardrails** are JavaScript hooks, global or per skill, that run before and after every tool call, including inside sub-tasks. They hold state across a session, and the LLM cannot bypass them:
-
-```javascript
-// scripts/guardrail.js — only touch files this session created
-module.exports = {
-  input: async (ctx) => {
-    if (
-      MUTATE_TOOLS.has(ctx.tool.name) &&
-      !createdFileIds.has(ctx.tool.args.spreadsheetId)
-    ) {
-      return {
-        allowed: false,
-        message: "Write denied: not created by this session",
-      };
-    }
-    return { allowed: true };
-  },
-  output: async (ctx) => {
-    if (CREATE_TOOLS.has(ctx.tool.name))
-      createdFileIds.add(extractId(ctx.tool.result));
-    return { override: false };
-  },
-};
-```
-
-**System reminders** inject rules only when they apply — when a `.ts` file is touched, after a particular tool runs, when context is running low, after repeated failures — instead of bloating the system prompt with instructions that are usually irrelevant.
-
-- [Skill API](./docs/skill_api.md) · [Guardrails API](./docs/guardrails_api.md) · [Reminder system](./docs/system_reminder.md)
-
-### Security model
-
-All script execution — skill scripts, MCP servers, guardrails — happens in sandboxed iframes with `allow-scripts` only: no DOM access, no same-origin privileges, no `chrome.*` APIs. Messages are validated against the parent extension origin. OAuth tokens are scoped to the domains a skill declares, so they cannot be sent elsewhere. The LLM cannot invent and run arbitrary browser control code; only installed, deterministic scripts execute, and no code is ever loaded remotely.
-
-### Enterprise
-
-For managed deployments: signed skills and configuration (ECDSA P-256, SHA-256 content hashes verified against an IT-provisioned key), extension whitelisting through Chrome policy, and a layered trust model spanning device (MDM), user (SSO/MFA), extension (signatures) and gateway (credentials never reach the browser). Managed deployment is the only difference between the paid and free versions.
-
-- [Enterprise security architecture](./docs/enterprise-data-security.md) · [Deployment guide](./docs/enterprise-deployment.md) · [Licensing](./docs/enterprise-licensing.md)
-
----
-
-Ready when you are. Install it, open the side panel, and ask it to do something you would normally do yourself.
+Everything above is built on the same `skill` extension mechanism. Read the [Skill API documentation](./docs/skill_api.md) to build your own skill.
