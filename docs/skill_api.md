@@ -30,7 +30,6 @@ When a skill script is executed via `runBrowserScript`, it runs inside an isolat
 
 An array of string arguments passed to the script by the LLM. Inside the sandbox, `args` is always a `string[]`. Arguments are populated differently depending on how the script is invoked:
 
-- **LLM invocation** (`runBrowserScript`): The LLM provides `args` as a string array via `runBrowserScript({ script_path: "skill:scripts/main.js", args: ["val1", "val2"] })`. Access as `args[0]`, `args[1]`, etc.
 - **LLM invocation** (`runBrowserScript`): The LLM provides `args` as a string array via `runBrowserScript({ script_path: "skill:scripts/main.js", args: ["val1", "val2"], timeout: 120000 })`. Access as `args[0]`, `args[1]`, etc.
 - **Direct invocation** (`/skill` command): Skill parameter values (from the UI prompt or `--param` flags) are passed as positional strings via `Object.values(params)`. Parameter order follows the order of the `parameters` list in `SKILL.md`.
 - **Delegation from background**: When the background service worker delegates `executeIsolatedScript` to the sidepanel, args come from the caller (usually the LLM's `runBrowserScript` call).
@@ -39,7 +38,7 @@ Scripts that need named access to parameters should destructure from the positio
 
 ### 1.2 `console`
 
-A proxy that forwards `log`, `warn`, `error`, and `info` directly to the Deft/Koi side panel UI. Objects are safely stringified to prevent sandbox escapes.
+A proxy that forwards `log`, `warn`, `error`, and `info` directly to the Koi side panel UI. Objects are safely stringified to prevent sandbox escapes.
 
 ### 1.3 `tools` (The Complete Browser API)
 
@@ -57,7 +56,7 @@ These methods are built into the script runtime. No skill needs to be loaded fir
 
 > **Important: `readSkill` in scripts shares tools with the LLM session.**
 >
-> When a script calls `tools.readSkill({ name: "google-workspace" })`, the skill's MCP servers are registered into a **shared MCP router** (`getSharedMCPRouter()` in `script-runner.ts`). This router is a singleton — the same instance used by both the script sandbox and the LLM's main tool executor. Once the script finishes, the MCP tools it loaded **remain registered** and become available to the LLM for direct tool calls in subsequent conversation turns.
+> When a script calls `tools.readSkill({ name: "google-workspace" })`, the skill's MCP servers are registered into a **shared MCP router**. This router is a singleton — the same instance used by both the script sandbox and the LLM's main tool executor. Once the script finishes, the MCP tools it loaded **remain registered** and become available to the LLM for direct tool calls in subsequent conversation turns.
 >
 > This means:
 >
@@ -282,23 +281,23 @@ Koi provides a **Handle System** to manage object references entirely on the tar
 Koi exposes **two** acquisition APIs. Pick the simplest one that fits.
 
 **Path A — `runtime.findHandle` / `runtime.findHandleByGlobal` (preferred).** For acquiring a DOM element by CSS selector, or a global object by dotted path. Routes through a static page function injected via `chrome.scripting.executeScript` with a function reference, so it does **not** consume the page's CSP `unsafe-eval` budget. Works on hardened sites like claude.ai, github.com, and any page with a strict `script-src` policy. Context-aware: honors the current shadow/iframe path tracked by the background context manager.
-``javascript
+
+```javascript
 // Example: finding a DOM element or global object (from dom_interactor.js).
 // This is the implementation pattern used by the dom-interactor skill itself.
-async \_getHandle(args) {
-const res = args.selector
-? await runtime.findHandle({ selector: args.selector })
-: await runtime.findHandleByGlobal({ path: args.global || "window" });
+async _getHandle(args) {
+  const res = args.selector
+    ? await runtime.findHandle({ selector: args.selector })
+    : await runtime.findHandleByGlobal({ path: args.global || "window" });
 
-if (res && res.error) throw new Error(`Target not found: ${res.error}`);
-const handleId = res && (res.handleId || (res.result && res.result.handleId));
-if (!handleId) throw new Error("Target not found: finder returned no handleId");
-return handleId; // e.g., "h_1"
+  if (res && res.error) throw new Error(`Target not found: ${res.error}`);
+  const handleId = res && (res.handleId || (res.result && res.result.handleId));
+  if (!handleId) throw new Error("Target not found: finder returned no handleId");
+  return handleId; // e.g., "h_1"
 }
+```
 
-````
-
-**Path B — `runtime.evaluateScript` with a finder script.** For acquisition that needs *domain-specific discovery logic* — walking React Fiber internals, sniffing window properties for a viewer instance, traversing framework state. The finder script is passed as a **function expression** (not an IIFE) — the runtime calls it with `(document, __ctx, args)` where `__ctx` is the current shadow root or document context.
+**Path B — `runtime.evaluateScript` with a finder script.** For acquisition that needs _domain-specific discovery logic_ — walking React Fiber internals, sniffing window properties for a viewer instance, traversing framework state. The finder script is passed as a **function expression** (not an IIFE) — the runtime calls it with `(document, __ctx, args)` where `__ctx` is the current shadow root or document context.
 
 This path uses `new Function(code)` inside the page's MAIN world, which **fails on sites that disallow `unsafe-eval` in their CSP** (most modern apps with strict CSP). Use it only when Path A's selector/global lookup is insufficient — i.e., when the discovery logic itself is the skill's domain knowledge and cannot be expressed as a single CSS selector.
 
@@ -333,12 +332,11 @@ async _getViewerHandle(elementSelector) {
   if (result.error) throw new Error(result.error);
   return result.handleId;
 }
-``
+```
 
 > **Rule of thumb:** If your finder is just `querySelector(sel)` or `window.foo.bar`, use Path A. If it walks framework internals or sniffs page-script state, use Path B and accept that the skill won't work on sites with strict CSP.
 
 #### Operating on Handles
-
 
 Once you have a `handleId`, use the handle API methods. These operate by reference — the object is never serialized across the sandbox boundary:
 
@@ -351,7 +349,7 @@ const zoom = await runtime.getFromHandle(handleId, "viewport.zoom");
 
 // Release when done
 await runtime.releaseHandle(handleId);
-````
+```
 
 > **Design principle — "Smart Skill, Dumb Pipe":** The extension core is a generic transport layer. All domain-specific logic (React Fiber traversal, OpenSeadragon detection, etc.) lives inside the skill's MCP script, not in the extension. This keeps the extension CWS-reviewable and makes skills independently evolvable.
 
@@ -363,8 +361,7 @@ Inside `mcp/*.js` scripts, the `runtime` object provides the following APIs:
 
 | Method                                               | Description                                                                                                                                                                                                                                                                                                                                                |
 | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `runtime.fetch(url, options?)`                       | Authenticated HTTP proxy. Attaches the OAuth token for the server's configured scopes. Supports `options.skipAuth = true` for public APIs. Returns a standard `Response` object.                                                                                                                                                                           |
-|                                                      | Additional `options`: `responseFormat` (`"text"` or `"base64"` — use `"base64"` for binary downloads like PDFs/images), `method`, `headers`, `body`.                                                                                                                                                                                                       |
+| `runtime.fetch(url, options?)`                       | Authenticated HTTP proxy. Attaches the OAuth token for the server's configured scopes. Supports `options.skipAuth = true` for public APIs. Returns a standard `Response` object. `options`: `responseFormat` (`"text"` or `"base64"` — use `"base64"` for binary downloads like PDFs/images), `method`, `headers`, `body`.                                 |
 | `runtime.findHandle({ selector })`                   | Acquire a handle to a DOM element by CSS selector. Context-aware (honors current shadow/iframe). **Works on CSP-strict sites.** Returns `{ handleId }` or `{ error }`.                                                                                                                                                                                     |
 | `runtime.findHandleByGlobal({ path })`               | Acquire a handle to a global object by dotted path (e.g. `"document"`, `"window.location"`). **Works on CSP-strict sites.** Returns `{ handleId }` or `{ error }`.                                                                                                                                                                                         |
 | `runtime.evaluateScript(code, args?, worldId?)`      | Execute a function-expression string on the target page. `worldId` is `"MAIN"` (page context) or `"ISOLATED"` (default). Returns `{ result }`. **MAIN-world execution uses `new Function(code)` and is subject to the page's CSP — fails on sites without `unsafe-eval`.** For simple selector/global lookups, prefer `findHandle` / `findHandleByGlobal`. |
