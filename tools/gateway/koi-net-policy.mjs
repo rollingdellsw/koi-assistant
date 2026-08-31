@@ -152,16 +152,52 @@ export function ruleMatches(rule, host, port) {
 }
 
 /**
+ * Is this the machine the sandbox is already running on?
+ *
+ * RFC 6761 reserves `localhost` and any `*.localhost` name for loopback, and
+ * the whole of 127.0.0.0/8 is loopback, not just 127.0.0.1. Squid hands us the
+ * literal host string from the request, so an IPv6 literal may still be
+ * bracketed.
+ */
+export function isLoopbackHost(host) {
+  const h = String(host).toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h === '::1' || h === '0:0:0:0:0:0:0:1') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
  * Decide a single request. `sessionRules` are in-memory grants from this
  * session's approvals; they are consulted after the file's explicit denies so
  * a session grant can never override a standing deny.
+ *
+ * Loopback is allowed structurally rather than by seeding the allowlist file:
+ * `ensurePolicy` writes that file exactly once, so a seed entry would never
+ * reach anyone who already has a `network-policy.json` — which is everyone who
+ * has run the gateway before. The built-in sits AFTER the explicit-deny sweep,
+ * so `!localhost` in the policy still wins and the escape hatch survives.
+ *
+ * This grants no reachability the sandbox did not already have directly: the
+ * confine rules pass `oif "lo"` unconditionally, and NO_PROXY already lists
+ * localhost. It only stops a tool that routes everything through HTTPS_PROXY
+ * (ignoring NO_PROXY) from prompting for the dev server the session just
+ * started. Note the asymmetry: inside the namespace `localhost` is the
+ * sandbox's own loopback, but Squid runs on the host, so a request that
+ * actually reaches the proxy resolves against the HOST's loopback.
  */
 export function evaluate(policy, { host, port }, sessionRules = []) {
   const all = [...policy.rules, ...sessionRules];
+
   for (const r of all) {
     if (r.decision === 'deny' && ruleMatches(r, host, port)) {
       return { decision: 'deny', rule: r };
     }
+  }
+  if (isLoopbackHost(host)) {
+    return {
+      decision: 'allow',
+      rule: { host, decision: 'allow', source: 'builtin-loopback' },
+    };
   }
   for (const r of all) {
     if (r.decision === 'allow' && ruleMatches(r, host, port)) {

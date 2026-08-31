@@ -2053,6 +2053,32 @@ function extractServiceUrls(log) {
   return [...new Set(urls)];
 }
 
+/**
+ * What the caller can actually do with the port this service just opened.
+ *
+ * `policy` mode is NOT the isolated case: pasta runs with `-t auto`, which
+ * republishes namespace-bound ports onto host loopback. Collapsing it into the
+ * loopback branch told the caller its dev server was unreachable when it was
+ * one navigation away.
+ *
+ * Two caveats worth stating, because both cost real debugging time:
+ *  - `-t auto` reads listening sockets from the namespace's /proc/net/tcp, so a
+ *    server bound to 127.0.0.1 is not usefully republished. Bind 0.0.0.0.
+ *  - On WSL2 the Windows-side `localhost` relay does not always reach the
+ *    republished port, so a browser on the host may need the VM's IP instead.
+ */
+function serviceReachabilityNote() {
+  if (OPTS.net === 'loopback') {
+    return 'loopback mode: service ports are isolated inside the sandbox network namespace.';
+  }
+  const base = OPTS.net === 'host'
+    ? 'Ports opened by this service are reachable at http://localhost:<port> from the browser.'
+    : 'Ports bound to 0.0.0.0 are republished onto host loopback (pasta -t auto), so the browser can '
+      + 'open http://localhost:<port>. A server bound only to 127.0.0.1 is not forwarded — pass --host 0.0.0.0. '
+      + 'On WSL2, if localhost does not resolve to the service, try the VM IP from `ip -4 addr show eth0`.';
+  return `${base} After overlay edits, call sandbox_restart_service before expecting UI changes.`;
+}
+
 function startService(name, shCmd, cwd) {
   if (services.has(name) && services.get(name).exitCode == null) {
     throw new Error(`service '${name}' already running (stop it first, or use sandbox_restart_service)`);
@@ -2196,7 +2222,7 @@ const TOOLS = [
     tier: 'mutating',
     description:
       'Start a long-running command (dev server, test watcher) inside the sandbox as a named background service. ' +
-      'In host network mode its ports are reachable on localhost, so the browser can open the app directly. ' +
+      'In host and policy network modes its ports are reachable on localhost (bind 0.0.0.0, not 127.0.0.1), so the browser can open the app directly. ' +
       'Waits for a ready/listening log line. After overlay file edits, use sandbox_restart_service — ' +
       'running services do not reliably see later overlay writes (separate bwrap mounts).',
     displayMessage: '🚀 Starting service {{name}}: {{command}}',
@@ -2340,9 +2366,7 @@ const handlers = {
       ready: boot.ready,
       urls: extractServiceUrls(svc.log),
       earlyLog: svc.log.slice(-4000),
-      note: OPTS.net === 'host'
-        ? 'Ports opened by this service are reachable at http://localhost:<port> from the browser. After overlay edits, call sandbox_restart_service before expecting UI changes.'
-        : 'loopback mode: service ports are isolated inside the sandbox network namespace.',
+      note: serviceReachabilityNote(),
     };
   },
 

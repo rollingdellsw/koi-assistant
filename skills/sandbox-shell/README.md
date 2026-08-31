@@ -23,26 +23,27 @@ Watch Koi™ Assistant complete a web coding task fully autonomously using this 
 
 ## Install
 
-Three commands. The installer resolves your Node, writes a background service, and starts it.
+One command. The installer resolves your Node, sets up network filtering, writes a
+background service, and starts it.
 
 ```sh
 cd tools/gateway
 ./koi-gateway-installer          # installs and starts the gateway service
-./koi-gateway-installer network on   # optional: turn on network filtering
 ```
 
-The second command is optional but recommended — see [Network access](#network-access).
-It checks for the three packages it needs, offers to install them, picks a free port, and
-verifies the whole chain before enabling anything.
+[Network filtering](#network-access) is part of that, not a second step: it checks for the
+three packages it needs, offers to install them, picks a free port, and verifies the whole
+chain before enabling anything. If that cannot be completed the gateway still installs —
+with unfiltered network access, and a warning saying so.
 
 **Requirements**
 
-|                              | Needed for                         | Installed by                            |
-| ---------------------------- | ---------------------------------- | --------------------------------------- |
-| Node.js 18+                  | everything                         | you (or fnm/nvm/brew)                   |
-| `bubblewrap` (`bwrap`)       | filesystem isolation on Linux      | your distro, usually preinstalled       |
-| `passt`, `nftables`, `squid` | network filtering (optional)       | `./koi-gateway-installer network on`    |
-| `setpriv` (util-linux)       | dropping privileges in the sandbox | preinstalled on every mainstream distro |
+|                              | Needed for                         | Installed by                              |
+| ---------------------------- | ---------------------------------- | ----------------------------------------- |
+| Node.js 18+                  | everything                         | you (or fnm/nvm/brew)                     |
+| `bubblewrap` (`bwrap`)       | filesystem isolation on Linux      | your distro, usually preinstalled         |
+| `passt`, `nftables`, `squid` | network filtering                  | `./koi-gateway-installer` (it asks first) |
+| `setpriv` (util-linux)       | dropping privileges in the sandbox | preinstalled on every mainstream distro   |
 
 macOS uses the built-in `sandbox-exec` instead of bubblewrap and needs only `squid` for
 network filtering.
@@ -77,6 +78,7 @@ error.
 
 ```sh
 ./koi-gateway-installer status
+node test-lower-layer-sync.mjs
 node test-network-approval.mjs
 ```
 
@@ -155,9 +157,9 @@ Three modes, set in `gateway-config.json` (or by the installer):
 
 | Mode       | What the sandbox can reach              | When to use it                                            |
 | ---------- | --------------------------------------- | --------------------------------------------------------- |
-| `host`     | everything, unfiltered                  | default; simplest, least protected                        |
+| `policy`   | an allowlist, plus whatever you approve | **the default — set up by the installer**                 |
+| `host`     | everything, unfiltered                  | fallback when the proxy cannot run; least protected       |
 | `loopback` | nothing at all                          | offline work; dev servers become invisible to the browser |
-| `policy`   | an allowlist, plus whatever you approve | **recommended**                                           |
 
 In `policy` mode the sandbox gets its own network namespace with no route out except a
 filtering proxy. Common development hosts — GitHub, npm, PyPI, crates.io, Go modules,
@@ -176,12 +178,13 @@ The waiting command is held for about 45 seconds. If you take longer, it fails w
 message telling you to retry — your answer is still recorded, so the retry goes straight
 through. Nothing is lost by taking your time.
 
-Turn it on and off at any time:
+The installer already did this. These are for checking it, repairing it, or deliberately
+turning it off:
 
 ```sh
-./koi-gateway-installer network on
 ./koi-gateway-installer network status
-./koi-gateway-installer network off
+./koi-gateway-installer network on      # re-run the setup (idempotent)
+./koi-gateway-installer network off     # unfiltered again
 ```
 
 _Provided by:_ `pasta` (namespace networking), `nftables` (default-drop egress filter),
@@ -257,22 +260,23 @@ Chrome side panel  ──WebSocket──▶  koi-gateway  ──stdio──▶  
 **`systemctl --user status koi-gateway`** and **`journalctl --user -u koi-gateway -f`** answer
 most questions. Beyond that:
 
-| Symptom                                                           | Cause                                       | Fix                                                                                                             |
-| ----------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Assistant says the sandbox is unavailable                         | gateway not running                         | `./koi-gateway-installer`                                                                                       |
-| Every command inside the sandbox fails to reach the network       | proxy not running, or on a different port   | `./koi-gateway-installer network on` (re-runs the whole setup)                                                  |
-| `network on` reports missing tools                                | `passt`/`nftables`/`squid` not installed    | say yes when it offers to install them                                                                          |
-| `E: Package 'passt' has no installation candidate`                | Ubuntu 22.04 or older                       | build it from source — see [Requirements](#install)                                                             |
-| `port NNNN is already in use` during `network on`                 | another proxy holds it                      | nothing to do; a free port is chosen automatically                                                              |
-| Gateway log: `MISSING port NNNN is already in use`, sandbox exits | old `koi-net-setup.sh`                      | re-apply the current patch set; the sandbox must check that the proxy is _listening_, not that the port is free |
-| A distro `squid` is running on 3128                               | your package manager started it             | harmless; ours runs on its own port. `sudo systemctl disable --now squid` if unwanted                           |
-| A request fails with **HTTP 403 from proxy**                      | working as designed — the policy refused it | approve the host, or add it to the policy                                                                       |
-| A request fails with **HTTP 500 from proxy**                      | the proxy gave up before you answered       | approve the prompt and run the command again; the answer is remembered                                          |
-| A request fails with **HTTP 503 from proxy**                      | allowed, but DNS or the origin failed       | not a policy problem — the host is genuinely unreachable                                                        |
-| Approval dialogs never appear                                     | no side panel attached, or filtering is off | `./koi-gateway-installer network status`                                                                        |
-| `neither setpriv nor capsh is available ... Refusing to run`      | util-linux/libcap2-bin missing (unusual)    | `sudo apt install util-linux` (or `libcap2-bin`); the filter must not be removable by the sandbox               |
-| `could not install egress filter; refusing to run unfiltered`     | `nft` failed inside the namespace           | working as designed — it fails closed. Check `nft` is installed and unprivileged userns is enabled              |
-| A build needs a host you keep denying                             | —                                           | add it to `~/.koi/network-policy.json`, or click "Always allow"                                                 |
+| Symptom                                                                    | Cause                                                       | Fix                                                                                                             |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Assistant says the sandbox is unavailable                                  | gateway not running                                         | `./koi-gateway-installer`                                                                                       |
+| Every command inside the sandbox fails to reach the network                | proxy not running, or on a different port                   | `./koi-gateway-installer network on` (re-runs the whole setup)                                                  |
+| Gateway log: `nothing is listening on 127.0.0.1:NNNN`, sandbox MCP exits 1 | egress proxy is down; the sandbox refuses to run unfiltered | `./koi-gateway-installer network on`; if it persists, `journalctl --user -u koi-egress -n 30`                   |
+| `network on` reports missing tools                                         | `passt`/`nftables`/`squid` not installed                    | say yes when it offers to install them                                                                          |
+| `E: Package 'passt' has no installation candidate`                         | Ubuntu 22.04 or older                                       | build it from source — see [Requirements](#install)                                                             |
+| `port NNNN is already in use` during `network on`                          | another proxy holds it                                      | nothing to do; a free port is chosen automatically                                                              |
+| Gateway log: `MISSING port NNNN is already in use`, sandbox exits          | old `koi-net-setup.sh`                                      | re-apply the current patch set; the sandbox must check that the proxy is _listening_, not that the port is free |
+| A distro `squid` is running on 3128                                        | your package manager started it                             | harmless; ours runs on its own port. `sudo systemctl disable --now squid` if unwanted                           |
+| A request fails with **HTTP 403 from proxy**                               | working as designed — the policy refused it                 | approve the host, or add it to the policy                                                                       |
+| A request fails with **HTTP 500 from proxy**                               | the proxy gave up before you answered                       | approve the prompt and run the command again; the answer is remembered                                          |
+| A request fails with **HTTP 503 from proxy**                               | allowed, but DNS or the origin failed                       | not a policy problem — the host is genuinely unreachable                                                        |
+| Approval dialogs never appear                                              | no side panel attached, or filtering is off                 | `./koi-gateway-installer network status`                                                                        |
+| `neither setpriv nor capsh is available ... Refusing to run`               | util-linux/libcap2-bin missing (unusual)                    | `sudo apt install util-linux` (or `libcap2-bin`); the filter must not be removable by the sandbox               |
+| `could not install egress filter; refusing to run unfiltered`              | `nft` failed inside the namespace                           | working as designed — it fails closed. Check `nft` is installed and unprivileged userns is enabled              |
+| A build needs a host you keep denying                                      | —                                                           | add it to `~/.koi/network-policy.json`, or click "Always allow"                                                 |
 
 If something looks wrong, `node test-network-approval.mjs` will tell you which layer is
 broken before you start reading logs.

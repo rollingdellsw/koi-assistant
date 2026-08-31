@@ -12,6 +12,7 @@ Instead of running scripts blindly against a headless kernel, this skill connect
 
 A wrong turn costs one turn: if a feature isn't what you intended, adjust it immediately in place rather than starting a script from scratch.
 
+Click to watch the demo:
 [![Click to watch a 50s demo](./docs/freecad-jet-fan.png)](https://youtu.be/x_JI_yhrWeM)
 
 ---
@@ -178,6 +179,8 @@ Get the login, then open the page:
 grep -E 'CUSTOM_USER|PASSWORD' ~/freecad-stream/bridge.env
 ```
 
+Sample output:
+
 ```bash
 CUSTOM_USER=koi
 PASSWORD=ca83a64e1feee09622b2858966289d4edc57c5e5c4c81b2c
@@ -186,14 +189,13 @@ PASSWORD=ca83a64e1feee09622b2858966289d4edc57c5e5c4c81b2c
 Browse to **`https://localhost:3001`** and log in with those. (Remote host: set
 up the tunnel in Step 5 first — the URL stays `localhost:3001`.)
 
-The certificate is self-signed, so the browser warns. Over a loopback tunnel
-that is expected and the traffic is already inside SSH. Do not make a habit of
-clicking through it against a remote address — that is the case where the
-warning means something.
+The https certificate is self-signed, so the browser warns. You can ignore it
+from Chrome's `Advanced` -> `Proceed to [site] (unsafe)`.
 
 **Working means:** you see the FreeCAD desktop and can click menus in it.
 
-### Fix blurry text
+<details>
+<summary><b>Fix FreeCAD blurry text over WebRTC</b></summary>
 
 WebRTC applies automatic UI scaling by default. For a crisp 1:1 display:
 
@@ -208,6 +210,8 @@ WebRTC applies automatic UI scaling by default. For a crisp 1:1 display:
   <br>
 </div>
 
+</details>
+
 ## Step 4: Install and start the bridge
 
 ### 4.1 Copy `koi_bridge.py` into FreeCAD's macro directory
@@ -216,15 +220,11 @@ WebRTC applies automatic UI scaling by default. For a crisp 1:1 display:
 podman unshare mkdir -p ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro
 ```
 
-Copy it out of the skill:
+Download this skill to the FreeCAD WebRTC server, then copy it out of this skill's directory:
 
 ```bash
-# Local host (from repo root):
-podman unshare cp skills/freecad-live/tools/koi_bridge.py ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro/
-
-# Remote host:
-rsync -av skills/freecad-live/tools/koi_bridge.py \
-  $USER@192.168.68.113:~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro/
+git clone https://github.com/rollingdellsw/freecad-skill.git
+podman unshare cp freecad-live/tools/koi_bridge.py ~/freecad-stream/config/.local/share/FreeCAD/v1-1/Macro/
 ```
 
 ### 4.2 Start it manually first
@@ -252,12 +252,14 @@ In the streamed FreeCAD GUI: **Macro → Macros… → `koi_start` → Execute**
 > If nothing happens or the curl test fails, enable the output panels in FreeCAD to see macro errors:
 > **View** -> **Panels** -> check **Report view** and **Python console**.
 
-**Verify from the server:**
+**Verify from the FreeCAD WebRTC server side:**
 
 ```bash
 set -a; . ~/freecad-stream/bridge.env; set +a   # keeps the token out of argv
 curl -s -H "X-Koi-Token: $KOI_BRIDGE_TOKEN" http://127.0.0.1:8765/hello | jq
 ```
+
+Sample output:
 
 ```json
 {
@@ -290,7 +292,7 @@ curl -s -H "X-Koi-Token: $KOI_BRIDGE_TOKEN" http://127.0.0.1:8765/hello | jq
 `"gui": true` is the field that matters: the bridge is inside the process you
 are watching, not a headless second one.
 
-### 4.3 Start it automatically (once 5.2 works)
+### 4.3 Now start it automatically (once 4.2 works)
 
 ```bash
 MODDIR=~/freecad-stream/config/.local/share/FreeCAD/v1-1/Mod/koi_bridge
@@ -342,7 +344,7 @@ koi_bridge: listening on http://0.0.0.0:8765 (protocol 1, gui, dispatch qtimer/1
 koi_bridge: FreeCAD 1.1.x ..., exports to /workspace/koi_export
 ```
 
-## Step 5: Reach the server from your workstation
+## Step 5: Setup ssh tunnel to the server from your workstation
 
 **Skip this entirely if the server runs on the same machine as Chrome** — e.g.
 Windows 11 workstation with the server in WSL2. Loopback already reaches it.
@@ -351,13 +353,13 @@ Otherwise, nothing is published off the FreeCAD host, so both the stream and
 the bridge come to you through one tunnel:
 
 ```bash
-ssh -N -L 3001:127.0.0.1:3001 -L 8765:127.0.0.1:8765 $USER@192.168.68.113
+ssh -N -L 3001:127.0.0.1:3001 -L 8765:127.0.0.1:8765 $USER@$FREECAD_WEBRTC_SERVER
 ```
 
 The stream is then `https://localhost:3001` and the bridge is
 `http://localhost:8765`. The bridge speaks plain HTTP: over the tunnel that is
 fine, because the bytes never touch the wire unencrypted. Pointed straight at
-`http://192.168.68.113:8765` it is not fine — the token and every document
+`http://$FREECAD_WEBRTC_SERVER:8765` it is not fine — the token and every document
 cross the network in the clear, and the skill will say so on attach.
 
 **Verify from the workstation before touching the skill:**
@@ -365,25 +367,23 @@ cross the network in the clear, and the skill will say so on attach.
 ```bash
 # Read the token from a file rather than typing it: a token on the command
 # line is a token in ~/.bash_history.
-KOI_BRIDGE_TOKEN=$(ssh $USER@192.168.68.113 'grep -h KOI_BRIDGE_TOKEN ~/freecad-stream/bridge.env | cut -d= -f2')
+KOI_BRIDGE_TOKEN=$(ssh $USER@$FREECAD_WEBRTC_SERVER 'grep -h KOI_BRIDGE_TOKEN ~/freecad-stream/bridge.env | cut -d= -f2')
 curl -s -H "X-Koi-Token: $KOI_BRIDGE_TOKEN" http://127.0.0.1:8765/hello | jq
 ```
 
 You should see the same JSON as in 5.2.
 
-## Step 6: Point the skill at it
+## Step 6: Config the freecad-live skill
 
-Open **Skills → freecad-live → Run**, fill in three fields, press **Run Skill**.
+Open **Skills → freecad-live → Run** from Koi™ Assistant UI:
 
 | Field         | Value                    | Notes                                                                                                                           |
 | :------------ | :----------------------- | :------------------------------------------------------------------------------------------------------------------------------ |
-| `bridgeUrl`   | `http://localhost:8765`  | Plain HTTP. `https://` fails at the TLS handshake before it can authenticate. Safe here: loopback, or inside the Step 5 tunnel. |
 | `bridgeToken` | from `bridge.env`        | `grep KOI_BRIDGE_TOKEN ~/freecad-stream/bridge.env` on the FreeCAD host.                                                        |
+| `bridgeUrl`   | `http://localhost:8765`  | Plain HTTP. `https://` fails at the TLS handshake before it can authenticate. Safe here: loopback, or inside the Step 5 tunnel. |
 | `streamUrl`   | `https://localhost:3001` | Optional. 3001 is TLS, 3000 is plaintext. Nothing in the skill fetches this; it is the link you open to watch.                  |
 
-Use the Run dialog rather than pasting the token into the chat: it goes from
-the form to the bridge client without entering the transcript. The binding
-lasts for the session; a new session needs the dialog again.
+Click `Save as default` after you fill them in, so you don't need to do this again.
 
 **Verify:** Run test script `/skill freecad-live/scripts/test_connect.js --full-auto` from Koi user message box, a successful attach reports `Script finished. Success: true `.
 If not, review the Koi extension's console log:
@@ -395,10 +395,10 @@ If not, review the Koi extension's console log:
 | `No FreeCAD bridge is answering`           | The macro was never run — Step 5.2, or check the autostart in 5.3.      |
 | Warning that the transport is in the clear | `bridgeUrl` points at a remote host over `http://`. Tunnel it (Step 5). |
 
-At this point you have a working environment. Everything below is optional or
+At this point you have a **working** environment. Everything below is optional or
 explanatory.
 
-## Step 7: Run it as a service (optional but recommended)
+## Step 7: Run FreeCAD as a systemd service (optional but recommended)
 
 So FreeCAD comes back on boot and after a crash.
 

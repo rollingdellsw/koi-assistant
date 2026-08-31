@@ -146,7 +146,8 @@ cmd_preflight() {
         echo "ok       proxy:  listening on 127.0.0.1:${KOI_PROXY_PORT}"
       else
         echo "MISSING  nothing is listening on 127.0.0.1:${KOI_PROXY_PORT} — the egress proxy"
-        echo "         is not running. Start it with: koi-gateway-installer network on"
+        echo "         is not running. It is started by the gateway itself, so restart"
+        echo "         that:  launchctl kickstart -k gui/\$(id -u)/com.koi.gateway"
         rc=1
       fi
     fi
@@ -197,14 +198,15 @@ cmd_preflight() {
       echo "ok       proxy:  listening on 127.0.0.1:${KOI_PROXY_PORT}"
     else
       echo "MISSING  nothing is listening on 127.0.0.1:${KOI_PROXY_PORT} — the egress proxy"
-      echo "         is not running. Start it with: koi-gateway-installer network on"
+      echo "         is not running. It is started by the gateway itself, so restart"
+      echo "         that:  systemctl --user restart koi-gateway"
       rc=1
     fi
   elif port_in_use "${KOI_PROXY_PORT}"; then
-    # Our own proxy already sitting there is not a conflict; it is about to be
-    # restarted onto the same port.
-    if systemctl --user is-active --quiet koi-egress.service 2>/dev/null; then
-      echo "ok       port:   ${KOI_PROXY_PORT} held by our own koi-egress (will be restarted)"
+    # Our own proxy already sitting there is not a conflict; it is a child of
+    # the running gateway and goes down with it when the gateway restarts.
+    if systemctl --user is-active --quiet koi-gateway.service 2>/dev/null; then
+      echo "ok       port:   ${KOI_PROXY_PORT} held by the running gateway's proxy (restarts with it)"
     else
       echo "BUSY     port ${KOI_PROXY_PORT} is in use by something else — another port will be chosen"
       port_rc=3

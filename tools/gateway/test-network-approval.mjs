@@ -48,7 +48,7 @@ import { fileURLToPath } from 'url';
 
 import {
   parseAllowFile, loadPolicy, savePolicy, emptyPolicy, ensurePolicy,
-  hostMatches, evaluate, upsertRule,
+  hostMatches, evaluate, upsertRule, isLoopbackHost,
 } from './koi-net-policy.mjs';
 
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -197,6 +197,40 @@ async function suitePolicy() {
       'deny',
       'a session grant must not be able to open cloud metadata',
     );
+  });
+
+  await test('loopback is allowed without an allowlist entry', () => {
+    // The sandbox reaching a service it is itself running is not egress, and
+    // the policy file cannot carry this rule: ensurePolicy writes it once, so
+    // a seeded entry would never reach an existing install.
+    const policy = { ...emptyPolicy(), default: 'deny' };
+    for (const host of ['localhost', '127.0.0.1', '127.0.0.53', '::1', '[::1]',
+                        'app.localhost', 'LOCALHOST']) {
+      assert.equal(
+        evaluate(policy, { host, port: 3000 }).decision, 'allow',
+        `${host} should be treated as loopback`,
+      );
+    }
+  });
+
+  await test('loopback lookalikes are not treated as loopback', () => {
+    // The check must be an equality/prefix test, not a substring one: a name
+    // an attacker controls must never inherit the loopback grant.
+    const policy = { ...emptyPolicy(), default: 'deny' };
+    for (const host of ['localhost.evil.com', '127.0.0.1.evil.com', 'notlocalhost',
+                        'localhost.com', '1.2.3.4', 'evil.com']) {
+      assert.equal(isLoopbackHost(host), false, `${host} must not be loopback`);
+      assert.equal(evaluate(policy, { host, port: 443 }).decision, 'deny');
+    }
+  });
+
+  await test('an explicit deny still overrides the loopback built-in', () => {
+    // The built-in sits after the deny sweep precisely so this stays possible.
+    const policy = {
+      version: 1, default: 'ask',
+      rules: [{ host: 'localhost', decision: 'deny', source: 'user' }],
+    };
+    assert.equal(evaluate(policy, { host: 'localhost', port: 3000 }).decision, 'deny');
   });
 
   await test('unmatched falls through to the policy default', () => {

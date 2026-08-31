@@ -23,11 +23,21 @@ cd tools/gateway
 ```
 
 The installer resolves the gateway directory and a stable Node path (fnm/nvm/system)
-itself, writes `~/.config/systemd/user/koi-gateway.service` with absolute paths, reloads
-the user daemon, and enables lingering so the service survives logout.
+itself, sets up [egress filtering](#network-egress), writes
+`~/.config/systemd/user/koi-gateway.service` with absolute paths, reloads the user
+daemon, and enables lingering so the service survives logout.
 
-It installs **a service and nothing else** — no packages, no changes to your global
-npm/pip/cargo prefixes, no `apt`. The toolchains stay yours.
+**Egress filtering is part of the install, not an extra step.** A gateway without it
+runs the sandbox with `--net host`: unfiltered internet, plus every service listening on
+your machine. So `install` also switches the sandbox to `--net policy`, and the gateway
+starts the egress proxy itself as part of its own startup — **one service, not two.**
+The only packages it installs are the ones egress filtering needs (`passt`, `nftables`,
+`squid`), and it asks first. Your npm/pip/cargo prefixes and toolchains are untouched.
+
+If those packages cannot be installed, the install still completes — with `--net host`
+and a loud warning telling you so and how to fix it. To skip the setup deliberately:
+`KOI_NET=host ./koi-gateway-installer`. To install non-interactively:
+`KOI_ASSUME_YES=1 ./koi-gateway-installer`.
 
 A **user** service, not a system one: the Gateway spawns the sandbox as _you_, with your
 `$HOME`, your overlays under `~/.koi/sandbox`, and your Node. A root unit would use the
@@ -60,6 +70,7 @@ node koi-gateway.js --config gateway-config.json   # [--port 8080]
 
 ```bash
 ./koi-gateway-installer status
+node test-lower-layer-sync.mjs
 node test-network-approval.mjs
 ```
 
@@ -217,15 +228,77 @@ Three modes, set in `gateway-config.json` or by the installer:
 
 | Mode       | The sandbox can reach               | When                                                      |
 | ---------- | ----------------------------------- | --------------------------------------------------------- |
-| `host`     | everything, unfiltered              | simplest, least protected                                 |
+| `policy`   | an allowlist, plus what you approve | **the default — set up by `install`**                     |
+| `host`     | everything, unfiltered              | fallback when the proxy cannot run; least protected       |
 | `loopback` | nothing at all                      | offline work; dev servers become invisible to the browser |
-| `policy`   | an allowlist, plus what you approve | **recommended**                                           |
+
+`./koi-gateway-installer` already does all of this. The subcommands are for repairing or
+deliberately opting out of it afterwards:
 
 ```bash
-./koi-gateway-installer network on       # install + start the filtering proxy
-./koi-gateway-installer network status
-./koi-gateway-installer network off
+./koi-gateway-installer network status   # mode, enforcement tools, current policy
+./koi-gateway-installer network on       # re-run the setup (idempotent; after a failure)
+./koi-gateway-installer network off      # back to --net host: UNFILTERED
 ```
+
+#### One service starts both
+
+Filtering is **one unit**: `koi-gateway`. In `policy` mode `run-gateway.sh` starts the
+egress proxy (squid + the ACL helper), **waits for the port to actually answer**, and
+only then runs the gateway. Stopping the unit stops both — the proxy is a child in the
+same cgroup.
+
+This used to be two units, and the split was the single most common way the setup broke.
+In `policy` mode the sandbox server **exits at boot** if nothing is listening on the
+proxy port, rather than silently degrading to unfiltered. But `koi-egress` was
+`Type=simple`, so systemd called it _active_ the instant squid forked — before squid had
+parsed its config, spawned the helper and bound the port. `After=` orders starts; it does
+not wait for readiness. So the gateway raced ahead into a proxy that was not up yet and
+the journal read:
+
+```
+MISSING  nothing is listening on 127.0.0.1:3129 — the egress proxy is not running
+[Gateway] Failed to start MCP 'sandbox': exited with code 1 during startup
+```
+
+That looks like a broken gateway, sends you to the wrong log, and — worst of all — often
+cleared up if you restarted by hand, which is not a fix you can rely on. Polling the port
+in one process tree removes the race by construction: the start either works, or it fails
+immediately with squid's own log attached and a line telling you what to run.
+
+The trade, stated plainly: a gateway restart now also restarts the proxy, so **approvals
+in flight are dropped**, and a proxy that dies mid-session is not independently
+resupervised — `Restart=on-failure` brings the pair back together. That is the cost of a
+startup that either works or says why.
+
+#### If the gateway will not start
+
+**Check the service first — a failed start is the expected symptom of a proxy that
+cannot come up.**
+
+```bash
+systemctl --user status koi-gateway     # is it active?
+systemctl --user restart koi-gateway    # restart proxy + gateway together
+journalctl --user -u koi-gateway -n 50  # why it failed
+```
+
+On macOS: `launchctl kickstart -k gui/$(id -u)/com.koi.gateway` and
+`tail -n 50 ~/Library/Logs/koi-gateway.log`.
+
+The log tells you which half failed. `run-gateway:` lines are the proxy startup, and a
+failure there quotes squid's own output:
+
+| In the log                               | Meaning                                       | Fix                                                             |
+| ---------------------------------------- | --------------------------------------------- | --------------------------------------------------------------- |
+| `egress proxy ready on 127.0.0.1:<port>` | proxy is up; any later error is the gateway   | read on in the log                                              |
+| `the egress proxy exited during startup` | squid refused to start (see the quoted log)   | usually a stale `~/.koi/squid/koi-squid.conf` — delete it       |
+| `did not start listening ... within 20s` | squid started but never bound the port        | `./koi-gateway-installer network status`                        |
+| `Cannot bind ... in use`                 | something else holds the port                 | `KOI_PROXY_PORT=<free port> ./koi-gateway-installer network on` |
+| `shm_open ... File exists`               | a system squid owns the default shm namespace | `sudo systemctl stop squid`, or upgrade squid so `-n` works     |
+
+If the proxy cannot be fixed right now, get a working gateway back with
+`./koi-gateway-installer network off` — that returns the sandbox to `--net host`, which
+is **unfiltered**. Re-enable with `network on` once it is sorted.
 
 Hosts are matched by the name (or address) in the proxy's `CONNECT` line. **A raw IP is
 just another host string:** it is matched exactly, never inherits an allowlisted name's
@@ -238,6 +311,21 @@ filtering proxy. Common development hosts are allowed automatically; anything el
 the request and asks you in the side panel, with `once` / `session` / `always` scopes.
 "Always" answers persist to `~/.koi/network-policy.json`. Cloud metadata endpoints are
 denied outright and cannot be approved.
+
+Loopback is always allowed and is not part of the allowlist. `localhost`, `*.localhost`,
+`127.0.0.0/8` and `::1` are decided in the policy engine itself, so the sandbox is never
+asked to approve a service it is already running. An explicit `!localhost` deny still
+overrides it. This grants no new reach — the confine rules already pass `oif "lo"`, and
+`NO_PROXY` lists localhost — it only stops tools that force everything through
+`HTTPS_PROXY` from prompting. Note the asymmetry: a request that genuinely reaches the
+proxy is resolved on the **host**, since Squid runs there, not in the namespace.
+
+In `policy` mode pasta also runs with `-t auto`, which republishes ports bound inside the
+namespace onto host loopback — this is what makes a sandboxed dev server reachable from
+the browser without `--net host`. It reads listening sockets from the namespace's
+`/proc/net/tcp`, so **bind `0.0.0.0`, not `127.0.0.1`**, or there is nothing to forward.
+On WSL2 the Windows `localhost` relay does not always follow the republished port; if the
+browser cannot reach it, use the VM's own IP.
 
 The filter is installed before your command starts, and the capability that installed it
 (`CAP_NET_ADMIN`) is dropped immediately afterwards — so the sandbox cannot take its own
@@ -448,17 +536,22 @@ navigation without the sandbox — keep `SEARCH_MCP_READONLY=1` set there too.
 
 ## Troubleshooting
 
-`systemctl --user status koi-gateway` and `journalctl --user -u koi-gateway -f` answer
-most questions. `node test-network-approval.mjs` answers most of the rest.
+**Start here: `systemctl --user status koi-gateway`.** If it is not active, restart it
+with `systemctl --user restart koi-gateway` — that restarts the egress proxy with it —
+and read `journalctl --user -u koi-gateway -n 50` for the reason. See
+[If the gateway will not start](#if-the-gateway-will-not-start) for what the proxy's
+own messages mean. `node test-network-approval.mjs` answers most of the rest.
 
-| Symptom                                   | Cause                            | Fix                                                                                                                |
-| ----------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Assistant says the sandbox is unavailable | gateway not running              | `./koi-gateway-installer`                                                                                          |
-| `Could not start LSP for <language>`      | server not on the service's PATH | see [PATH](#why-a-language-server-that-works-in-your-terminal-is-invisible-to-the-service), or set `KOI_TOOL_PATH` |
-| Dev server unreachable from the browser   | `--net loopback`                 | use `--net policy` (or `host`)                                                                                     |
-| Stale dev server holding a port           | process reuse across sessions    | check `sandbox_info.services`, stop it, or restart the gateway                                                     |
-| Two windows fighting over the sandbox     | one child process, shared state  | use a single extension window                                                                                      |
-| Overlays eating disk                      | never GC'd, by design            | prune `sessions/<id>/`; the outbox survives                                                                        |
+| Symptom                                                         | Cause                                        | Fix                                                                                                                |
+| --------------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Assistant says the sandbox is unavailable                       | gateway not running                          | `./koi-gateway-installer`                                                                                          |
+| `nothing is listening on 127.0.0.1:<port>`, sandbox MCP exits 1 | `--net policy` and the proxy did not come up | `systemctl --user restart koi-gateway`, then `journalctl --user -u koi-gateway -n 50` for the `run-gateway:` lines |
+| `Could not start LSP for <language>`                            | server not on the service's PATH             | see [PATH](#why-a-language-server-that-works-in-your-terminal-is-invisible-to-the-service), or set `KOI_TOOL_PATH` |
+| Dev server unreachable from the browser                         | bound to `127.0.0.1`, not the net mode       | start it with `--host 0.0.0.0`; on WSL2 also try the VM IP (`ip -4 addr show eth0`) instead of `localhost`         |
+| Dev server unreachable, `--net loopback`                        | egress and port forwarding both off          | use `--net policy` (or `host`)                                                                                     |
+| Stale dev server holding a port                                 | process reuse across sessions                | check `sandbox_info.services`, stop it, or restart the gateway                                                     |
+| Two windows fighting over the sandbox                           | one child process, shared state              | use a single extension window                                                                                      |
+| Overlays eating disk                                            | never GC'd, by design                        | prune `sessions/<id>/`; the outbox survives                                                                        |
 
 Network-filtering symptoms (403/500/503 from the proxy, dialogs never appearing, missing
 `passt`) are tabulated in the
