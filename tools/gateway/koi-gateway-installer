@@ -193,6 +193,166 @@ PKGEOF
   ok "Installed gateway dependencies"
 }
 
+BWRAP_TARGET_TAG="${KOI_BWRAP_VERSION:-v0.11.2}"
+
+# Find a bubblewrap binary that supports --overlay-src (>= 0.11.0)
+find_bwrap() {
+  local c
+  for c in /usr/local/bin/bwrap bwrap /usr/bin/bwrap; do
+    if have_cmd "$c"; then
+      if "$c" --help 2>&1 | grep -q -- '--overlay-src'; then
+        if [ -x "$c" ]; then
+          printf '%s\n' "$c"
+        else
+          command -v "$c"
+        fi
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+bwrap_build_deps_cmd() {
+  if have_cmd apt-get; then
+    printf 'sudo apt-get update -y && sudo apt-get install -y meson ninja-build libcap-dev git build-essential'
+  elif have_cmd dnf; then
+    printf 'sudo dnf install -y meson ninja-build libcap-devel git gcc'
+  elif have_cmd pacman; then
+    printf 'sudo pacman -S --needed meson ninja libcap git gcc'
+  elif have_cmd zypper; then
+    printf 'sudo zypper install -y meson ninja libcap-devel git gcc'
+  fi
+}
+
+install_bwrap_from_source() {
+  local build_cmd; build_cmd="$(bwrap_build_deps_cmd)"
+  if [ -z "$build_cmd" ]; then
+    err "Could not detect package manager to install bubblewrap build dependencies."
+    err "Install meson, ninja, and libcap-dev manually, then build bubblewrap >= 0.11.0."
+    return 1
+  fi
+
+  info "Installing build dependencies for bubblewrap (${BWRAP_TARGET_TAG}) ..."
+  echo "    ${build_cmd}"
+  if [ "${KOI_ASSUME_YES:-0}" != "1" ]; then
+    printf '  Proceed with installing build dependencies? [Y/n] '
+    local reply; read -r reply </dev/tty || reply="n"
+    case "$reply" in [Nn]*) err "Skipped. Bubblewrap >= 0.11.0 is required for the Linux sandbox."; return 1 ;; esac
+  fi
+
+  # shellcheck disable=SC2086
+  eval "$build_cmd" || { err "Failed to install build dependencies. Run: ${build_cmd}"; return 1; }
+
+  local src_dir
+  src_dir="$(mktemp -d /tmp/koi-bwrap-build-XXXXXX)"
+  info "Cloning and building bubblewrap ${BWRAP_TARGET_TAG} in ${src_dir} ..."
+
+  (
+    set -e
+    git clone --depth 1 --branch "$BWRAP_TARGET_TAG" https://github.com/containers/bubblewrap.git "$src_dir" || \
+      git clone --depth 1 https://github.com/containers/bubblewrap.git "$src_dir"
+    cd "$src_dir"
+    meson setup _build --prefix=/usr/local
+    meson compile -C _build
+    echo "Installing bwrap to /usr/local/bin/bwrap ..."
+    sudo meson install -C _build
+  )
+  local build_status=$?
+  rm -rf "$src_dir"
+
+  if [ $build_status -ne 0 ]; then
+    err "Failed to build/install bubblewrap from source."
+    return 1
+  fi
+
+  hash -r 2>/dev/null || true
+  ok "Installed bubblewrap $(/usr/local/bin/bwrap --version 2>/dev/null || true) to /usr/local/bin/bwrap"
+  return 0
+}
+
+# Verify bubblewrap on Linux: checks binary, version (>=0.11.0 for overlayfs), and userns permissions.
+# If missing or version is outdated, offers / forces installation from source.
+ensure_sandbox_linux() {
+  echo
+  info "Checking Linux sandbox backend (bubblewrap) ..."
+
+  local bwrap_bin
+  if bwrap_bin="$(find_bwrap)"; then
+    ok "Found compatible bubblewrap at ${bwrap_bin} ($("$bwrap_bin" --version 2>/dev/null || true))"
+  else
+    local installed_bwrap
+    installed_bwrap="$(command -v bwrap 2>/dev/null || true)"
+    if [ -n "$installed_bwrap" ]; then
+      local bwrap_ver
+      bwrap_ver="$("$installed_bwrap" --version 2>/dev/null || echo 'unknown')"
+      warn "Bubblewrap version mismatch: ${bwrap_ver} found at ${installed_bwrap}."
+      warn "Bubblewrap >= 0.11.0 (with --overlay-src support) is required."
+    else
+      warn "Bubblewrap (bwrap) is not installed."
+      warn "Bubblewrap >= 0.11.0 (with --overlay-src support) is required."
+    fi
+
+    echo
+    info "The installer can build and install bubblewrap ${BWRAP_TARGET_TAG} from source into /usr/local/bin."
+    if [ "${KOI_ASSUME_YES:-0}" != "1" ]; then
+      printf '  Build and install bubblewrap %s now? [Y/n] ' "$BWRAP_TARGET_TAG"
+      local reply; read -r reply </dev/tty || reply="n"
+      case "$reply" in [Nn]*)
+        err "Cannot continue installation without bubblewrap >= 0.11.0."
+        return 1
+        ;;
+      esac
+    fi
+
+    install_bwrap_from_source || {
+      err "Bubblewrap installation failed. Cannot continue."
+      return 1
+    }
+
+    bwrap_bin="$(find_bwrap)" || {
+      err "Could not find bubblewrap with --overlay-src even after build. Aborting."
+      return 1
+    }
+  fi
+
+  # Now test unprivileged user namespace permissions
+  local test_out
+  test_out="$("$bwrap_bin" --ro-bind / / true 2>&1 || true)"
+  if echo "$test_out" | grep -qiE "uid_map|user mappings|Operation not permitted|permission denied"; then
+    warn "bubblewrap cannot create user namespaces: Operation not permitted."
+    warn "On Ubuntu 24.04 (due to AppArmor unprivileged-userns restrictions), this must be enabled."
+    if [ "${KOI_ASSUME_YES:-0}" != "1" ]; then
+      printf '  Configure unprivileged user namespaces with sudo sysctl now? [Y/n] '
+      local reply; read -r reply </dev/tty || reply="n"
+      case "$reply" in [Nn]*)
+        err "Cannot continue without user namespace permissions for bubblewrap."
+        return 1
+        ;;
+      esac
+    fi
+
+    info "Setting kernel.apparmor_restrict_unprivileged_userns=0 ..."
+    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+    echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/99-userns.conf >/dev/null 2>&1 || true
+
+    # Re-test
+    test_out="$("$bwrap_bin" --ro-bind / / true 2>&1 || true)"
+    if echo "$test_out" | grep -qiE "uid_map|user mappings|Operation not permitted|permission denied"; then
+      info "Sysctl alone was insufficient; attempting setuid fallback on ${bwrap_bin} ..."
+      sudo chmod u+s "$bwrap_bin" || true
+      test_out="$("$bwrap_bin" --ro-bind / / true 2>&1 || true)"
+      if echo "$test_out" | grep -qiE "uid_map|user mappings|Operation not permitted|permission denied"; then
+        err "bubblewrap still cannot create user namespaces (${test_out})."
+        return 1
+      fi
+    fi
+  fi
+
+  ok "bubblewrap: ${bwrap_bin} ($("$bwrap_bin" --version 2>/dev/null || true), overlayfs supported, userns enabled)"
+  return 0
+}
+
 # Flatten sandbox-exclude.default (one path per line, `#` comments, blank lines)
 # into the single comma-separated value the sandbox server expects.
 flatten_excludes() {
@@ -473,8 +633,8 @@ Documentation=file://${docs}
 
 [Service]
 Type=simple
-# gateway-config.json uses relative paths (./sandbox-shell-mcp.mjs, ./lsp_search),
-# so the service runs from the gateway directory.
+# gateway-config.json uses relative paths (./sandbox-shell-mcp.mjs), so the
+# service runs from the gateway directory.
 WorkingDirectory=${GATEWAY_DIR}
 # In --net policy mode this starts squid + the ACL helper, waits for the port to
 # answer, and only then runs the gateway. There is no separate proxy unit to
@@ -493,11 +653,13 @@ EOF
   printf 'Environment=KOI_NETWORK_POLICY=%s\n' "${NET_POLICY_FILE}"
   printf 'Environment=KOI_NETWORK_SOCK=%s\n' "${NET_SOCK}"
   printf 'Environment=KOI_PROXY_PORT=%s\n' "${PROXY_PORT}"
+  local bwrap_path; bwrap_path="$(find_bwrap || true)"
+  [ -n "${bwrap_path}" ] && printf 'Environment=KOI_BWRAP_BIN=%s\n' "${bwrap_path}"
   cat <<'EOF'
 Restart=on-failure
 RestartSec=3
-# First start runs the lsp_search autoBuild — allow time. It also covers the
-# proxy readiness poll, which is bounded at 20s inside run-gateway.sh.
+# Covers the proxy readiness poll, which is bounded at 20s inside
+# run-gateway.sh.
 TimeoutStartSec=600
 # The proxy is a child of ExecStart, so the whole cgroup must go on stop or a
 # stale squid keeps the port and the next start cannot bind.
@@ -650,6 +812,7 @@ cmd_install_linux() {
   fi
 
   ensure_deps "$node_bin" || exit 1
+  ensure_sandbox_linux || exit 1
   install_network || exit 1
 
   mkdir -p "$UNIT_DIR"
@@ -920,6 +1083,7 @@ cmd_status() {
   else
     if ! have_systemd_user; then wsl_hint; exit 1; fi
     [ -f "$UNIT_PATH" ] || { info "Not installed. Run: ./koi-gateway-installer"; exit 0; }
+    ensure_sandbox_linux || true
     systemctl --user status "$UNIT" --no-pager || true
   fi
 }
@@ -1001,6 +1165,7 @@ case "${1:-install}" in
   render|print) cmd_render ;;
   excludes|exclude) cmd_excludes ;;
   network|net) shift || true; cmd_network "${1:-status}" ;;
+  sandbox|bwrap) ensure_sandbox_linux ;;
   -h|--help|help) usage ;;
   *) err "Unknown command: $1"; echo; usage; exit 2 ;;
 esac

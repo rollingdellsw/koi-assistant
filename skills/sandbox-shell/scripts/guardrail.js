@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------
 
 const BLOCKED_EXEC_COMMANDS = [
-  // In-place edits: the overlay changes but the LSP index does not (SKILL.md
-  // Golden Rule 3). This is the real port of Deft's "use patch instead of sed".
+  // In-place stream edits are unverifiable: they either match or silently do
+  // nothing, and the model cannot tell which without a second read. This is the
+  // real port of Deft's "use patch instead of sed".
   {
     pattern:
       /(?:^|[;&|]\s*)(?:sed[^|;&]*\s-i\b|perl[^|;&]*\s-[a-z]*i[a-z]*\b|ex\s+-s\b)/,
@@ -17,16 +18,15 @@ const BLOCKED_EXEC_COMMANDS = [
     message:
       "Interactive/pager programs have no TTY in the sandbox and will hang until timeout. Use cat/sed -n, or pipe through 'cat'",
   },
-  // ast-grep rewrites land on disk directly: they mutate the overlay without
-  // going through sandbox_apply_patch, so the LSP index silently desyncs —
-  // exactly the failure mode the sed -i rule above exists to prevent.
-  // Interactive mode additionally needs a TTY the sandbox does not have.
+  // ast-grep's interactive mode needs a TTY the sandbox does not have, so it
+  // hangs until timeout_ms. -U/--update-all is NOT blocked: it is an ordinary
+  // overlay write now that nothing indexes the tree behind the shell's back.
   {
     pattern:
-      /(?:^|[;&|]\s*)(?:ast-grep|sg)\b[^;&|]*(?:\s-U\b|\s--update-all\b|\s-i\b|\s--interactive\b)/,
+      /(?:^|[;&|]\s*)(?:ast-grep|sg)\b[^;&|]*(?:\s-i\b|\s--interactive\b)/,
     message:
-      "ast-grep -U/--update-all writes files without syncing the LSP, and --interactive has no TTY here. " +
-      "Preview the change with `ast-grep run -p '<pattern>' --rewrite '<replacement>'`, then apply it with an atomic Python script via sandbox_exec",
+      "ast-grep --interactive has no TTY here and will hang until timeout. " +
+      "Preview the change with `ast-grep run -p '<pattern>' --rewrite '<replacement>'`, then apply it with `-U` or an atomic Python script via sandbox_exec",
   },
   // Existing rules, kept.
   {
@@ -89,30 +89,6 @@ module.exports = {
     const args = ctx.tool.args || {};
 
     // -----------------------------------------------------------------------
-    // RULE: Trigger overlay FS sync before evaluating mutations
-    // -----------------------------------------------------------------------
-    const MUTATING_TOOLS = [
-      'sandbox_exec',
-      'run_command',
-    ];
-    if (MUTATING_TOOLS.includes(name)) {
-      console.log(`[Guardrail] Triggering overlay FS sync before ${name}...`);
-      try {
-        if (typeof ctx.callTool === 'function') {
-          await ctx.callTool('overlay_fs_sync', {});
-        } else if (typeof tools !== 'undefined' && typeof tools.overlay_fs_sync === 'function') {
-          await tools.overlay_fs_sync({});
-        } else if (typeof tools !== 'undefined' && typeof tools.overlayFsSync === 'function') {
-          await tools.overlayFsSync({});
-        }
-      } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        console.error('[Guardrail] Overlay FS sync failed:', errMsg);
-        return { allowed: false, message: `Guardrail blocked action: Overlay sync failed - ${errMsg}` };
-      }
-    }
-
-    // -----------------------------------------------------------------------
     // RULE 0a: Blocked shell commands
     // -----------------------------------------------------------------------
     if (name === 'sandbox_exec') {
@@ -150,21 +126,6 @@ module.exports = {
   },
 
   output: async (ctx) => {
-    // Sync LSP after successful shell execution so subsequent reads see the mutations
-    if (ctx.tool.name === "sandbox_exec" && !ctx.result.isError) {
-      try {
-        if (typeof ctx.callTool === 'function') {
-          await ctx.callTool('overlay_fs_sync', {});
-        } else if (typeof tools !== 'undefined' && typeof tools.overlay_fs_sync === 'function') {
-          await tools.overlay_fs_sync({});
-        } else if (typeof tools !== 'undefined' && typeof tools.overlayFsSync === 'function') {
-          await tools.overlayFsSync({});
-        }
-      } catch (error) {
-        console.error('[Guardrail] Post-exec overlay FS sync failed:', error);
-      }
-    }
-
     // Anti-pattern 4: Misreporting masked paths
     if (ctx.tool.name === "sandbox_exec" && !ctx.result.isError) {
       // Defensive reads: the output hook runs for EVERY tool, and args/content

@@ -726,7 +726,7 @@ Browsers cannot establish direct TCP/UDP connections (required for databases lik
 - **Auth:** Configurable per Gateway via `auth.mode`:
   - `none` (default) — for **local, single-user development**. The Gateway binds to `127.0.0.1` only and is never reachable from the network. Do not use `none` on a shared or multi-user host.
   - `sso` — intended for managed deployments (token validated against the corporate IdP). **Token verification is not yet implemented; do not deploy `sso` mode in production.**
-- **Best For:** Databases, sandboxed shell access, LSP code intelligence, local file systems, native binaries.
+- **Best For:** Databases, sandboxed shell access, local file systems, native binaries.
 
 **SKILL.md Declaration for Remote MCP:**
 
@@ -759,26 +759,26 @@ The Gateway is a WebSocket-to-stdio bridge: it spawns each MCP server as a child
 
 Two bundled servers matter to skill authors:
 
-| Server     | Endpoint        | Provides                                                                                 |
-| ---------- | --------------- | ---------------------------------------------------------------------------------------- |
-| `sandbox`  | `/mcp/sandbox`  | Sandboxed shell, overlay filesystem, services, patch export — **plus** code intelligence |
-| `postgres` | `/mcp/postgres` | Example database server                                                                  |
+| Server     | Endpoint        | Provides                                                    |
+| ---------- | --------------- | ----------------------------------------------------------- |
+| `sandbox`  | `/mcp/sandbox`  | Sandboxed shell, overlay filesystem, services, patch export |
+| `postgres` | `/mcp/postgres` | Example database server                                     |
 
-The `sandbox` server **embeds code intelligence**: it spawns the compiled `lsp_search` bundle as its own child and re-exports the navigation tools (`search`, `get_references`, `get_hover`, `get_implementation`, `get_file_structure`, `get_lsp_diagnostics`, `search_ast`, `read_ast_node`) through the same endpoint. A skill therefore declares **one** server and gets both. Do not declare a separate `lsp_search` server.
+The `sandbox` server exposes **no navigation tools**. It used to embed a `lsp_search` child and re-export `search` / `get_references` / `get_hover` / `get_implementation` / `get_file_structure` / `get_lsp_diagnostics` / `search_ast` / `read_ast_node`; that duplicated what the session can already do for itself. Language servers, `ast-grep` and `ripgrep` live on the host PATH, so a skill navigates by running them through `sandbox_exec` — which reads through the overlay and therefore sees the session's unshipped edits without any buffer-sync protocol.
 
 Two constraints that affect how a skill behaves at runtime:
 
 - **One client at a time per stateful server.** The Gateway multiplexes all WebSocket clients of a server onto one child process. The `sandbox` server holds global session state (current project, overlay, session id), so two concurrent clients on `/mcp/sandbox` corrupt each other's view.
 - **Process reuse.** Child processes survive extension disconnects and are reattached on reconnect. The sandbox rotates its overlay per client connection, so overlay state does not leak between sessions — but **background services started by a previous session keep running**. A skill that starts dev servers should check `sandbox_info.services` first.
 
-> **Operators:** installation, `gateway-config.json`, the security model (loopback exposure, credential masking, network egress modes), disk retention, the `review` CLI, code-intelligence prerequisites, and troubleshooting are all in
+> **Operators:** installation, `gateway-config.json`, the security model (loopback exposure, credential masking, network egress modes), disk retention, the `review` CLI, host tooling prerequisites, and troubleshooting are all in
 > **[`tools/gateway/README.md`](../tools/gateway/README.md)**.
 > End users of the sandboxed shell want the shorter
 > **[`skills/sandbox-shell/README.md`](../skills/sandbox-shell/README.md)**.
 
 ### 7.5 Using the Gateway from a Skill: `sandbox-shell`
 
-The bundled `sandbox-shell` skill declares the single merged server:
+The bundled `sandbox-shell` skill declares the single server:
 
 ```yaml
 mcp-servers:
@@ -788,7 +788,7 @@ mcp-servers:
     server: sandbox
 ```
 
-The workflow the skill teaches the LLM: `sandbox_info` → `sandbox_open_project` (one call — sets the shell/overlay scope _and_ the code-intelligence workspace) → navigate with `search` / `get_references` / `get_hover`, reading individual declarations with `read_ast_node` rather than whole files → edit via `sandbox_exec` → build/test with `sandbox_exec` → checkpoint with in-overlay `git commit` → ship with `git format-patch -o "$KOI_OUTBOX"` → **the user reviews** the patches in the outbox and applies them with `git am`.
+The workflow the skill teaches the LLM: `sandbox_info` → `sandbox_open_project` (sets the shell/overlay scope) → navigate with `rg` / `ast-grep` through `sandbox_exec`, reading individual declarations rather than whole files → edit via `sandbox_exec` → build/test with `sandbox_exec` → checkpoint with in-overlay `git commit` → ship with `git format-patch -o "$KOI_OUTBOX"` → **the user reviews** the patches in the outbox and applies them with `git am`.
 
 The three properties a skill author should design around:
 

@@ -10,7 +10,7 @@
  */
 
 import { WebSocketServer } from 'ws';
-import { spawn, spawnSync } from 'child_process';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -80,69 +80,6 @@ function loadConfig() {
   }
 
   return config;
-}
-
-// =============================================================================
-// Auto-build — servers can declare an "autoBuild" block in the config:
-//   "autoBuild": {
-//     "dir": "./lsp_search",                  // package dir (relative to cwd)
-//     "check": "dist/index.js",               // build output to test for
-//     "srcDir": "src",                        // rebuilt if sources are newer
-//     "commands": ["npm install", "npm run build"]
-//   }
-// Runs at gateway startup, before listening. Skipped when the check file
-// exists and is newer than every file under srcDir. KOI_REBUILD=1 forces.
-// =============================================================================
-
-function newestMtime(dir) {
-  let newest = 0;
-  let entries;
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
-  for (const ent of entries) {
-    if (ent.name === 'node_modules' || ent.name === 'dist' || ent.name.startsWith('.')) continue;
-    const p = path.join(dir, ent.name);
-    if (ent.isDirectory()) {
-      newest = Math.max(newest, newestMtime(p));
-    } else if (ent.isFile()) {
-      try { newest = Math.max(newest, fs.statSync(p).mtimeMs); } catch { /* ignore */ }
-    }
-  }
-  return newest;
-}
-
-function autoBuildServers(config) {
-  for (const [name, srv] of Object.entries(config.servers)) {
-    const ab = srv.autoBuild;
-    if (!ab || !ab.dir) continue;
-    const dir = path.resolve(ab.dir);
-    if (!fs.existsSync(dir)) {
-      console.error(`[Gateway] ${name}: autoBuild dir not found: ${dir} — skipping (server will not start)`);
-      continue;
-    }
-    const checkPath = ab.check ? path.join(dir, ab.check) : null;
-    const force = process.env.KOI_REBUILD === '1';
-    if (!force && checkPath && fs.existsSync(checkPath)) {
-      const built = fs.statSync(checkPath).mtimeMs;
-      const src = newestMtime(path.join(dir, ab.srcDir || 'src'));
-      if (built >= src) {
-        console.log(`[Gateway] ${name}: build up to date (${ab.check}; KOI_REBUILD=1 to force)`);
-        continue;
-      }
-      console.log(`[Gateway] ${name}: sources newer than ${ab.check} — rebuilding`);
-    }
-    const commands = ab.commands || ['npm install', 'npm run build'];
-    let ok = true;
-    for (const cmd of commands) {
-      console.log(`[Gateway] ${name}: running '${cmd}' in ${dir} ...`);
-      const r = spawnSync(cmd, { cwd: dir, shell: true, stdio: 'inherit' });
-      if (r.status !== 0) {
-        console.error(`[Gateway] ${name}: '${cmd}' failed (exit ${r.status}); this server will likely fail to start.`);
-        ok = false;
-        break;
-      }
-    }
-    if (ok) console.log(`[Gateway] ${name}: build complete`);
-  }
 }
 
 // =============================================================================
@@ -424,7 +361,6 @@ class Gateway {
 // =============================================================================
 
 const config = loadConfig();
-autoBuildServers(config);
 const gateway = new Gateway(config);
 
 // Handle graceful shutdown

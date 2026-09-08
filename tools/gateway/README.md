@@ -107,13 +107,7 @@ Everything is in `gateway-config.json`:
         "10GB",
         "--net",
         "policy"
-      ],
-      "autoBuild": {
-        "dir": "./lsp_search",
-        "check": "dist/index.js",
-        "srcDir": "src",
-        "commands": ["npm install", "npm run build"]
-      }
+      ]
     }
   }
 }
@@ -125,16 +119,14 @@ Everything is in `gateway-config.json`:
 | `auth.mode`      | `none` (local single-user) or `sso` (**not implemented — see below**) |
 | `allowedOrigins` | Which extension IDs may connect from a browser page                   |
 | `servers`        | The MCP servers to spawn, by name (`/mcp/<name>`)                     |
-| `autoBuild`      | Build commands run at startup when output is missing or stale         |
 
-The `sandbox` server **embeds code intelligence**: it spawns the compiled `lsp_search`
-bundle as its own child and re-exports the navigation tools through the single
-`/mcp/sandbox` endpoint. That is why `autoBuild` for `lsp_search` sits under the
-`sandbox` entry — the Gateway builds the bundle so the sandbox server finds it next to
-itself. Do **not** declare a separate `lsp_search` server for the `sandbox-shell` skill.
-
-`autoBuild` commands run with your shell and your privileges. Set `KOI_REBUILD=1` to
-force a rebuild. Only use config files you trust.
+The `sandbox` server exposes a shell, an overlay filesystem, services and patch export —
+and nothing else. It used to spawn a compiled `lsp_search` bundle as a child and
+re-export its navigation tools through the same endpoint; that duplicated work the
+session can do for itself, so it is gone, along with the `autoBuild` config block that
+built it. The assistant navigates by running `rg`, `ast-grep` and your project's own
+compiler in the sandbox, which means what it sees is exactly what you would see. See
+[Host tooling](#host-tooling-for-code-navigation).
 
 **Do not inline secrets here.** Prefer the per-server `env` block. The whole host
 filesystem — including this file — is _readable inside the sandbox_, so a password
@@ -179,9 +171,11 @@ multi-user host, do not run it until token auth exists.
 
 **Backends by platform:**
 
-- **linux** → bubblewrap + overlayfs. Needs `sudo apt install bubblewrap`. On Ubuntu
-  24.04 the AppArmor unprivileged-userns restriction may need the bwrap profile, or
-  `kernel.apparmor_restrict_unprivileged_userns=0`.
+- **linux** → bubblewrap + overlayfs. **Requires bubblewrap >= 0.11.0** for overlayfs
+  support (`--overlay-src`, `--overlay`). Default package manager builds (e.g. Ubuntu 22.04 / 24.04 LTS)
+  provide older versions (< 0.11.0); build 0.11.0+ from source (`meson setup _build && meson compile -C _build && sudo meson install -C _build`).
+  On Ubuntu 24.04, the default AppArmor unprivileged-userns restriction blocks user namespaces;
+  allow with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s $(which bwrap)`.
 - **darwin** → `sandbox-exec` (seatbelt) + an APFS copy-on-write clone. Host writes are
   denied and credentials are masked with deny-read rules, but the guarantees differ in
   kind from the Linux ones — see [Platform parity](#platform-parity-linux-vs-macos).
@@ -464,35 +458,30 @@ momentarily inconsistent view that corrects itself on the next refresh.
 
 ---
 
-## Code intelligence prerequisites
+## Host tooling for code navigation
 
-The `sandbox` server re-exports code navigation over three tiers. Each is **optional and
-degrades independently**: no language server skips the semantic tier, no `ast-grep` skips
-the structural tier, no `rg` skips text search. Startup logs what it could not find, and
-`sandbox_open_project` reports `codeIntelligence.available`.
+Navigation is not a Gateway feature. The session searches and reads code by running
+ordinary commands in the sandbox, so what it can do is exactly what is installed on your
+machine and reachable from the service's PATH. Nothing is indexed in the background, and
+the host tree stays read-only either way — every write lands in the overlay.
 
 **You install these yourself** — the installer does not add packages.
 
 ```bash
-# Text tier
+# Text
 sudo apt install ripgrep                 # or: brew install ripgrep
 
-# Structural tier (tree-sitter)
+# Structural (tree-sitter)
 npm install -g @ast-grep/cli             # or: brew install ast-grep
 
-# Semantic tier — only the languages you use
-pip install python-lsp-server[all]                    # Python
-npm install -g typescript-language-server typescript  # JS/TS
-rustup component add rust-analyzer                    # Rust
-go install golang.org/x/tools/gopls@latest            # Go
-sudo apt install clangd                               # C/C++
+# Semantic: your project's own toolchain (tsc, cargo, go, clangd, ...)
 ```
 
-Restart the Gateway after installing anything — capability detection runs at startup.
-Prefer the `ast-grep` binary name over its `sg` alias: on Linux `sg` is also
-shadow-utils' setgid shell.
+Nothing needs a Gateway restart — the sandbox resolves binaries per command. Prefer the
+`ast-grep` binary name over its `sg` alias: on Linux `sg` is also shadow-utils' setgid
+shell.
 
-### Why a language server that works in your terminal is invisible to the service
+### Why a tool that works in your terminal is invisible to the service
 
 A systemd **user service** does not read your shell profile. It inherits the user
 manager's PATH, which on a stock Ubuntu is:
@@ -503,34 +492,23 @@ manager's PATH, which on a stock Ubuntu is:
 
 Every per-user toolchain directory is missing from that list — `rustup` installs to
 `~/.cargo/bin`, `go install` to `~/go/bin`, `pip --user` to `~/.local/bin`, and nvm/fnm
-put npm globals beside the versioned node binary. That is why a server that works
-perfectly in your terminal can be invisible to the service, surfacing as
-`Could not start LSP for <language>` with no other explanation.
+put npm globals beside the versioned node binary. The sandbox inherits the Gateway's
+environment, so a toolchain that works perfectly in your terminal can be missing inside a
+session, surfacing as a bare `command not found`.
 
-So `lsp_search` does not trust the inherited PATH: it also searches the standard per-user
-toolchain directories, and passes the widened PATH to the servers it spawns — necessary
-because rust-analyzer shells out to `cargo` and gopls to `go`. Startup logs every tool it
-resolved and the absolute path it found:
+`run-gateway.sh` resolves a Node binary and puts its directory on PATH. Nothing else is
+added automatically. If the session cannot see something you have installed, put its
+directory in the service environment and restart:
 
+```sh
+systemctl --user edit koi-gateway
+# [Service]
+# Environment=PATH=%h/.cargo/bin:%h/go/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+systemctl --user restart koi-gateway
 ```
-[Search MCP] Host tools:
-[Search MCP]   ✓ rg: /usr/bin/rg
-[Search MCP]   ✓ rust-analyzer: /home/you/.cargo/bin/rust-analyzer
-[Search MCP]   ✗ gopls
-```
 
-| Variable                   | Effect                                            |
-| -------------------------- | ------------------------------------------------- |
-| `KOI_TOOL_PATH=/opt/x/bin` | Prepended to the search path; wins over the rest  |
-| `KOI_TOOL_PATH_AUGMENT=0`  | Disable augmentation; use only the inherited PATH |
-
-This widens where the Gateway looks. It does not modify your environment, install
-anything, or affect other services.
-
-The child runs with `SEARCH_MCP_READONLY=1`, so no code-intelligence tool can write to
-the real host tree; all mutations flow through the overlay and leave only as patches.
-`lsp_search` can also be deployed as a standalone Gateway server for skills that want
-navigation without the sandbox — keep `SEARCH_MCP_READONLY=1` set there too.
+Ask the session itself what it sees — `command -v rg ast-grep cargo go` through
+`sandbox_exec` is the only answer that counts.
 
 ---
 
@@ -542,16 +520,19 @@ and read `journalctl --user -u koi-gateway -n 50` for the reason. See
 [If the gateway will not start](#if-the-gateway-will-not-start) for what the proxy's
 own messages mean. `node test-network-approval.mjs` answers most of the rest.
 
-| Symptom                                                         | Cause                                        | Fix                                                                                                                |
-| --------------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Assistant says the sandbox is unavailable                       | gateway not running                          | `./koi-gateway-installer`                                                                                          |
-| `nothing is listening on 127.0.0.1:<port>`, sandbox MCP exits 1 | `--net policy` and the proxy did not come up | `systemctl --user restart koi-gateway`, then `journalctl --user -u koi-gateway -n 50` for the `run-gateway:` lines |
-| `Could not start LSP for <language>`                            | server not on the service's PATH             | see [PATH](#why-a-language-server-that-works-in-your-terminal-is-invisible-to-the-service), or set `KOI_TOOL_PATH` |
-| Dev server unreachable from the browser                         | bound to `127.0.0.1`, not the net mode       | start it with `--host 0.0.0.0`; on WSL2 also try the VM IP (`ip -4 addr show eth0`) instead of `localhost`         |
-| Dev server unreachable, `--net loopback`                        | egress and port forwarding both off          | use `--net policy` (or `host`)                                                                                     |
-| Stale dev server holding a port                                 | process reuse across sessions                | check `sandbox_info.services`, stop it, or restart the gateway                                                     |
-| Two windows fighting over the sandbox                           | one child process, shared state              | use a single extension window                                                                                      |
-| Overlays eating disk                                            | never GC'd, by design                        | prune `sessions/<id>/`; the outbox survives                                                                        |
+| Symptom                                                         | Cause                                        | Fix                                                                                                                                                                                            |
+| --------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Assistant says the sandbox is unavailable                       | gateway not running                          | `./koi-gateway-installer`                                                                                                                                                                      |
+| `nothing is listening on 127.0.0.1:<port>`, sandbox MCP exits 1 | `--net policy` and the proxy did not come up | `systemctl --user restart koi-gateway`, then `journalctl --user -u koi-gateway -n 50` for the `run-gateway:` lines                                                                             |
+| `bwrap: Unknown option --overlay-src`                           | `bwrap` is older than 0.11.0                 | Build and install bubblewrap >= 0.11.0: `git clone https://github.com/containers/bubblewrap && cd bubblewrap && meson setup _build && meson compile -C _build && sudo meson install -C _build` |
+| `Couldn't write to /proc/self/uid_map: Operation not permitted` | unprivileged user namespaces restricted      | `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s $(which bwrap)`                                                                                             |
+| `bubblewrap not found`                                          | `bwrap` is not installed                     | Install or compile bubblewrap >= 0.11.0                                                                                                                                                        |
+| `command not found` in the sandbox for a tool you have          | tool not on the service's PATH               | see [PATH](#why-a-tool-that-works-in-your-terminal-is-invisible-to-the-service)                                                                                                                |
+| Dev server unreachable from the browser                         | bound to `127.0.0.1`, not the net mode       | start it with `--host 0.0.0.0`; on WSL2 also try the VM IP (`ip -4 addr show eth0`) instead of `localhost`                                                                                     |
+| Dev server unreachable, `--net loopback`                        | egress and port forwarding both off          | use `--net policy` (or `host`)                                                                                                                                                                 |
+| Stale dev server holding a port                                 | process reuse across sessions                | check `sandbox_info.services`, stop it, or restart the gateway                                                                                                                                 |
+| Two windows fighting over the sandbox                           | one child process, shared state              | use a single extension window                                                                                                                                                                  |
+| Overlays eating disk                                            | never GC'd, by design                        | prune `sessions/<id>/`; the outbox survives                                                                                                                                                    |
 
 Network-filtering symptoms (403/500/503 from the proxy, dialogs never appearing, missing
 `passt`) are tabulated in the

@@ -1,6 +1,6 @@
 ---
 name: google-workspace
-version: 2.1.0
+version: 2.1.2
 description: Comprehensive Google Workspace MCP - Drive, Sheets, Docs, Slides, Gmail, Calendar. Write operations restricted to agent-created files via guardrail.
 url-patterns:
   - "https://docs.google.com/spreadsheets/*"
@@ -26,14 +26,17 @@ allowed-tools:
   - docs_read_content
   - docs_get_images
   - docs_get_urls
+  - gsuite_download_image
   - slides_create
   - slides_batch_update
   - slides_get_metadata
   - slides_read_content
   - slides_get_urls
+  - slides_get_thumbnail
   - drive_list
   - drive_search
   - drive_get_file_metadata
+  - drive_render_page
   - gmail_search
   - gmail_get_message
   - gmail_list_labels
@@ -56,7 +59,12 @@ mcp-servers:
       client_id: 474535101182-poobgugcnom698jmuq6o0io9376el2jl.apps.googleusercontent.com
       allowed_domains:
         - googleapis.com
-guardrails: scripts/guardrail.js
+        # The Slides thumbnail endpoint (slides_get_thumbnail) and image
+        # content URLs resolve to short-lived signed CDN hosts such as
+        # lh7-us.googleusercontent.com / lh7-rt.googleusercontent.com.
+        # Without this, the JSON call succeeds but the image fetch is
+        # blocked ("Domain not in allowed_domains").
+        - googleusercontent.com
 ---
 
 # Google Workspace Skill
@@ -69,6 +77,48 @@ Write/mutate tools (`sheets_write_range`, `sheets_batch_update`, `sheets_clear_r
 
 Read tools work on any file the user has access to — no restrictions.
 
+## Reading Visual Content
+
+The text APIs see text runs and embedded rasters. They do **not** see native
+charts, linked Sheets charts, Drawings, equations, or the geometry of a table or
+a slide layout. When a question turns on any of those, read the text _and_ look
+at the page:
+
+- **Slides** — `slides_get_thumbnail({ presentationId, slideIndex })`. One call,
+  no export, renders exactly what the slide looks like. Prefer it over
+  `drive_render_page` for any presentation.
+- **Docs and Sheets** — `drive_render_page({ fileId, page })`. Google exports the
+  file to PDF with its own renderer and the page is rasterized, so page numbers
+  match what the user sees on screen. The response reports `totalPages`,
+  `prevPage`, and `nextPage` for paging through.
+- **Zooming in** — pass `region` in normalized 0-1 page coordinates to crop. The
+  pixel budget is spent on the crop, so a small region comes back sharper. Supported
+  by both `drive_render_page` and `slides_get_thumbnail`:
+  `drive_render_page({ fileId, page: 3, region: { x: 0, y: 0.5, width: 0.5, height: 0.5 } })`
+  `slides_get_thumbnail({ presentationId, slideIndex: 3, region: { x: 0, y: 0.5, width: 0.5, height: 0.5 } })`
+
+**Images cost context.** Resolution tiers match `takeScreenshot`: `low` (480px,
+the default, ~1k tokens), `medium` (1280px), `high` (1920px), `original`
+(uncapped). A `low` crop of one chart is both cheaper and more legible than a
+whole page at `high`, so crop first and raise the tier only when the crop is
+genuinely unreadable.
+
+Text remains the source of truth for prose and numbers — `docs_read_content` and
+`sheets_read_range` are exact, and a render is not. Use the render for what the
+text cannot express, and do not transcribe body text out of an image when a text
+tool can return it.
+
+**Text APIs return element order, not visual order.** `slides_read_content`
+returns text runs in the presentation's internal element order — not
+left-to-right, top-to-bottom layout order. On slides with several text boxes
+(e.g. a heading plus per-column captions), a caption can appear _before_ the
+heading it belongs to, and bio/description text can be mis-attributed to the
+wrong name. When which text goes with which person, date, or column matters,
+confirm the layout with `slides_get_thumbnail`.
+
+Exports are cached for five minutes per file, so paging through a document does
+not re-export it. Drive refuses to export files over ~10MB.
+
 ## Available Tools
 
 ### Google Drive (read-only)
@@ -76,6 +126,7 @@ Read tools work on any file the user has access to — no restrictions.
 - `drive_list` - List/filter files with pagination
 - `drive_search` - Full-text search across Drive
 - `drive_get_file_metadata` - Get file details (name, type, owners, URL)
+- `drive_render_page` - Render one page of a Doc/Sheet/Slides file as an image (see Reading Visual Content)
 
 ### Google Sheets (CRUD on own files, read on all)
 
@@ -105,6 +156,7 @@ Read tools work on any file the user has access to — no restrictions.
 - `slides_get_metadata` - Get presentation metadata and slide list
 - `slides_read_content` - Read slide text and image inventory (with slide-range pagination). Each slide includes any embedded images with contentUrl for downloading via `gsuite_download_image`.
 - `slides_get_urls` - Extract all hyperlinks
+- `slides_get_thumbnail` - Render a single slide as an image (see Reading Visual Content)
 
 ### Gmail (read-only)
 

@@ -1,6 +1,6 @@
 ---
 name: sandbox-shell
-version: 2.3.0
+version: 2.4.0
 description: >-
   A shell on the user's machine inside a safety sandbox — the bridge to the
   local filesystem and toolchain. Load this whenever a task touches the
@@ -9,15 +9,15 @@ description: >-
   installed tools and versions, running a script, test, or one-off command
   (python/node/jq/awk/...), and processing data too large to paste into
   chat. Produced files are delivered to the user via an outbox. Also the
-  full coding workflow: LSP code navigation, overlay edits, build/test with
+  full coding workflow: code navigation, overlay edits, build/test with
   the host toolchain, git-patch shipping, browser verification of dev
   servers. The host is read-only inside the sandbox (writes land in an
   overlay; nothing on the machine changes unless the user applies exported
   patches or takes files from the outbox), so it is safe to load and use
-  liberally. Code navigation spans three tiers: LSP (semantic), tree-sitter
-  (structural/boundary-aware, via the optional ast-grep CLI), and ripgrep
-  (text). Not needed for purely in-browser/web tasks with no local-file
-  or local-execution component.
+  liberally. Code navigation is done with the host's own CLIs through the
+  shell — a language server front-end (semantic), ast-grep (structural),
+  ripgrep (text) — not with dedicated tools. Not needed for purely
+  in-browser/web tasks with no local-file or local-execution component.
 runnable: true
 mcp-servers:
   - name: sandbox
@@ -45,21 +45,13 @@ allowed-tools:
   - sandbox_reset
   - sandbox_info
   - sandbox_network_policy
-  - search
-  - search_ast
-  - read_ast_node
-  - get_references
-  - get_hover
-  - get_implementation
-  - get_file_structure
-  - get_lsp_diagnostics
 guardrails: scripts/guardrail.js
 reminders:
   - id: "sandbox:prefer-lsp"
     trigger:
       type: "file_pattern"
       pattern: '\.(ts|tsx|js|jsx|rs|py|go|cpp|c|h|hpp)$'
-    content: "For cross-file symbol lookups, type definitions, callers, or implementations, prefer semantic LSP tools (`search` -> `get_references`, `get_implementation`, `get_hover`) over text grep to avoid false positives."
+    content: "Code navigation is shell-based here — there are no navigation tools to call. For cross-file symbol lookups, callers, or implementations, run a language-server CLI or `ast-grep` through `sandbox_exec` (e.g. `ast-grep run -p '<pattern>' --lang ts`) before falling back to `rg`/`grep`, which matches comments, strings and unrelated same-named symbols."
     strategy: "sticky"
     priority: "medium"
   - id: "sandbox:outbox-delivery"
@@ -91,7 +83,8 @@ reminders:
 
 # Sandbox Shell
 
-You have a **shell on the user's machine inside a sandbox**, plus **LSP code intelligence** for project work.
+You have a **shell on the user's machine inside a sandbox**. Everything —
+including code navigation — is a command you run in it.
 
 👑 **The Golden Rules:**
 
@@ -100,7 +93,7 @@ You have a **shell on the user's machine inside a sandbox**, plus **LSP code int
    is `$KOI_OUTBOX`. For a GREENFIELD project the overlay tree is itself
    host-visible at `sandbox_info.overlayHostPath` and the user copies it out —
    delivery there is automatic and cannot fail. See "Shipping changes".
-3. **LSP Syncing:** All edits are made via `sandbox_exec` (e.g. atomic Python scripts or `cat << 'EOF' > file`). The guardrail automatically invokes `overlay_fs_sync` after `sandbox_exec` so code intelligence and LSP memory stay immediately synchronized with the overlay.
+3. **Edits Are Shell Writes:** All edits are made via `sandbox_exec` (e.g. atomic Python scripts or `cat << 'EOF' > file`). They land in the overlay, and every later command reads through the overlay — so a tool you run in the next turn already sees them. Nothing needs to be re-synced. If the **user** changes a file on the host mid-session, call `overlay_fs_sync` to pull their version in.
 4. **No Guessing:** Never guess the outbox path or context lines for a patch. Always read the file or call `sandbox_info` first.
 5. **Masked Paths:** The host's `/tmp`, `/run`, and credential files (`~/.ssh`, `~/.aws`, etc.) are hidden for security. **Never** tell the user these files "do not exist". Explicitly state: _"This path is masked from the sandbox."_ If you need them for a build, ask the user to restart the MCP server with `--allow-creds`.
 
@@ -112,7 +105,7 @@ For anything that is not sustained work on one codebase (e.g. "read this log", "
 
 For sustained work on one codebase (editing, building, testing, shipping patches), you must open the project first.
 
-1. Call `sandbox_open_project({ path })`. This sets the shell/overlay scope **and** points code intelligence (LSP) at the same project. Each new session starts from a **fresh overlay over the host tree**. Its response includes the `outbox` for that project.
+1. Call `sandbox_open_project({ path })`. This sets the shell/overlay scope: the writable overlay location, the working directory, and the relative path root. Each new session starts from a **fresh overlay over the host tree**. Its response includes the `outbox` for that project.
 2. Call `sandbox_info` for the full picture (backend, services, `gitWorkflow`).
 
 > **The outbox path changes with the project.** It is keyed by a hash of the
@@ -132,104 +125,71 @@ For sustained work on one codebase (editing, building, testing, shipping patches
 | Outbox       | `$KOI_OUTBOX` in your shell; files written there appear on the host                                             |
 | Overlay path | `sandbox_info.overlayHostPath` — the overlay's host-side location. On greenfield this is the whole project tree |
 | Services     | Long-running processes owned by the server (e.g. dev servers)                                                   |
-| LSP          | Host-tree index **plus your synced edits** — automatically synced after `sandbox_exec` mutations                |
 
-## Navigating code: LSP first, tree-sitter second, grep last
+## Navigating code (all through `sandbox_exec`)
 
-Prefer semantic tools over `grep`/`rg` for symbols. They use the language server (Rust, TS, C++, Go, Python).
+There are **no navigation tools on this endpoint**. Every command below runs in
+the shell, reads **through your overlay** (so it sees edits you have not
+shipped), and depends on the binary existing on the host.
 
-- `search` (LSP-backed, text fallback)
-- `search_ast` (tree-sitter structural patterns)
-- `get_references` (file, line, column)
-- `get_hover`
-- `get_implementation`
-- `get_file_structure`
-- `get_lsp_diagnostics`
+**Check what you have, once, at the start of project work:**
 
-**Both upper tiers can be absent on a given machine.** The language server may
-be down and the `ast-grep` CLI may not be installed, which takes out
-`get_lsp_diagnostics`, `read_ast_node` and `search_ast` together and leaves you
-on ripgrep plus `sed -n '<start>,<end>p'` for reading ranges. That is a
-supported way to work — just notice it early rather than assuming the fancy
-tools are available.
-
-`get_lsp_diagnostics` now **throws** when no server analyzed the file, instead
-of returning an empty list. Empty means clean; an error means unchecked. Never
-treat "no diagnostics" from a degraded backend as a passing build — run the
-project's own compiler (`tsc --noEmit`, `cargo check`) to confirm.
-**LSP Tool Examples:**
-
-- `search({ query: "ClassName" })`
-- `get_references({ file_path: "src/main.ts", line: 10, column: 5 })`
-
-### Tree-sitter: `search_ast` and `read_ast_node`
-
-LSP is the **brain** — it knows `User` in one file is the same type as `User`
-in another. Tree-sitter is the **eyes** — it knows exactly where the `User`
-class starts and ends. You need both.
-
-Tree-sitter needs no index and no language server, works on a file with a
-syntax error three lines above, and answers in milliseconds. `search` already
-falls back to it automatically when the LSP is cold, missing, or the project
-does not build; the two tools below are for when you want it deliberately.
-
-**`read_ast_node` — read one declaration, not the file.**
-
-This is your defence against burning the context window on a 3,000-line file.
-LSP tells you `handleSubmit` is on line 450; tree-sitter tells you it spans
-450-612 and hands you exactly those lines.
-
-```
-read_ast_node({ file_path: "src/app.ts", name: "handleSubmit" })
-read_ast_node({ file_path: "src/user.rs", name: "User", node_type: "class" })
+```bash
+command -v rg ast-grep tsc cargo gopls clangd 2>/dev/null; echo "---"
 ```
 
-It reads through your overlay, so it reflects unshipped edits. **To replace a
-declaration:** call it first, then use the returned `code` as target strings for an
-atomic Python replacement in `sandbox_exec` (`assert old in s; s = s.replace(old, new, 1)`).
+Any tier can be missing. Notice that early instead of assuming, and say so in
+your report rather than silently degrading.
 
-**`search_ast` — find a code shape.**
+| Tier       | Command                                                           | Good for                                       |
+| ---------- | ----------------------------------------------------------------- | ---------------------------------------------- |
+| Semantic   | the project's own type-checker/compiler, or a language-server CLI | real diagnostics, resolving aliased re-exports |
+| Structural | `ast-grep run -p '<pattern>' --lang <lang>`                       | code _shapes_, boundary-accurate matches       |
+| Text       | `rg -n 'Foo' --glob '!node_modules'`                              | strings, TODOs, config keys, last resort       |
 
-Use it when the thing you want is a shape, not a name: calls with a particular
-argument, empty catch blocks, functions returning `Result`.
+**Ground truth for "is it broken" is the project's own build**, not a search:
+`tsc --noEmit`, `cargo check`, `go build ./...`, `pytest -q`. A clean grep is
+not a passing build.
+
+### `ast-grep` — structure, not text
+
+Prefer the `ast-grep` binary name over its `sg` alias: on Linux `sg` is also
+shadow-utils' setgid shell.
 
 Pattern syntax: `$VAR` = one node (captured), `$$$ARGS` = zero or more nodes,
 `$_` = one node, uncaptured. A pattern must be parseable code on its own —
 `foo($$$)` works, `foo(` does not.
 
+```bash
+ast-grep run -p 'console.log($$$ARGS)' --lang ts src/
+ast-grep run -p 'fn $NAME($$$) -> Result<$OK, $ERR> { $$$ }' --lang rust src/
+ast-grep run -p 'await $CALL' src/tools/search-code.ts
 ```
-search_ast({ pattern: "console.log($$$ARGS)", lang: "ts" })
-search_ast({ pattern: "fn $NAME($$$) -> Result<$OK, $ERR> { $$$ }", lang: "rust" })
-search_ast({ pattern: "await $CALL", file_path: "src/tools/search-code.ts" })
+
+**Read one declaration instead of a 3,000-line file.** This is your main
+defence against burning the context window:
+
+```bash
+ast-grep run -p 'function handleSubmit($$$) { $$$ }' --lang ts src/app.ts
+ast-grep run -p 'class User { $$$ }' --lang rust src/user.rs
 ```
 
-Relational queries ("X inside Y") use `rule` with inline ast-grep YAML instead
-of `pattern`.
+Relational queries ("X inside Y") take a rule file: `ast-grep scan -r rule.yml`.
 
-**Choosing a tool:**
+**Rewrites:** preview with `--rewrite '<replacement>'`, then apply with `-U`
+(or with an atomic Python script if the edit is delicate). Always read the
+preview before applying — an ast-grep pattern that matches more than you meant
+rewrites all of it in one pass.
 
-| You want                           | Tool                                          |
-| ---------------------------------- | --------------------------------------------- |
-| where is `UserService` defined     | `search`                                      |
-| the body of `handleSubmit`, only   | `read_ast_node`                               |
-| who actually calls this symbol     | `get_references` (semantic; resolves aliases) |
-| every call with a literal password | `search_ast`                                  |
-| any string containing TODO         | `search` (text tier)                          |
-
-**Caveats:**
-
-- Tree-sitter is **syntactic**. Same-named symbols in unrelated modules all
-  match. For true call sites, `get_references` is still correct.
-- A **directory** search reads the host tree and will not see edits you have
-  not shipped. Pass `file_path` to go through your overlay.
-
-If a tool reports that `ast-grep` is missing, tell the user how to install it
+If `ast-grep` is missing, tell the user how to install it
 (`npm install -g @ast-grep/cli`, `brew install ast-grep`, or
-`cargo install ast-grep --locked`) and that the Gateway needs a restart
-afterwards. Do not retry until they confirm; `search` still works meanwhile.
+`cargo install ast-grep --locked`) and carry on with `rg` plus
+`sed -n '<start>,<end>p'` for reading ranges. That is a supported way to work.
 
-Preview ast-grep rewrites with `ast-grep run -p '<pattern>' --rewrite '<replacement>'`,
-then apply them with an atomic script in `sandbox_exec`.
+**Caveat that matters:** text and structural search are both **syntactic**.
+Same-named symbols in unrelated modules all match, and a re-exported or aliased
+symbol will not. When a rename has to be exhaustive, confirm with the
+compiler after the edit, not with the search before it.
 
 ## Build / test / services
 
@@ -265,7 +225,7 @@ npm test && python3 -m pyflakes ...
 - **Transactional safety:** If any `assert` fails, the file is never written to disk.
 - **1-turn turnaround:** Edit, build, lint, and test occur in a single round trip.
 - **No diff context failures:** Raw multiline strings bypass patch fuzzing and line-number mismatches.
-- **LSP Note:** Shell writes land in the overlay filesystem; call `overlay_fs_sync` if you need the LSP to refresh its symbol cache/diagnostics immediately.
+- **Visibility:** Shell writes land in the overlay, and every later command reads through it — the next `ast-grep`/`rg`/`tsc` run already sees them. `overlay_fs_sync` is only for the reverse direction: pulling in a change the _user_ made on the host.
 
 **Shell is `bash` (`/bin/bash`).** Commands run through `bash -c`, so standard
 bash syntax (such as `[[ ... ]]`, process substitution `<(...)`, and `${PIPESTATUS[@]}`)
@@ -343,7 +303,7 @@ The default timeout for `sandbox_exec` is 120,000ms (2 minutes). For heavy comma
 
 1. `sandbox_info`; `sandbox_open_project`; `git rev-parse HEAD` as `<base>`.
    _(If the user applies your patches mid-session, run `git rev-parse HEAD` again to get the new `<base>` before making further edits, or you will export duplicate patches)._
-2. Explore with `search` / `get_references`.
+2. Explore with `rg` / `ast-grep` via `sandbox_exec`.
 3. Edit with atomic in-memory Python script via `sandbox_exec`.
 4. Build/test with `sandbox_exec`.
 5. `git commit` per verified milestone.

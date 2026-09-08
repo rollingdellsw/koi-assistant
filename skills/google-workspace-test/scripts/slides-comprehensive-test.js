@@ -90,7 +90,7 @@ async function run() {
         } catch (e) { console.warn(`⚠️ Image Parse Error: ${imgText}`); }
 
         // E. Test the new Image Download API
-        console.log(`\n[5/5] Testing Image Download API...`);
+        console.log(`\n[5/6] Testing Image Download API...`);
         if (firstImageUrl) {
             try {
                 const downloadRes = await tools.gsuite_download_image({ contentUri: firstImageUrl });
@@ -105,6 +105,20 @@ async function run() {
             }
         } else {
             console.log(`   (Skipped: No valid image URLs found in presentation to download)`);
+        }
+
+        // F. Test Slide Thumbnail API
+        console.log(`\n[6/6] Testing Slide Thumbnail API...`);
+        try {
+            const thumbRes = await tools.slides_get_thumbnail({ presentationId: existingId, slideIndex: 1 });
+            if (thumbRes.isError) {
+                console.warn(`⚠️ Thumbnail failed:`, thumbRes.content[0].text);
+            } else {
+                const thumbData = JSON.parse(thumbRes.content.find(c => c.type === "text")?.text || "{}");
+                console.log(`✓ Slide 1 thumbnail rendered: ${thumbData.render?.width}x${thumbData.render?.height}, ${thumbData.render?.resolution} tier, ${Math.round((thumbData.render?.bytes || 0) / 1024)}KB base64 JPEG`);
+            }
+        } catch (e) {
+            console.warn(`⚠️ Tool slides_get_thumbnail execution error: ${e.message}`);
         }
 
         console.log(`\nPart 1 Complete.\n`);

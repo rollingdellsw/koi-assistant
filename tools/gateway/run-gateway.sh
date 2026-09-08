@@ -3,10 +3,10 @@
 # run-gateway.sh — launch the Koi Gateway (by hand or under systemd/launchd).
 #
 # systemd/launchd starts services with a minimal PATH that does NOT include a
-# user-managed Node (fnm/nvm/brew). The gateway both *is* Node and *spawns* `node`
-# (the sandbox server) and `npm` (the lsp_search autoBuild), so we resolve a
-# Node binary, put its directory on PATH, then exec the gateway from its own
-# directory (the config uses relative paths like ./sandbox-shell-mcp.mjs).
+# user-managed Node (fnm/nvm/brew). The gateway both *is* Node and *spawns*
+# `node` (the sandbox server), so we resolve a Node binary, put its directory on
+# PATH, then exec the gateway from its own directory (the config uses relative
+# paths like ./sandbox-shell-mcp.mjs).
 #
 # Override Node resolution by setting KOI_NODE_BIN=/abs/path/to/node.
 #
@@ -87,9 +87,9 @@ NODE_BIN="$(find_node)" || {
   exit 127
 }
 
-# Put node/npm on PATH so the gateway can spawn `node ./sandbox-shell-mcp.mjs`
-# and run the lsp_search autoBuild (`npm install && npm run build`).
-export PATH="$(dirname "$NODE_BIN"):$PATH"
+# Put node on PATH so the gateway can spawn `node ./sandbox-shell-mcp.mjs`, and
+# so the toolchains the sandbox session uses resolve the same way.
+export PATH="/usr/local/bin:$(dirname "$NODE_BIN"):$PATH"
 
 export KOI_NODE_BIN="$NODE_BIN"
 

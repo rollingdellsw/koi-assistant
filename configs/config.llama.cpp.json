@@ -1,13 +1,13 @@
 {
   "llm": {
     "provider": "llamacpp",
-    "apiKey": "None",
-    "model": "qwen/qwen3.5-27b",
+    "apiKey": "${VLLM_API_KEY}",
+    "model": "Qwen3.8-27B-Q8",
     "contextWindow": 262144,
-    "baseUrl": "http://192.168.68.116:8080/v1",
+    "baseUrl": "https://vllm.rollingdell.com/v1",
     "temperature": 1.0,
     "topP": 0.95,
-    "maxTokens": 16384,
+    "maxTokens": 61440,
     "thinking": {
       "enabled": true,
       "budgetLevel": "high",
@@ -15,8 +15,8 @@
     }
   },
   "executor": {
+    "model": "Qwen3.8-27B-Q8",
     "enabled": true,
-    "model": "qwen/qwen3.5-27b",
     "timeoutMs": 180000,
     "maxIterations": 20
   },

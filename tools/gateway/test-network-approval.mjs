@@ -407,7 +407,7 @@ async function suiteHelper() {
 /** Minimal stdio MCP client — what the extension does, minus the extension. */
 function startServer({ home, project }) {
   const child = spawn(process.execPath, [
-    SERVER, '--net', 'policy', '--no-lsp', '--project', project,
+    SERVER, '--net', 'policy', '--project', project,
     '--state', path.join(home, 'sandbox'),
     '--net-policy', path.join(home, 'network-policy.json'),
     '--net-allow', path.join(SELF_DIR, 'koi-network-allow.default'),

@@ -23,16 +23,7 @@
         "10GB",
         "--net",
         "policy"
-      ],
-      "autoBuild": {
-        "dir": "./lsp_search",
-        "check": "dist/index.js",
-        "srcDir": "src",
-        "commands": [
-          "npm install",
-          "npm run build"
-        ]
-      }
+      ]
     }
   }
 }

@@ -16,6 +16,7 @@ allowed-tools:
   - onedrive_get_file_metadata
   - onedrive_download_text
   - onedrive_resolve_link
+  - onedrive_render_page
   # Excel Online
   - excel_list
   - excel_create
@@ -64,7 +65,6 @@ mcp-servers:
       - https://graph.microsoft.com/Files.ReadWrite.All
       - https://graph.microsoft.com/Calendars.Read
       - https://graph.microsoft.com/User.Read
-guardrails: scripts/guardrail.js
 ---
 
 # Microsoft 365 Skill
@@ -83,6 +83,30 @@ Never use `takeScreenshot` or visual subtasks (like `runSubtask`) to read the co
 
 To fully summarize a document with images: call word_read_content for text, call word_get_images to list embedded images, then selectively call word_download_image for relevant ones.
 
+### Exception: `onedrive_render_page`
+
+The rule above is about _screenshots_ — reading text off a picture of a screen at
+an unknown zoom, where the model has no exact source to check itself against.
+`onedrive_render_page` is different: Graph converts the file to PDF with Office's
+own renderer and the page is rasterized deterministically at a known scale.
+
+**Images cost context.** Resolution tiers match `takeScreenshot`: `low` (480px,
+the default, ~1k tokens), `medium` (1280px), `high` (1920px), `original`
+(uncapped). A `low` crop of one chart is both cheaper and more legible than a
+whole page at `high`, so crop first and raise the tier only when the crop is
+genuinely unreadable.
+
+Use it only for what the text APIs genuinely cannot express — charts, SmartArt,
+drawings, equations, the geometry of a table, or a question about how a page
+looks. Text APIs remain the sole source of truth for prose and numbers: never
+transcribe body text or figures out of a render when `word_read_content` or
+`excel_read_range` can return them exactly. If both are available and they
+disagree, the text API wins.
+
+Pass `region` (normalized 0-1 page coordinates, origin top-left) to crop and zoom
+into a single figure — a smaller region comes back sharper. Converted PDFs are
+cached for five minutes per file, so paging through a document is cheap.
+
 ## Setup
 
 1. Configure your Microsoft Azure App Client ID in Extension Settings → Microsoft 365
@@ -95,6 +119,8 @@ When the user asks about "this slide" or "the current slide", explicitly inform 
 Ask the user to provide the exact slide number they want to interact with.
 
 `ppt_read_content` returns both text and an image inventory per slide (image names and sizes). To view actual image content, call `ppt_download_image` with the image name(s) from the read output. Multiple images can be fetched in one call using comma-separated names.
+
+`ppt_download_image` only returns _embedded rasters_. A slide whose meaning lives in its layout — shapes, arrows, positioning, a chart built in PowerPoint — has no embedded image to download and reads out as disconnected strings. For those slides use `onedrive_render_page`, where page N of the converted PDF is slide N.
 
 Never read all slides just to answer a question about a single slide. Use the range parameters to minimize token usage.
 

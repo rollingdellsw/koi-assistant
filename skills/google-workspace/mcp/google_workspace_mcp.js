@@ -4,6 +4,460 @@
 // Write operations on Docs/Slides/Sheets are guarded by guardrail.js (own-file-only policy)
 // Pagination supported via offset/limit or pageToken patterns
 
+// ── Page Rendering (visual reads) ─────────────────────────────
+// Office/Workspace text APIs are blind to anything that isn't a text run or an
+// embedded raster: native charts, drawings, equations, and layout-carrying
+// tables come back as disconnected strings or not at all. For those, export the
+// file to PDF and rasterize the page — the same fallback pdf_goto_page provides
+// for PDFs.
+//
+// The rendering happens here rather than by handing base64 to the pdf skill on
+// purpose: a 1MB PDF is ~1.4M characters of base64, which would blow the
+// context window before the model saw a single pixel. Only the JPEG leaves this
+// module.
+
+let pdfjsLibRef = null;
+// ── Own-file-only write policy ──────────────────────────────────────
+// Enforced HERE rather than in a guardrail script. Guardrails hook the
+// ToolExecutor path, but a skill script reaches this server through
+// ScriptRunner -> MCP router, which skips that layer entirely — so every
+// script had unguarded write access to the user's files with the server's
+// own OAuth token. A policy attached to a caller is bypassed by adding a new
+// caller; attached to the resource, it holds for every caller there is.
+//
+// State lives as long as the server instance does, which is the same lifetime
+// the guardrail's module-level Set had.
+const createdFileIds = new Set();
+let needsAuth = false;
+
+const CREATE_TOOLS = new Set(["sheets_create", "docs_create", "slides_create"]);
+
+const MUTATE_ID_ARG = {
+  sheets_write_range: "spreadsheetId",
+  sheets_batch_update: "spreadsheetId",
+  sheets_clear_range: "spreadsheetId",
+  docs_batch_update: "documentId",
+  slides_batch_update: "presentationId",
+};
+const MUTATE_TOOLS = new Set(Object.keys(MUTATE_ID_ARG));
+
+const AUTH_ERROR_RE = /\b(401|UNAUTHENTICATED)\b/;
+const CREATED_ID_RE = /(?:Created|Copied) (?:spreadsheet|document|presentation): (\S+)/;
+
+const REAUTH_MESSAGE =
+  "\u26a0\ufe0f AUTHENTICATION REQUIRED: Your Google session has expired. Please click " +
+  "'Sign in' in the side panel to re-connect your account before continuing.";
+
+function isOwned(fileId) {
+  return createdFileIds.has(fileId);
+}
+
+function recordOwned(id) {
+  createdFileIds.add(id);
+}
+
+// Anything shaped like a mutation but not registered above fails closed rather
+// than falling through to the read allowance. Verified against every tool name
+// both servers expose: no read tool matches.
+const LOOKS_LIKE_MUTATION_RE =
+  /(^|_)(write|update|delete|clear|remove|append|insert|move|rename|share|send)(_|$)/i;
+
+function deny(message) {
+  return { content: [{ type: "text", text: `GUARDRAIL BLOCK: ${message}` }], isError: true };
+}
+
+/** Returns a denial result to short-circuit with, or null to proceed. */
+function enforceWritePolicy(name, args) {
+  if (needsAuth) {
+    needsAuth = false;
+    return { content: [{ type: "text", text: REAUTH_MESSAGE }], isError: true };
+  }
+
+  if (CREATE_TOOLS.has(name)) return null;
+
+  if (MUTATE_TOOLS.has(name)) {
+    const idKey = MUTATE_ID_ARG[name];
+    const fileId = args?.[idKey];
+
+    if (!fileId) {
+      return deny(`${name} requires a file ID (${idKey}) but none was provided.`);
+    }
+    if (!isOwned(fileId, args)) {
+      return deny(
+        `${name} on ${idKey}="${fileId}" denied. Write operations are only allowed on ` +
+        `files created by this agent. Created files: [${[...createdFileIds].join(", ") || "none"}]. ` +
+        `Use the corresponding create tool first, or use read-only tools for existing files.`
+      );
+    }
+    return null;
+  }
+
+  if (LOOKS_LIKE_MUTATION_RE.test(name)) {
+    return deny(
+      `${name} looks like a write operation but is not registered in MUTATE_ID_ARG, ` +
+      `so its ownership check cannot be applied. Register it before use.`
+    );
+  }
+
+  return null;
+}
+
+/** Records created file IDs and latches auth failures for the next call. */
+function observeResult(name, args, result) {
+  if (!result) return;
+
+  if (result.isError) {
+    const text = (result.content || []).map(b => b?.text || "").join("\n");
+    if (AUTH_ERROR_RE.test(text)) needsAuth = true;
+    return;
+  }
+
+  if (!CREATE_TOOLS.has(name)) return;
+
+  const block = result.content?.[0];
+  const text = block?.text || "";
+  const id = block?._createdFileId || (text.match(CREATED_ID_RE) || [])[1];
+  if (id) recordOwned(id, args);
+}
+
+const PDF_EXPORT_CACHE = new Map(); // cacheKey -> { bytes, at }
+const PDF_EXPORT_TTL_MS = 5 * 60 * 1000;
+
+// ── Sandbox rendering prerequisite ──────────────────────────────────────
+// The MCP sandbox iframe is never painted, and Chrome does not service
+// requestAnimationFrame for a frame that is not being rendered. pdf.js drives
+// its render loop through rAF for display intent, so page.render().promise
+// starts, schedules its next chunk, and never settles — no error, no
+// rejection, just a tool call that never returns. Confirmed in the pdf skill:
+// the stalled tasks only died when the document was destroyed, which surfaced
+// as a burst of "Rendering cancelled" rejections.
+//
+// Routing rAF to a timer restores forward progress. Nothing here paints, so
+// there is no animation to stay in sync with.
+let rafShimInstalled = false;
+
+function installRafShim() {
+  if (rafShimInstalled || typeof window === "undefined") return;
+  rafShimInstalled = true;
+
+  window.requestAnimationFrame = function (cb) {
+    return setTimeout(() => cb(typeof performance !== "undefined" ? performance.now() : Date.now()), 0);
+  };
+  window.cancelAnimationFrame = function (id) { clearTimeout(id); };
+
+  runtime.console.log("[PDF render] requestAnimationFrame routed to timers (sandbox frame is never painted)");
+}
+
+// A page that has not rasterized in this long is stuck, not slow.
+const RENDER_TIMEOUT_MS = 20000;
+
+async function ensurePdfJs() {
+  installRafShim();
+  if (pdfjsLibRef) return pdfjsLibRef;
+
+  if (typeof pdfjsLib !== "undefined") {
+    pdfjsLibRef = pdfjsLib;
+    return pdfjsLibRef;
+  }
+
+  let extId = null;
+  try {
+    extId = new URLSearchParams(window.location.hash.slice(1)).get("extensionId");
+  } catch (_) {}
+  if (!extId) {
+    const m = window.location.href.match(/chrome-extension:\/\/([a-z]{32})/);
+    if (m) extId = m[1];
+  }
+  if (!extId && window.location.origin && window.location.origin.startsWith("chrome-extension://")) {
+    extId = window.location.origin.split("//")[1];
+  }
+  if (!extId) throw new Error("pdf.js: cannot determine extension ID. Check sandbox URL configuration.");
+
+  // Dynamic import — pdf.mjs is a real ES module; running it as a classic
+  // script breaks webpack's lazy getter closures (see pdf_mcp.js).
+  const module = await import(`chrome-extension://${extId}/lib/pdf.mjs`);
+  if (!module || typeof module.getDocument !== "function") {
+    throw new Error("pdf.js not available. Copy build/pdf.mjs to public/lib/pdf.mjs in the extension and rebuild.");
+  }
+  if (module.GlobalWorkerOptions) {
+    module.GlobalWorkerOptions.workerSrc = `chrome-extension://${extId}/lib/pdf.worker.mjs`;
+  }
+  pdfjsLibRef = module;
+  return pdfjsLibRef;
+}
+
+function clamp01(v) {
+  return Math.max(0, Math.min(1, v));
+}
+
+// Crop region in normalized 0..1 page coordinates, origin top-left.
+function normalizeRegion(region) {
+  if (!region) return null;
+  const x = clamp01(Number(region.x) || 0);
+  const y = clamp01(Number(region.y) || 0);
+  const width = Math.min(region.width === undefined ? 1 - x : clamp01(Number(region.width)), 1 - x);
+  const height = Math.min(region.height === undefined ? 1 - y : clamp01(Number(region.height)), 1 - y);
+  if (!(width > 0) || !(height > 0)) {
+    throw new Error("region width/height must be > 0 (normalized 0-1 page coordinates)");
+  }
+  return { x, y, width, height };
+}
+
+// runtime.fetch sometimes hands back base64 text in the ArrayBuffer rather than
+// raw bytes. Detect via the format's magic number and decode if it is missing.
+async function readBinaryResponse(response, magic) {
+  const raw = new Uint8Array(await response.arrayBuffer());
+  if (magic && raw.length > magic.length && magic.every((b, i) => raw[i] === b)) {
+    return raw;
+  }
+  try {
+    const decoded = atob(new TextDecoder().decode(raw));
+    const out = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; i++) out[i] = decoded.charCodeAt(i);
+    return out;
+  } catch (_) {
+    return raw;
+  }
+}
+
+const MAGIC_PDF = [0x25, 0x50, 0x44, 0x46]; // %PDF
+const MAGIC_PNG = [0x89, 0x50, 0x4E, 0x47]; // \x89PNG
+const MAGIC_JPEG = [0xFF, 0xD8, 0xFF];      // SOI + marker
+const MAGIC_GIF = [0x47, 0x49, 0x46, 0x38]; // GIF8
+const MAGIC_BMP = [0x42, 0x4D];             // BM
+const MAGIC_RIFF = [0x52, 0x49, 0x46, 0x46]; // RIFF (WebP container)
+
+const IMAGE_SIGNATURES = [
+  { mime: "image/png", magic: MAGIC_PNG },
+  { mime: "image/jpeg", magic: MAGIC_JPEG },
+  { mime: "image/gif", magic: MAGIC_GIF },
+  { mime: "image/bmp", magic: MAGIC_BMP },
+];
+
+function startsWithMagic(bytes, magic) {
+  if (bytes.length < magic.length) return false;
+  return magic.every((b, i) => bytes[i] === b);
+}
+
+// Identify an image from its bytes rather than from a Content-Type header or a
+// caller-supplied hint. Both lie here: the proxy reports text/plain for a
+// base64-encoded body, and callers pass whatever mimeType they guessed.
+function sniffImageMime(bytes) {
+  for (const sig of IMAGE_SIGNATURES) {
+    if (startsWithMagic(bytes, sig.magic)) return sig.mime;
+  }
+  if (
+    bytes.length > 12 &&
+    startsWithMagic(bytes, MAGIC_RIFF) &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+// The same defect readBinaryResponse() guards against, generalized over every
+// image format we might be handed: runtime.fetch returns the body as *text* by
+// default, so the ArrayBuffer holds ASCII base64 rather than image bytes.
+// Blindly wrapping that in a Blob produces something createImageBitmap cannot
+// decode and bytesToBase64 happily re-encodes, doubling an already oversized
+// payload. Sniff first, decode once, and report failure rather than handing
+// undecodable bytes to the model as an image.
+async function readImageResponse(response) {
+  const raw = new Uint8Array(await response.arrayBuffer());
+  const directMime = sniffImageMime(raw);
+  if (directMime) return { bytes: raw, mime: directMime };
+
+  try {
+    const text = new TextDecoder()
+      .decode(raw)
+      .trim()
+      .replace(/^data:[^;,]*;base64,/, "");
+    const decoded = atob(text);
+    const out = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; i++) out[i] = decoded.charCodeAt(i);
+    const decodedMime = sniffImageMime(out);
+    if (decodedMime) return { bytes: out, mime: decodedMime };
+  } catch (_) { /* not base64 text either — fall through */ }
+
+  return { bytes: raw, mime: null };
+}
+
+async function readPdfBytes(response) {
+  return await readBinaryResponse(response, MAGIC_PDF);
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const CHUNK = 0x8000; // avoid blowing the argument limit on large buffers
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// Encoded size without doing the encoding: 4 chars per 3 bytes, padded.
+function base64LengthOf(bytes) {
+  return Math.ceil(bytes.length / 3) * 4;
+}
+
+/**
+ * Rasterize one page of a PDF held in memory.
+ * Returns { base64, width, height, page, totalPages, scale }.
+ *
+ * The pixel budget (maxDim) applies to the *output* canvas, so cropping to a
+ * region buys resolution instead of throwing it away — that is what makes a
+ * small axis label on a chart legible.
+ */
+// Resolution tiers, deliberately identical to ScreenshotTools.RESOLUTION_MAP in
+// src/background/tools/screenshot-tools.ts and to the pdf skill. An image
+// returned from a tool is spent context: rendering a page at maxDim 2000 costs
+// ~29,800 tokens, against ~1,300 for takeScreenshot's own default. Same repo,
+// 23x apart. One vocabulary, one default, so the cheap thing happens by default.
+const RESOLUTION_MAP = { low: 480, medium: 1280, high: 1920, original: Infinity };
+const DEFAULT_RESOLUTION = "low";
+
+// Hard ceiling on the encoded payload, mirroring resizeForLLM's maxBase64Length.
+// A runaway guard, not a budget: the tier is what keeps calls cheap.
+const MAX_BASE64_LENGTH = 400000;
+
+function resolveMaxDim(resolution) {
+  if (resolution === undefined || resolution === null || resolution === "") {
+    return RESOLUTION_MAP[DEFAULT_RESOLUTION];
+  }
+  const dim = RESOLUTION_MAP[String(resolution).toLowerCase()];
+  if (dim === undefined) {
+    throw new Error(
+      `Unknown resolution "${resolution}". Use one of: ${Object.keys(RESOLUTION_MAP).join(", ")}.`
+    );
+  }
+  return dim;
+}
+
+async function renderPdfPage(bytes, pageNum, opts = {}) {
+  const lib = await ensurePdfJs();
+  const doc = await lib.getDocument({
+    // pdf.js takes ownership of `data` and transfers the underlying
+    // ArrayBuffer, which detaches it. These bytes come from PDF_EXPORT_CACHE
+    // and are reused for the 5-minute TTL, so handing the cached array over
+    // directly poisons the cache: the first render succeeds and every
+    // subsequent render of the same file dies inside the fake worker's
+    // LoopbackPort with "structuredClone ... ArrayBuffer is detached".
+    // Paging through a document is the main use case, so this hit constantly.
+    // Give pdf.js a copy and keep the cached original intact.
+    data: bytes.slice(),
+    useWorkerFetch: false,
+    useSystemFonts: true,
+    disableWorker: true,
+    stopWorker: true,
+  }).promise;
+
+  try {
+    const totalPages = doc.numPages;
+    const target = Math.round(Number(pageNum) || 1);
+    if (!Number.isFinite(target) || target < 1 || target > totalPages) {
+      throw new Error(`Page ${pageNum} is out of range — the rendered file has ${totalPages} page(s).`);
+    }
+
+    const region = normalizeRegion(opts.region);
+    const maxDim = resolveMaxDim(opts.resolution);
+    const page = await doc.getPage(target);
+
+    // Fit the page to the tier rather than starting from an arbitrary scale.
+    // Cropping to a region spends the pixel budget on the crop instead of on
+    // pixels that get thrown away, so a small region comes back sharper for
+    // the same cost — a 480px crop of one chart reads better than a whole
+    // page at 1920.
+    let scale = 1.0;
+    let viewport = page.getViewport({ scale });
+    const outSpan = () => Math.max(
+      viewport.width * (region ? region.width : 1),
+      viewport.height * (region ? region.height : 1)
+    );
+    if (maxDim !== Infinity && outSpan() !== 0) {
+      scale = maxDim / outSpan();
+      viewport = page.getViewport({ scale });
+    }
+
+    const canvas = new OffscreenCanvas(
+      Math.max(1, Math.round(viewport.width * (region ? region.width : 1))),
+      Math.max(1, Math.round(viewport.height * (region ? region.height : 1)))
+    );
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "white"; // JPEG has no alpha — transparent pixels turn black
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Shift the page under a smaller canvas instead of cropping afterwards.
+    const transform = region
+      ? [1, 0, 0, 1, -Math.round(viewport.width * region.x), -Math.round(viewport.height * region.y)]
+      : undefined;
+
+    // Never await a render unbounded. If the shim above ever stops working — a
+    // pdf.js change, a different sandbox host — the failure must surface as an
+    // error the caller can report, not as a tool call that hangs until the
+    // whole script budget is gone.
+    const renderTask = page.render({ canvasContext: ctx, viewport, transform });
+    let watchdog;
+    try {
+      await Promise.race([
+        renderTask.promise,
+        new Promise((_, reject) => {
+          watchdog = setTimeout(() => {
+            renderTask.cancel();
+            reject(new Error(
+              `Render of page ${target} did not complete within ${RENDER_TIMEOUT_MS}ms. ` +
+              `The render loop is stalled, not slow — check that requestAnimationFrame ` +
+              `is being serviced in the MCP sandbox frame.`
+            ));
+          }, RENDER_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(watchdog);
+    }
+    page.cleanup();
+
+    // Back off quality, then dimensions, until the payload fits — the same
+    // strategy resizeForLLM uses in screenshot-tools.ts. A dense scanned page
+    // can exceed the ceiling even at a modest tier, and silently shipping
+    // 100k tokens of base64 is the failure this guard exists to prevent.
+    let quality = opts.quality == null ? 0.85 : opts.quality;
+    let outCanvas = canvas;
+    let blob = await outCanvas.convertToBlob({ type: "image/jpeg", quality });
+    let base64 = bytesToBase64(new Uint8Array(await blob.arrayBuffer()));
+    while (base64.length > MAX_BASE64_LENGTH && quality > 0.2) {
+      quality -= 0.1;
+      if (quality < 0.5) {
+        const w = Math.max(1, Math.round(outCanvas.width * 0.75));
+        const h = Math.max(1, Math.round(outCanvas.height * 0.75));
+        const shrunk = new OffscreenCanvas(w, h);
+        const sctx = shrunk.getContext("2d");
+        sctx.fillStyle = "white";
+        sctx.fillRect(0, 0, w, h);
+        sctx.drawImage(outCanvas, 0, 0, w, h);
+        outCanvas = shrunk;
+        quality = 0.7;
+      }
+      blob = await outCanvas.convertToBlob({ type: "image/jpeg", quality });
+      base64 = bytesToBase64(new Uint8Array(await blob.arrayBuffer()));
+    }
+
+    return {
+      base64,
+      width: outCanvas.width,
+      height: outCanvas.height,
+      page: target,
+      totalPages,
+      scale: Number(scale.toFixed(3)),
+      resolution: opts.resolution || DEFAULT_RESOLUTION,
+      quality: Number(quality.toFixed(2)),
+      bytes: base64.length,
+    };
+  } finally {
+    doc.destroy().catch(() => {});
+  }
+}
+
 return {
   listTools() {
     return [
@@ -203,6 +657,30 @@ return {
           required: ["fileId"],
         },
       },
+      {
+        name: "drive_render_page",
+        description: "Render one page of a Drive file as an image. Exports Docs, Sheets, and Slides to PDF via Google's own renderer, then rasterizes the requested page. Use this when the text APIs cannot express what matters: native charts, drawings, equations, layout-carrying tables, or any question about how a page actually looks. Text APIs (docs_read_content, sheets_read_range) remain the source of truth for prose and numbers — this is for what they cannot see. Page numbers come from Google's pagination and match what the user sees on screen; the response reports totalPages so you can page through.",
+        displayMessage: "🖼️ Rendering page {{page|default:1}} of Drive file",
+        inputSchema: {
+          type: "object",
+          properties: {
+            fileId: { type: "string", description: "The file ID (Doc, Sheet, Slides, or an uploaded PDF)" },
+            page: { type: "number", description: "1-based page number of the exported PDF (default: 1)" },
+            resolution: { type: "string", enum: ["low", "medium", "high", "original"], description: "Resolution tier, matching takeScreenshot: low=480px (default, ~1k tokens), medium=1280px, high=1920px, original=uncapped. Prefer a region crop over a higher tier — cropping spends the pixels where they matter and costs less." },
+            region: {
+              type: "object",
+              description: "Optional crop in normalized 0-1 page coordinates, origin top-left. A smaller region comes back sharper, since the pixel budget is spent on the crop. Example: bottom-left quadrant = { x: 0, y: 0.5, width: 0.5, height: 0.5 }.",
+              properties: {
+                x: { type: "number", description: "Left edge, 0-1 (default: 0)" },
+                y: { type: "number", description: "Top edge, 0-1 (default: 0)" },
+                width: { type: "number", description: "Width, 0-1 (default: to right edge)" },
+                height: { type: "number", description: "Height, 0-1 (default: to bottom edge)" },
+              },
+            },
+          },
+          required: ["fileId"],
+        },
+      },
 
       // ── Google Docs ──────────────────────────────────────────────
       {
@@ -348,6 +826,36 @@ return {
         },
       },
       {
+        name: "slides_get_thumbnail",
+        description: "Render a slide as an image using the Slides API thumbnail endpoint. Prefer this over drive_render_page for Google Slides — it is one call, needs no PDF export, and returns exactly what the slide looks like. Use it whenever a slide's meaning is carried by layout rather than text: diagrams built from shapes and arrows, charts, positioning, or anything slides_read_content returns as disconnected strings.",
+        displayMessage: "🖼️ Rendering slide {{slideIndex|default:1}}",
+        inputSchema: {
+          type: "object",
+          properties: {
+            presentationId: { type: "string" },
+            slideIndex: { type: "number", description: "1-based slide index (default: 1). Ignored if objectId is given." },
+            objectId: { type: "string", description: "Slide objectId from slides_get_metadata. Takes precedence over slideIndex." },
+            resolution: {
+              type: "string",
+              enum: ["low", "medium", "high", "original"],
+              description: "Resolution tier, matching takeScreenshot: low=480px (default, ~1k tokens), medium=1280px, high=1920px, original=uncapped. Prefer a region crop over a higher tier — cropping spends the pixels where they matter and costs less.",
+            },
+            region: {
+              type: "object",
+              description: "Optional crop in normalized 0-1 page coordinates, origin top-left. A smaller region comes back sharper, since the pixel budget is spent on the crop. Example: bottom-left quadrant = { x: 0, y: 0.5, width: 0.5, height: 0.5 }.",
+              properties: {
+                x: { type: "number", description: "Left edge, 0-1 (default: 0)" },
+                y: { type: "number", description: "Top edge, 0-1 (default: 0)" },
+                width: { type: "number", description: "Width, 0-1 (default: to right edge)" },
+                height: { type: "number", description: "Height, 0-1 (default: to bottom edge)" },
+              },
+              required: ["x", "y", "width", "height"],
+            },
+          },
+          required: ["presentationId"],
+        },
+      },
+      {
         name: "slides_get_urls",
         description: "Extract all hyperlink URLs from presentation slides. Returns URL, anchor text, and slide number.",
         displayMessage: "🔗 Extracting URLs from slides",
@@ -361,7 +869,7 @@ return {
       },
       {
         name: "gsuite_download_image",
-        description: "Download an image from Google Docs or Slides using its contentUri from docs_get_images or slides_read_content. Returns base64 image for visual analysis. Valid ~30 mins.",
+        description: "Download an image from Google Docs or Slides using its contentUri from docs_get_images or slides_read_content. Returns base64 image for visual analysis. Valid ~30 mins. Defaults to the medium resolution tier — raise it only if fine detail or small text is genuinely unreadable.",
         displayMessage: "🖼️ Downloading image",
         inputSchema: {
           type: "object",
@@ -373,6 +881,11 @@ return {
             mimeType: {
               type: "string",
               description: "Optional mime type (default: image/png)"
+            },
+            resolution: {
+              type: "string",
+              enum: ["low", "medium", "high", "original"],
+              description: "Resolution tier: low=480px, medium=1280px (default), high=1920px, original=uncapped. Higher tiers cost proportionally more context."
             }
           },
           required: ["contentUri"],
@@ -487,6 +1000,15 @@ return {
   },
 
   async callTool(name, args) {
+    const denial = enforceWritePolicy(name, args);
+    if (denial) return denial;
+
+    const result = await this._dispatch(name, args);
+    observeResult(name, args, result);
+    return result;
+  },
+
+  async _dispatch(name, args) {
     try {
       switch (name) {
         case "sheets_read_range":
@@ -513,6 +1035,8 @@ return {
           return await this.driveSearch(args.searchTerm, args.mimeType, args.maxResults, args.pageToken);
         case "drive_get_file_metadata":
           return await this.driveGetFileMetadata(args.fileId);
+        case "drive_render_page":
+          return await this.driveRenderPage(args.fileId, args.page, args.resolution, args.region);
         case "docs_get_metadata":
           return await this.docsGetMetadata(args.documentId);
         case "docs_read_content":
@@ -537,8 +1061,10 @@ return {
           return await this.slidesBatchUpdate(args.presentationId, args.requests);
         case "slides_get_urls":
           return await this.slidesGetUrls(args.presentationId);
+        case "slides_get_thumbnail":
+          return await this.slidesGetThumbnail(args.presentationId, args.slideIndex, args.objectId, args.resolution || args.size, args.region);
         case "gsuite_download_image":
-          return await this.gsuiteDownloadImage(args.contentUri, args.mimeType);
+          return await this.gsuiteDownloadImage(args.contentUri, args.mimeType, args.resolution);
         case "gmail_search":
           return await this.gmailSearch(args.query, args.maxResults, args.pageToken);
         case "gmail_get_message":
@@ -1377,49 +1903,294 @@ return {
   },
 
   // ═══════════════════════════════════════════════════════════════
+  // VISUAL RENDERING
+  // ═══════════════════════════════════════════════════════════════
+
+  // Export a Drive file to PDF bytes. Google-native types go through the
+  // export endpoint; anything already binary (an uploaded PDF) is downloaded
+  // with alt=media instead, since export rejects it as non-exportable.
+  async _exportFileAsPdf(fileId) {
+    const cached = PDF_EXPORT_CACHE.get(fileId);
+    if (cached && Date.now() - cached.at < PDF_EXPORT_TTL_MS) return cached.bytes;
+
+    const exportUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application%2Fpdf`;
+    let response = await runtime.fetch(exportUrl, { responseFormat: "base64" });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      if (/fileNotExportable|not exportable/i.test(body)) {
+        // Already a binary file — fetch it directly.
+        response = await runtime.fetch(
+          `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+          { responseFormat: "base64" }
+        );
+        if (!response.ok) {
+          const body2 = await response.text().catch(() => "");
+          throw new Error(`Download failed (${response.status}): ${body2.slice(0, 200)}`);
+        }
+      } else if (/exportSizeLimitExceeded/i.test(body)) {
+        throw new Error(
+          "Drive refused the PDF export: the file exceeds the ~10MB export limit. " +
+          "Read it with the text tools instead, or ask the user to export it manually."
+        );
+      } else {
+        throw new Error(`PDF export failed (${response.status}): ${body.slice(0, 200)}`);
+      }
+    }
+
+    const bytes = await readPdfBytes(response);
+    PDF_EXPORT_CACHE.set(fileId, { bytes, at: Date.now() });
+    return bytes;
+  },
+
+  async driveRenderPage(fileId, page, resolution, region) {
+    const bytes = await this._exportFileAsPdf(fileId);
+    const r = await renderPdfPage(bytes, page || 1, { resolution, region });
+
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({
+          fileId,
+          page: r.page,
+          totalPages: r.totalPages,
+          prevPage: r.page > 1 ? r.page - 1 : null,
+          nextPage: r.page < r.totalPages ? r.page + 1 : null,
+          render: { width: r.width, height: r.height, scale: r.scale, resolution: r.resolution, bytes: r.bytes, region: normalizeRegion(region) },
+          url: `https://drive.google.com/file/d/${fileId}/view`,
+        }, null, 2) },
+        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: r.base64 } },
+      ],
+    };
+  },
+
+  async slidesGetThumbnail(presentationId, slideIndex, objectId, resolution, region) {
+    let targetId = objectId;
+    let index = slideIndex || 1;
+    let slideCount = null;
+
+    if (!targetId || !slideCount) {
+      const metaUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}?fields=slides(objectId)`;
+      const metaResp = await runtime.fetch(metaUrl);
+      if (!metaResp.ok) {
+        const error = await metaResp.text();
+        return { content: [{ type: "text", text: `API Error: ${error}` }], isError: true };
+      }
+      const slides = (await metaResp.json()).slides || [];
+      slideCount = slides.length;
+      if (targetId) {
+        const found = slides.findIndex(s => s.objectId === targetId);
+        if (found !== -1) {
+          index = found + 1;
+        } else {
+          return { content: [{ type: "text", text: `Slide objectId "${targetId}" not found in presentation.` }], isError: true };
+        }
+      } else {
+        if (index < 1 || index > slideCount) {
+          return { content: [{ type: "text", text: `Slide ${index} is out of range — this presentation has ${slideCount} slide(s).` }], isError: true };
+        }
+        targetId = slides[index - 1].objectId;
+      }
+    }
+
+    const LEGACY_SIZE_MAP = { small: "low", medium: "medium", large: "high" };
+    const resKey = (resolution && LEGACY_SIZE_MAP[String(resolution).toLowerCase()]) || resolution;
+    const maxDim = resolveMaxDim(resKey);
+    const resTier = (resKey && String(resKey).toLowerCase() in RESOLUTION_MAP) ? String(resKey).toLowerCase() : DEFAULT_RESOLUTION;
+
+    const normRegion = normalizeRegion(region);
+
+    // If uncropped and low tier, MEDIUM (800px) is plenty and saves network transfer;
+    // otherwise fetch LARGE (1600px) for maximum source detail.
+    const apiSize = (!normRegion && maxDim <= 480) ? "MEDIUM" : "LARGE";
+    const thumbUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}/pages/${targetId}/thumbnail` +
+      `?thumbnailProperties.mimeType=PNG&thumbnailProperties.thumbnailSize=${apiSize}`;
+    const thumbResp = await runtime.fetch(thumbUrl);
+    if (!thumbResp.ok) {
+      const error = await thumbResp.text();
+      return { content: [{ type: "text", text: `API Error: ${error}` }], isError: true };
+    }
+    const thumb = await thumbResp.json();
+
+    // contentUrl is a short-lived signed googleusercontent URL — no auth header.
+    const imgResp = await runtime.fetch(thumb.contentUrl, { skipAuth: true, responseFormat: "base64" });
+    if (!imgResp.ok) {
+      return { content: [{ type: "text", text: `Failed to fetch slide thumbnail: ${imgResp.status}` }], isError: true };
+    }
+    const rawBytes = await readBinaryResponse(imgResp, MAGIC_PNG);
+
+    const blob = new Blob([rawBytes], { type: "image/png" });
+    const probe = await createImageBitmap(blob);
+
+    let srcX = 0;
+    let srcY = 0;
+    let srcW = probe.width;
+    let srcH = probe.height;
+    if (normRegion) {
+      srcX = Math.round(probe.width * normRegion.x);
+      srcY = Math.round(probe.height * normRegion.y);
+      srcW = Math.max(1, Math.round(probe.width * normRegion.width));
+      srcH = Math.max(1, Math.round(probe.height * normRegion.height));
+    }
+
+    let width = srcW;
+    let height = srcH;
+    if (maxDim !== Infinity && (srcW > 0 || srcH > 0)) {
+      const maxSrcDim = Math.max(srcW, srcH);
+      const fit = maxDim / maxSrcDim;
+      width = Math.max(1, Math.round(srcW * fit));
+      height = Math.max(1, Math.round(srcH * fit));
+    }
+
+    const scale = srcW > 0 ? Number((width / srcW).toFixed(3)) : 1.0;
+
+    // Back off quality, then dimensions, until the payload fits — the same
+    // strategy as renderPdfPage and screenshot-tools.ts.
+    let quality = 0.85;
+    let outCanvas = new OffscreenCanvas(width, height);
+    let ctx = outCanvas.getContext("2d");
+    ctx.fillStyle = "white"; // JPEG has no alpha — transparent pixels turn black
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(probe, srcX, srcY, srcW, srcH, 0, 0, width, height);
+    probe.close();
+
+    let outBlob = await outCanvas.convertToBlob({ type: "image/jpeg", quality });
+    let base64 = bytesToBase64(new Uint8Array(await outBlob.arrayBuffer()));
+    while (base64.length > MAX_BASE64_LENGTH && quality > 0.2) {
+      quality -= 0.1;
+      if (quality < 0.5) {
+        const w = Math.max(1, Math.round(outCanvas.width * 0.75));
+        const h = Math.max(1, Math.round(outCanvas.height * 0.75));
+        const shrunk = new OffscreenCanvas(w, h);
+        const sctx = shrunk.getContext("2d");
+        sctx.fillStyle = "white";
+        sctx.fillRect(0, 0, w, h);
+        sctx.drawImage(outCanvas, 0, 0, w, h);
+        outCanvas = shrunk;
+        quality = 0.7;
+      }
+      outBlob = await outCanvas.convertToBlob({ type: "image/jpeg", quality });
+      base64 = bytesToBase64(new Uint8Array(await outBlob.arrayBuffer()));
+    }
+
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({
+          presentationId,
+          fileId: presentationId,
+          slideIndex: index,
+          page: index,
+          objectId: targetId,
+          slideCount,
+          totalPages: slideCount,
+          prevPage: index > 1 ? index - 1 : null,
+          nextPage: index < slideCount ? index + 1 : null,
+          width: outCanvas.width,
+          height: outCanvas.height,
+          render: {
+            width: outCanvas.width,
+            height: outCanvas.height,
+            scale,
+            resolution: resTier,
+            quality: Number(quality.toFixed(2)),
+            bytes: base64.length,
+            region: normRegion,
+          },
+          url: `https://docs.google.com/presentation/d/${presentationId}`,
+        }, null, 2) },
+        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } },
+      ],
+    };
+  },
+
+  // ═══════════════════════════════════════════════════════════════
   // IMAGES
   // ═══════════════════════════════════════════════════════════════
   // Optimized gsuiteDownloadImage replacement
-  async gsuiteDownloadImage(contentUri, mimeType) {
+  async gsuiteDownloadImage(contentUri, mimeType, resolution) {
+    // Validate the tier before the network round trip, and surface it as a tool
+    // error rather than an uncaught throw — matching drive_render_page.
+    try {
+      resolveMaxDim(resolution || "medium");
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    }
+
     // ── Helper: resize image to fit LLM context limits ──
-    const resizeForLLM = async (blob, mime, maxBase64 = 400000) => {
-      // Quick check: read as base64 first
-      const arrBuf = await blob.arrayBuffer();
-      const raw = new Uint8Array(arrBuf);
-      const quickB64 = btoa(Array.from(raw).map(b => String.fromCharCode(b)).join(''));
-      if (quickB64.length <= maxBase64) {
-        return { base64: quickB64, mime };
+    // Defaults to the medium tier rather than low: these are user-supplied
+    // images — screenshots, photos of documents — where 480px often makes text
+    // unreadable, unlike a rendered page the caller can re-crop. Callers that
+    // need detail can ask for high/original explicitly.
+    const resizeForLLM = async (bytes, mime, resolution, maxBase64 = MAX_BASE64_LENGTH) => {
+      const maxDim = resolveMaxDim(resolution || "medium");
+
+      // Estimate before encoding. base64 is 4/3 of the byte length, so a 12MB
+      // original can be ruled out without materializing a 16MB string first —
+      // which the old code did unconditionally, twice on the failure path.
+      const estimated = base64LengthOf(bytes);
+
+      // Already small enough AND within the tier: hand back the original bytes.
+      if (estimated <= maxBase64 && maxDim === Infinity) {
+        return { base64: bytesToBase64(bytes), mime, width: null, height: null, resized: false };
+      }
+      const blob = new Blob([bytes], { type: mime });
+      const probe = await createImageBitmap(blob);
+      const withinTier = probe.width <= maxDim && probe.height <= maxDim;
+      if (estimated <= maxBase64 && withinTier) {
+        const srcW = probe.width;
+        const srcH = probe.height;
+        probe.close();
+        return { base64: bytesToBase64(bytes), mime, width: srcW, height: srcH, resized: false };
       }
 
-      runtime.console.log(`[gsuiteDownloadImage] Image too large (${Math.round(quickB64.length / 1024)}KB base64), resizing...`);
-      const bitmap = await createImageBitmap(blob);
-      let { width, height } = bitmap;
-      const maxDim = 1980;
-      if (width > maxDim || height > maxDim) {
-        const scale = maxDim / Math.max(width, height);
-        width = Math.round(width * scale);
-        height = Math.round(height * scale);
+      runtime.console.log(`[gsuiteDownloadImage] Resizing ${probe.width}x${probe.height} (~${Math.round(estimated / 1024)}KB base64) to the ${resolution || "medium"} tier...`);
+      let width = probe.width;
+      let height = probe.height;
+      if (maxDim !== Infinity && (width > maxDim || height > maxDim)) {
+        const fit = maxDim / Math.max(width, height);
+        width = Math.max(1, Math.round(width * fit));
+        height = Math.max(1, Math.round(height * fit));
       }
-      const canvas = new OffscreenCanvas(width, height);
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(bitmap, 0, 0, width, height);
-      bitmap.close();
-      const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.80 });
-      const outBuf = await outBlob.arrayBuffer();
-      const outB64 = btoa(Array.from(new Uint8Array(outBuf)).map(b => String.fromCharCode(b)).join(''));
+
+      // Back off quality, then dimensions, until the payload fits — the same
+      // strategy as renderPdfPage and screenshot-tools.ts. The old single pass
+      // could still return well over the ceiling for a large photograph.
+      let quality = 0.8;
+      let outB64;
+      for (;;) {
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(probe, 0, 0, width, height);
+        const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality });
+        outB64 = bytesToBase64(new Uint8Array(await outBlob.arrayBuffer()));
+        if (outB64.length <= maxBase64 || quality <= 0.2) break;
+        quality -= 0.1;
+        if (quality < 0.5) {
+          width = Math.max(1, Math.round(width * 0.75));
+          height = Math.max(1, Math.round(height * 0.75));
+          quality = 0.7;
+        }
+      }
+      probe.close();
       runtime.console.log(`[gsuiteDownloadImage] Resized to ${width}x${height}, ${Math.round(outB64.length / 1024)}KB JPEG`);
-      return { base64: outB64, mime: "image/jpeg" };
+      return { base64: outB64, mime: "image/jpeg", width, height, resized: true };
     };
 
+      // responseFormat:"base64" is not optional for a binary body. Without it
+      // the proxy returns the payload as text, so response.blob() yields ASCII
+      // base64 instead of image bytes — every other binary fetch in this file
+      // already passes it (drive export, slide thumbnails).
+      const FETCH_OPTS = { responseFormat: "base64" };
       let response;
       try {
         // Try fetching. If it's a known CDN domain, skip auth immediately to prevent sandbox blocks.
         const skipAuth = contentUri.includes("googleusercontent.com");
-        response = await runtime.fetch(contentUri, skipAuth ? { skipAuth: true } : undefined);
+        response = await runtime.fetch(contentUri, skipAuth ? { ...FETCH_OPTS, skipAuth: true } : { ...FETCH_OPTS });
       } catch (e) {
         // Fallback if sandbox blocks the request due to domain scope restrictions
         if (e.message && e.message.includes("not authorized for scopes")) {
-          response = await runtime.fetch(contentUri, { skipAuth: true });
+          response = await runtime.fetch(contentUri, { ...FETCH_OPTS, skipAuth: true });
         } else {
           throw e;
         }
@@ -1427,45 +2198,83 @@ return {
 
       // Attempt 2: If 400/403, try without Auth (assuming signed URL conflict)
       if (response && (response.status === 400 || response.status === 403)) {
-        response = await runtime.fetch(contentUri, { skipAuth: true });
+        response = await runtime.fetch(contentUri, { ...FETCH_OPTS, skipAuth: true });
       }
 
       if (!response || !response.ok) {
         return { content: [{ type: "text", text: `Failed: ${response ? response.status : 'Unknown error'}` }], isError: true };
       }
 
-      const blob = await response.blob(); // Get as Blob directly
-      const mime = mimeType || blob.type || "image/png";
+      // Trust the bytes, not the header or the caller's hint. `mimeType` is a
+      // guess the model made and blob.type is whatever the proxy labelled the
+      // transport with; neither survives contact with a base64-wrapped body.
+      const { bytes, mime: sniffedMime } = await readImageResponse(response);
+      if (sniffedMime === null) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed: the body at that contentUri is not a decodable image ` +
+              `(${Math.round(bytes.length / 1024)}KB, no PNG/JPEG/GIF/WebP/BMP signature). ` +
+              `contentUri values expire after ~30 minutes — re-run docs_get_images or ` +
+              `slides_read_content for a fresh one. If it keeps failing, render the ` +
+              `containing page with drive_render_page or slides_get_thumbnail instead.`,
+          }],
+          isError: true,
+        };
+      }
+      const mime = sniffedMime;
+      const sourceBytes = bytes.length;
 
       // Resize for LLM context limits, then return
+      let out;
       try {
-        const { base64: base64Data, mime: outMime } = await resizeForLLM(blob, mime);
-        return {
-          content: [
-            {
-              type: "image",
-              source: { type: "base64", media_type: outMime, data: base64Data },
-            },
-            { type: "text", text: `Downloaded image (${Math.round(base64Data.length * 3/4 / 1024)} KB${outMime !== mime ? ', resized to JPEG' : ''})` }
-          ]
-        };
+        out = await resizeForLLM(bytes, mime, resolution);
       } catch (e) {
-        // Fallback: return raw (may be large, but tool-executor safety net will catch it)
-        return new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const base64Data = reader.result.split(',')[1];
-            resolve({
-              content: [
-                { type: "image", source: { type: "base64", media_type: mime, data: base64Data } },
-                { type: "text", text: `Downloaded image (${Math.round(blob.size / 1024)} KB, resize failed: ${e.message})` }
-              ]
-            });
+        // Downscaling is the ONLY thing bounding this payload. The old fallback
+        // re-encoded the original and shipped it anyway: a multi-megabyte doc
+        // image came back as ~1.5M tokens of base64 and the request died with
+        // "prompt is too long" before the model saw anything. An error the
+        // caller can act on beats a response that kills the conversation.
+        const estimated = base64LengthOf(bytes);
+        if (estimated > MAX_BASE64_LENGTH) {
+          return {
+            content: [{
+              type: "text",
+              text: `Failed to downscale this image (${e.message}). The original is ` +
+                `${Math.round(sourceBytes / 1024)}KB — about ${Math.round(estimated / 1024)}KB ` +
+                `of base64, past the ${Math.round(MAX_BASE64_LENGTH / 1024)}KB ceiling — so ` +
+                `returning it as-is would exhaust the context window. Render the containing ` +
+                `page with drive_render_page or slides_get_thumbnail instead.`,
+            }],
+            isError: true,
           };
-          reader.onerror = () => resolve({ content: [{ type: "text", text: "Failed to read image data" }], isError: true });
-          reader.readAsDataURL(blob);
-        });
+        }
+        // Small enough to pass through unmodified even though the decoder failed.
+        out = { base64: bytesToBase64(bytes), mime, width: null, height: null, resized: false, note: `resize skipped: ${e.message}` };
       }
+
+      const resTier = String(resolution || "medium").toLowerCase();
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({
+            mimeType: out.mime,
+            sourceMimeType: mime,
+            sourceBytes,
+            render: {
+              width: out.width,
+              height: out.height,
+              resolution: resTier,
+              resized: out.resized,
+              bytes: out.base64.length,
+            },
+            note: out.note,
+          }, null, 2) },
+          {
+            type: "image",
+            source: { type: "base64", media_type: out.mime, data: out.base64 },
+          },
+        ],
+      };
   },
 
   _walkSlideElements(elements, visitor) {

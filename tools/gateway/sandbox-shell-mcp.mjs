@@ -90,7 +90,8 @@ const SELF_PATH = fileURLToPath(import.meta.url);
 // worker self-heals on the next tick.
 //
 // This block must run BEFORE any server side effects (parseArgs banner,
-// setProject, LSP start): review is a pure CLI and must not spawn children.
+// setProject, network broker): review is a pure CLI and must not spawn
+// children.
 // =============================================================================
 
 function reviewUsage() {
@@ -186,7 +187,7 @@ function reviewGitArgv(target, gitArgs) {
     throw new Error('project dir contains the overlay state (projectless $HOME scope?) — pass --project <real project dir>');
   }
   return {
-    cmd: 'bwrap',
+    cmd: findBwrapBin(),
     args: [
       '--ro-bind', '/', '/',
       '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',
@@ -324,10 +325,6 @@ function mainUsage() {
     '                        Overlays are a cache: over the cap the oldest ones are',
     '                        deleted automatically. The live/in-use overlays and the',
     '                        per-project outbox (exported patches) are never evicted.',
-    '  --lsp PATH            code-intelligence (lsp_search) entry to load',
-    '                        (default: the bundle shipped next to this script;',
-    '                        KOI_LSP_ENTRY overrides).',
-    '  --no-lsp              disable the merged LSP tools entirely.',
     '  -h, --help            show this help and exit.',
     '',
     'Debug / review command:',
@@ -345,7 +342,6 @@ function mainUsage() {
     '',
     'Environment:',
     '  KOI_PROJECT           default value for --project.',
-    '  KOI_LSP_ENTRY         override the LSP entry, or set empty to disable LSP.',
     '  KOI_SANDBOX_BACKEND   force the backend: exec = NO isolation (DEV/TEST ONLY).',
     '  KOI_SANDBOX_PERSIST   1 = resume/persist the overlay session across restarts',
     '                        instead of starting fresh each connection.',
@@ -419,12 +415,6 @@ function parseArgs() {
     // policy, so it is set in the gateway config (args) or the unit (env);
     // 10GB is a sane default for a dev box that also has to build things.
     maxOverlayBytes: parseSizeSpec(process.env.KOI_SANDBOX_MAX_OVERLAY, DEFAULT_MAX_OVERLAY_BYTES),
-    // Code-intelligence child (lsp_search) is now merged into this server. Its
-    // compiled entry defaults to the bundle shipped next to this script; the
-    // path can be overridden, and an empty value disables LSP entirely.
-    lsp: process.env.KOI_LSP_ENTRY !== undefined
-      ? process.env.KOI_LSP_ENTRY
-      : path.join(SELF_DIR, 'lsp_search', 'dist', 'index.js'),
     // Credential/secret paths to mask inside the sandbox. There is no built-in
     // list — what to mask is deployment policy, so it is supplied entirely here
     // (see the systemd unit / gateway-config.json). Comma-separated; `~` and
@@ -450,8 +440,6 @@ function parseArgs() {
     else if (args[i].startsWith('--max-overlay-size=')) {
       out.maxOverlayBytes = parseSizeSpec(args[i].slice('--max-overlay-size='.length), DEFAULT_MAX_OVERLAY_BYTES);
     }
-    else if (args[i] === '--lsp' && args[i + 1]) out.lsp = args[++i];
-    else if (args[i] === '--no-lsp') out.lsp = '';
     else if (args[i] === '--exclude' && args[i + 1]) out.exclude.push(args[++i]);
     else if (args[i].startsWith('--exclude=')) out.exclude.push(args[i].slice('--exclude='.length));
   }
@@ -1244,18 +1232,67 @@ const GREENFIELD_MOUNT = '/tmp/koi/project';
 const NET_SETUP = path.join(SELF_DIR, 'koi-net-setup.sh');
 const PASTA_BIN = process.env.KOI_PASTA_BIN || 'pasta';
 
+function findBwrapBin() {
+  if (process.env.KOI_BWRAP_BIN) return process.env.KOI_BWRAP_BIN;
+  for (const c of ['/usr/local/bin/bwrap', 'bwrap', '/usr/bin/bwrap']) {
+    try {
+      const probe = spawnSync(c, ['--help'], { encoding: 'utf8' });
+      if (!probe.error && ((probe.stdout || '') + (probe.stderr || '')).includes('--overlay-src')) {
+        return c;
+      }
+    } catch { /* continue */ }
+  }
+  return 'bwrap';
+}
+
 class BwrapBackend {
   constructor() {
+    this.bwrapBin = findBwrapBin();
     this.name = 'bwrap-overlay';
     this.onProjectChanged();
-    const probe = spawnSync('bwrap', ['--version'], { encoding: 'utf8' });
+    const probe = spawnSync(this.bwrapBin, ['--version'], { encoding: 'utf8' });
     if (probe.error) {
       throw new Error(
-        "bubblewrap not found. Install it: sudo apt install bubblewrap\n" +
-        "On Ubuntu 24.04, if bwrap fails with a userns permission error, the AppArmor\n" +
-        "unprivileged-userns restriction is blocking it; install the bwrap apparmor\n" +
-        "profile or set: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0"
+        "bubblewrap not found. Please install bubblewrap (>= 0.11.0).\n" +
+        "Note: Ubuntu/Debian apt repositories often ship older versions (< 0.11.0).\n" +
+        "To build and install bwrap 0.11.0+ from source:\n" +
+        "  sudo apt install -y meson ninja-build libcap-dev\n" +
+        "  git clone https://github.com/containers/bubblewrap.git\n" +
+        "  cd bubblewrap && meson setup _build && meson compile -C _build && sudo meson install -C _build"
       );
+    }
+
+    const helpProbe = spawnSync(this.bwrapBin, ['--help'], { encoding: 'utf8' });
+    const helpOut = (helpProbe.stdout || '') + (helpProbe.stderr || '');
+    if (!helpOut.includes('--overlay-src')) {
+      const ver = (probe.stdout || '').trim();
+      throw new Error(
+        `bubblewrap version is too old (${ver || 'unknown'} at ${this.bwrapBin}).\n` +
+        "The sandbox requires bubblewrap >= 0.11.0 for overlayfs support (--overlay-src / --overlay).\n" +
+        "Default distro packages (e.g. Ubuntu 22.04 / 24.04) ship older versions without this feature.\n" +
+        "To build and install bwrap 0.11.0+ from source:\n" +
+        "  sudo apt install -y meson ninja-build libcap-dev\n" +
+        "  git clone https://github.com/containers/bubblewrap.git\n" +
+        "  cd bubblewrap && meson setup _build && meson compile -C _build && sudo meson install -C _build"
+      );
+    }
+
+    const permProbe = spawnSync(this.bwrapBin, ['--ro-bind', '/', '/', 'true'], { encoding: 'utf8' });
+    if (permProbe.status !== 0) {
+      const permErr = (permProbe.stderr || '') + (permProbe.stdout || '');
+      if (/uid_map|user mappings|Operation not permitted|permission denied/i.test(permErr)) {
+        throw new Error(
+          "bubblewrap cannot create user namespaces (Operation not permitted).\n" +
+          "On Ubuntu 24.04 (due to AppArmor unprivileged-userns restrictions), run:\n" +
+          "  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n" +
+          "To make it permanent, add it to /etc/sysctl.d/99-userns.conf\n" +
+          "On Debian or other distros, run:\n" +
+          "  sudo sysctl -w kernel.unprivileged_userns_clone=1\n" +
+          "Or grant setuid permissions:\n" +
+          "  sudo chmod u+s $(which bwrap)"
+        );
+      }
+      throw new Error(`bubblewrap preflight probe failed (exit code ${permProbe.status}):\n${permErr}`);
     }
   }
 
@@ -1268,7 +1305,7 @@ class BwrapBackend {
 
   /** Build the argv that runs `shCmd` inside the sandbox. */
   wrap(shCmd, { cwd } = {}) {
-    const argv = ['bwrap',
+    const argv = [this.bwrapBin,
       '--ro-bind', '/', '/',
       '--dev', '/dev',
       '--proc', '/proc',
@@ -1599,178 +1636,26 @@ if (OPTS.net === 'policy') {
 }
 
 // =============================================================================
-// Merged code intelligence (lsp_search)
+// Overlay -> host reconciliation
 // -----------------------------------------------------------------------------
-// The LSP search server used to be a separate Gateway endpoint the LLM had to
-// wire up by hand (set_workspace, kept in sync with sandbox_open_project). It
-// is now spawned and owned by THIS server as a child process, and its tools
-// (search / get_references / get_hover / get_implementation /
-// get_file_structure / get_lsp_diagnostics) are re-exported through this one
-// endpoint. Opening a project (sandbox_open_project) automatically points the
-// LSP workspace at it — the session never calls set_workspace itself.
+// Code intelligence is no longer an MCP surface. The server used to spawn the
+// compiled lsp_search bundle as a child and re-export its tools (search,
+// get_references, get_hover, get_implementation, get_file_structure,
+// get_lsp_diagnostics, search_ast, read_ast_node) through this endpoint. That
+// duplicated navigation the session can perform for itself: the language
+// servers, ast-grep and ripgrep are all on the host PATH, so the LLM reaches
+// them the same way it reaches every other tool — as a shell command through
+// sandbox_exec, reading through the overlay and therefore seeing its own
+// unshipped edits with no buffer-sync protocol in between.
 //
-// The child is launched with SEARCH_MCP_READONLY=1 so it cannot write to the
-// real host tree (search_and_replace is dropped); every mutation still flows
-// through the sandbox overlay and leaves only as an exported patch.
-// =============================================================================
-
-class LspChild {
-  constructor(entry) {
-    this.entry = entry;          // compiled lsp_search entry, or '' to disable
-    this.proc = null;
-    this.buf = '';
-    this.nextId = 1;
-    this.pending = new Map();    // id -> { resolve, reject, timer }
-    this.tools = [];             // tools/list from the child (set_workspace removed)
-    this.ready = false;          // handshake + tools/list complete
-    this.available = false;      // child is up and usable
-    this.workspace = null;       // last synced workspace root
-    this.lastError = null;
-  }
-
-  start() {
-    if (!this.entry) { log('lsp: disabled (--no-lsp / empty entry)'); return; }
-    if (!fs.existsSync(this.entry)) {
-      this.lastError = `entry not found: ${this.entry}`;
-      log(`lsp: ${this.lastError} — code-intelligence tools disabled ` +
-          '(build it, or pass --lsp <path>/dist/index.js)');
-      return;
-    }
-    const env = { ...process.env, SEARCH_MCP_READONLY: '1' };
-    this.proc = spawn('node', [this.entry], { env, stdio: ['pipe', 'pipe', 'pipe'] });
-    this.proc.stdout.on('data', (d) => this._onData(d.toString()));
-    this.proc.stderr.on('data', () => { /* child logs to stderr; ignore */ });
-    this.proc.on('exit', (code) => {
-      this.ready = false; this.available = false;
-      for (const [, p] of this.pending) { clearTimeout(p.timer); p.reject(new Error(`lsp child exited (${code})`)); }
-      this.pending.clear();
-      this.lastError = `child exited (${code})`;
-      log(`lsp: ${this.lastError}`);
-    });
-    this.proc.on('error', (e) => { this.available = false; this.lastError = e.message; log(`lsp: spawn error ${e.message}`); });
-    this._init().catch((e) => { this.lastError = e.message; log(`lsp: init failed ${e.message}`); });
-  }
-
-  _onData(chunk) {
-    this.buf += chunk;
-    const lines = this.buf.split('\n');
-    this.buf = lines.pop() || '';
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let msg; try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.id !== undefined && this.pending.has(msg.id)) {
-        const p = this.pending.get(msg.id); this.pending.delete(msg.id); clearTimeout(p.timer);
-        if (msg.error) p.reject(new Error(msg.error.message || 'lsp error'));
-        else p.resolve(msg.result);
-      }
-    }
-  }
-
-  _rpc(method, params, timeoutMs = 60_000) {
-    return new Promise((resolve, reject) => {
-      if (!this.proc || this.proc.exitCode !== null) return reject(new Error('lsp child not running'));
-      const id = this.nextId++;
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`lsp ${method} timed out`)); }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      try { this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); }
-      catch (e) { this.pending.delete(id); clearTimeout(timer); reject(e); }
-    });
-  }
-
-  _notify(method, params) {
-    try { this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n'); } catch { /* gone */ }
-  }
-
-  async _init() {
-    await this._rpc('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: {},
-      clientInfo: { name: 'koi-sandbox-shell', version: '2.2.0' },
-    }, 20_000);
-    this._notify('notifications/initialized', {});
-    const list = await this._rpc('tools/list', {}, 20_000);
-    // Hide set_workspace from the LLM: sandbox_open_project drives it.
-    this.tools = (list?.tools || []).filter((t) => t.name !== 'set_workspace');
-    this.ready = true;
-    this.available = true;
-    log(`lsp: ready (${this.tools.length} tools)`);
-    // If a project was already opened before the child finished booting, sync.
-    if (PROJ.path && PROJ.path !== os.homedir()) this.setWorkspace(PROJ.path).catch(() => {});
-  }
-
-  async setWorkspace(p) {
-    if (!this.ready) return { available: false, reason: this.lastError || 'lsp not ready' };
-    try {
-      await this._rpc('tools/call', { name: 'set_workspace', arguments: { path: p } }, 30_000);
-      this.workspace = p;
-      return { available: true, workspace: p };
-    } catch (e) {
-      return { available: false, error: e.message };
-    }
-  }
-
-  hasTool(name) { return this.tools.some((t) => t.name === name); }
-
-  call(name, args) { return this._rpc('tools/call', { name, arguments: args || {} }, 120_000); }
-
-  // --- Design 2: editor-style document sync -------------------------------
-  // The sandbox overlay is the source of truth for in-session edits, but the
-  // language servers index the read-only HOST tree. Rather than have them
-  // re-read a mount they can't see, we push the current overlay buffer for
-  // each edited file to the child, which forwards didOpen/didChange to the
-  // real language server (and keeps an in-memory overlay for text search).
-  // This makes navigation/diagnostics reflect unshipped edits without any
-  // dependency on overlay mount visibility.
-  async syncDocument(absPath, text) {
-    if (!this.ready || !this.hasTool('sync_document')) return { synced: false };
-    try {
-      await this._rpc('tools/call', { name: 'sync_document', arguments: { path: absPath, text } }, 30_000);
-      return { synced: true };
-    } catch (e) {
-      return { synced: false, error: e.message };
-    }
-  }
-
-  async resetDocuments() {
-    if (!this.ready || !this.hasTool('sync_reset')) return { synced: false };
-    try {
-      await this._rpc('tools/call', { name: 'sync_reset', arguments: {} }, 30_000);
-      return { synced: true };
-    } catch { return { synced: false }; }
-  }
-
-  status() {
-    return {
-      available: this.available,
-      workspace: this.workspace,
-      tools: this.tools.map((t) => t.name),
-      documentSync: this.hasTool('sync_document'),
-      ...(this.available ? {} : { error: this.lastError }),
-    };
-  }
-
-  stop() { try { this.proc && this.proc.exitCode === null && this.proc.kill('SIGTERM'); } catch { /* ignore */ } }
-}
-
-const LSP = new LspChild(OPTS.lsp);
-LSP.start();
-
-// =============================================================================
-// Overlay -> LSP re-sync
-// -----------------------------------------------------------------------------
-// Edits reach the overlay through the shell (sandbox_exec), which the LSP
-// child never observes, so its buffers are refreshed in bulk instead of
-// edit-by-edit: on resuming a previous session's overlay, and on switching
-// projects and back (set_workspace clears the child's buffers while the
-// overlay keeps the edits).
-// This walks the overlay upperdir and re-pushes every plausible text file so
-// code intelligence matches what the shell sees. Bounded and best-effort: the
-// compiler remains ground truth for anything skipped.
+// What survives is the part the shell cannot do for itself: keeping the
+// overlay's copy of a file from going stale when the HOST changes underneath
+// it. That reconciliation runs at the head of sandbox_exec and on demand via
+// overlay_fs_sync.
 // =============================================================================
 
 const RESYNC_SKIP_DIRS = new Set(['node_modules', 'target', 'dist', 'build', 'out', '.next', '.cache', '__pycache__', 'vendor']);
 const RESYNC_MAX_FILES = 300;
-const RESYNC_MAX_BYTES = 512 * 1024;
 
 /**
  * Overwrite an overlay file with the host's newer version.
@@ -1881,34 +1766,6 @@ function collectOverlayFiles(upperDir, relBase = '', acc = []) {
   return acc;
 }
 
-function looksBinary(buf) {
-  const n = Math.min(buf.length, 8192);
-  for (let i = 0; i < n; i++) if (buf[i] === 0) return true;
-  return false;
-}
-
-/** Push overlay upperdir contents into the LSP buffers. Returns a summary. */
-async function resyncOverlayToLsp() {
-  if (!LSP.ready || !LSP.hasTool('sync_document')) return { resynced: 0, skipped: 0, reason: 'document sync unavailable' };
-  const upper = projectTreeHostPath();
-  if (!upper || !fs.existsSync(upper)) return { resynced: 0, skipped: 0 };
-  const rels = collectOverlayFiles(upper);
-  let resynced = 0, skipped = 0;
-  for (const rel of rels) {
-    try {
-      if (rel.startsWith('.git/')) { skipped++; continue; }
-      const st = fs.statSync(path.join(upper, rel));
-      if (!st.isFile() || st.size > RESYNC_MAX_BYTES) { skipped++; continue; }
-      const buf = fs.readFileSync(path.join(upper, rel));
-      if (looksBinary(buf)) { skipped++; continue; }
-      const r = await LSP.syncDocument(path.join(PROJ.path, rel), buf.toString('utf8'));
-      if (r.synced) resynced++; else skipped++;
-    } catch { skipped++; }
-  }
-  const capped = rels.length >= RESYNC_MAX_FILES;
-  return { resynced, skipped, ...(capped ? { capped: true } : {}) };
-}
-
 // =============================================================================
 // Execution helpers
 // =============================================================================
@@ -1987,6 +1844,16 @@ function execInSandbox(shCmd, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, outputCap =
     child.stderr.on('data', (d) => { stderr = capAppend(stderr, d.toString(), outputCap); });
     const settle = (code, signal) => {
       if (done) return; done = true; clearTimeout(timer);
+      if (code !== 0 && code != null) {
+        if (/Unknown option --overlay-src/i.test(stderr)) {
+          stderr += '\n[sandbox hint] bubblewrap lacks --overlay-src (bubblewrap >= 0.11.0 is required for overlayfs support).\n' +
+            'Please build and install bwrap 0.11.0+: https://github.com/containers/bubblewrap';
+        } else if (/uid_map|user mappings|clone: Operation not permitted/i.test(stderr)) {
+          stderr += '\n[sandbox hint] bubblewrap failed to configure user namespaces (Operation not permitted).\n' +
+            'On Ubuntu 24.04 run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n' +
+            'or grant setuid permissions: sudo chmod u+s $(which bwrap)';
+        }
+      }
       resolve({ exitCode: code ?? -1, signal, stdout, stderr, timedOut });
     };
     child.on('error', (e) => {
@@ -2170,7 +2037,6 @@ function stopAllServices() {
 
 function shutdownChildren() {
   stopAllServices();
-  try { LSP.stop(); } catch { /* ignore */ }
   try { NET_BROKER?.stop(); } catch { /* ignore */ }
 }
 process.on('exit', shutdownChildren);
@@ -2280,7 +2146,7 @@ const TOOLS = [
   {
     name: 'sandbox_open_project',
     tier: 'safe',
-    description: 'Open a project directory on the host: sets the writable overlay location, working directory, relative path root, and points code intelligence (LSP) at the same project. New sessions start each project FRESH from the host tree; re-opening within this session CONTINUES its overlay. Pass resume to reattach a previous session overlay (see sandbox_info.priorSessions), or fresh:true to force a clean overlay mid-session. Existing running services are NOT stopped.',
+    description: 'Open a project directory on the host: sets the writable overlay location, working directory, and relative path root. New sessions start each project FRESH from the host tree; re-opening within this session CONTINUES its overlay. Pass resume to reattach a previous session overlay (see sandbox_info.priorSessions), or fresh:true to force a clean overlay mid-session. Existing running services are NOT stopped.',
     displayMessage: '📂 Opening project {{path}}',
     inputSchema: {
       type: 'object',
@@ -2306,7 +2172,7 @@ const TOOLS = [
   {
     name: 'overlay_fs_sync',
     tier: 'safe',
-    description: 'Synchronizes the gateway overlay filesystem and language server buffers to ensure the host, overlay, and LSP states are aligned.',
+    description: 'Reconcile the overlay with the host tree: refresh every overlay file the host has modified since it was copied, so the sandbox stops reading stale content. Run it when the user says they changed or applied something on their side.',
     displayMessage: '🔄 Syncing overlay filesystem',
     inputSchema: { type: 'object', properties: {} },
   },
@@ -2420,20 +2286,6 @@ const handlers = {
   async sandbox_open_project({ path: p, resume = null, fresh = false, label = null }) {
     try {
       setProject(p, { resume, fresh, label });
-      // A fresh overlay means the LSP's edit buffers must be cleared too so
-      // code intelligence reflects the host tree, not a stale session.
-      if (PROJ.startedFromHost || fresh) await LSP.resetDocuments().catch(() => {});
-      // Point code-intelligence at the same project automatically — the
-      // session no longer calls set_workspace itself. Non-blocking failure:
-      // the sandbox is fully usable even if LSP is unavailable.
-      const lsp = await LSP.setWorkspace(PROJ.path);
-      // Overlay already has edits (RESUMED, or CONTINUING after a workspace
-      // switch cleared the LSP buffers): re-push them so code intelligence
-      // matches what the shell sees. Best-effort and bounded.
-      let resync;
-      if (!PROJ.startedFromHost && !fresh) {
-        resync = await resyncOverlayToLsp().catch(() => undefined);
-      }
       const prior = listProjectSessions(PROJ.sessionsRoot).filter((s) => s.id !== PROJ.sessionId);
       const baseKind = PROJ.resumed ? 'RESUMED' : (PROJ.startedFromHost ? 'FRESH' : 'CONTINUING');
       const gfNote = PROJ.greenfield
@@ -2453,7 +2305,6 @@ const handlers = {
         baseKind,
         greenfield: PROJ.greenfield,
         resumed: PROJ.resumed,
-        ...(resync ? { lspResync: resync } : {}),
         // The outbox is keyed by a hash of the PROJECT PATH, so opening a
         // different project silently invalidates any previously-noted path.
         // Returned here (not only from sandbox_info) so a caller that switches
@@ -2465,14 +2316,15 @@ const handlers = {
         reviewCommand: `node ${SELF_PATH} review --watch`,
         priorSessions: prior,
         note: (baseKind === 'FRESH'
-          ? 'New empty overlay activated; code intelligence pointed at the same project.'
+          ? 'New empty overlay activated.'
           : baseKind === 'CONTINUING'
-            ? 'Existing session overlay reactivated; code intelligence pointed at the same project.'
-            : 'Resumed overlay activated; code intelligence pointed at the same project.')
+            ? 'Existing session overlay reactivated.'
+            : 'Resumed overlay activated.')
           + (prior.length ? ` ${prior.length} other session overlay(s) exist for this project — pass resume:"<session>" to reattach one, otherwise they are ignored.` : ''),
-        codeIntelligence: lsp.available
-          ? { available: true, tools: LSP.tools.map((t) => t.name), documentSync: LSP.hasTool('sync_document'), note: 'search / get_references / get_hover / get_implementation / get_file_structure / get_lsp_diagnostics are ready (indexing may warm up in the background for Rust/C++).' }
-          : { available: false, reason: lsp.reason || lsp.error || 'lsp not available', note: 'Fall back to shell rg/grep for navigation.' },
+        // Navigation is a shell concern: run rg / ast-grep / the project's own
+        // language tooling through sandbox_exec. They read through the overlay,
+        // so they already see this session's unshipped edits.
+        codeNavigation: 'Use sandbox_exec: `rg` for text, `ast-grep run -p \'<pattern>\' --lang <lang>` for structure, and the project\'s own compiler/LSP CLI (tsc --noEmit, cargo check, gopls, rust-analyzer) for semantics and diagnostics.',
       };
     } catch (e) {
       return { success: false, error: e.message };
@@ -2482,8 +2334,7 @@ const handlers = {
   async sandbox_reset() {
     BACKEND.reset();
     overlayUsageCache.delete(PROJ.state); // the freed space must show up immediately
-    await LSP.resetDocuments().catch(() => {});
-    return { success: true, session: PROJ.sessionId, note: 'overlay/workspace wiped back to host state; in-overlay git commits are gone (patches already in the outbox survive); LSP edit buffers cleared' };
+    return { success: true, session: PROJ.sessionId, note: 'overlay/workspace wiped back to host state; in-overlay git commits are gone (patches already in the outbox survive)' };
   },
 
   async sandbox_info() {
@@ -2527,7 +2378,6 @@ const handlers = {
       servicesAll: listAllServices(),
       outboxInside: BACKEND.outboxInside,
       projectOpened: PROJ.path !== os.homedir(),
-      codeIntelligence: LSP.status(),
       gitWorkflow: PROJ.greenfield
         ? {
             newProject: 'This path does not exist on the host yet — ship the WHOLE tree, not a delta patch. There is no host base for format-patch/git am to apply onto.',
@@ -2550,7 +2400,7 @@ const handlers = {
           ? ['OVERLAY RECREATED: this session\'s overlay directories had been deleted on the host and were recreated empty. Any writes, commits or services from before that point are GONE, and the session/greenfield/services fields above describe the session as it is NOW, not as it was. Re-check git log and the outbox before trusting continuity notes from an earlier session.']
           : []),
         ...(PROJ.path === os.homedir()
-          ? ['NO PROJECT OPENED: currently scoped to $HOME as a placeholder. Call sandbox_open_project({ path }) with the absolute project path before working — this also points code intelligence (LSP) at the project automatically; no separate set_workspace call is needed.']
+          ? ['NO PROJECT OPENED: currently scoped to $HOME as a placeholder. Call sandbox_open_project({ path }) with the absolute project path before working.']
           : []),
         ...(PROJ.greenfield
           ? [`GREENFIELD: the project path does not exist on the host. Nothing is created on the host by the sandbox — build here. Delivery is automatic and cannot fail: the tree is host-visible at ${projectTreeHostPath()} and the user copies it out. Commit for reviewability; a git bundle is optional. Do NOT use format-patch/git am; there is no host base.`]
@@ -2562,6 +2412,7 @@ const handlers = {
           ? [`DISK PRESSURE: overlay cache is at ${LAST_OVERLAY_GC.usedHuman} against a ${LAST_OVERLAY_GC.limitHuman} cap and only live sessions remain, so nothing more can be reclaimed. Keep large artifacts (node_modules, build output, downloads) out of the overlay and ship finished work to the outbox.`]
           : []),
         'Host PATH is inherited (toolchains via fnm/nvm/rustup/pyenv work if on host PATH).',
+        'Code navigation is shell-based: rg for text, ast-grep for structure, the project\'s own compiler/LSP CLI for semantics — all through sandbox_exec, all reading through the overlay. There are no navigation tools on this endpoint.',
         'Each session starts from a FRESH overlay over the host tree (the stable base on disk). Previous sessions do not leak in — pass resume:"<session>" to sandbox_open_project to reattach one deliberately.',
         'Overlay writes may not reach already-running services; use sandbox_restart_service after edits.',
         'git push is blocked; commits are cheap local checkpoints — use them freely.',
@@ -2597,13 +2448,7 @@ const handlers = {
       const rec = reconcileLowerToUpper();
       const hostUpdated = rec.reconciled;
 
-      // 2. Resync reconciled overlay files into LSP memory buffers
-      let lspResync;
-      if (LSP.available && !PROJ.startedFromHost) {
-        lspResync = await resyncOverlayToLsp().catch((err) => ({ error: err.message }));
-      }
-
-      // 3. Invalidate disk cache and usage stats
+      // 2. Invalidate disk cache and usage stats
       overlayUsageCache.delete(PROJ.state);
       const budget = overlayBudgetStatus();
 
@@ -2616,7 +2461,6 @@ const handlers = {
           hint: 'Some overlay files could not be refreshed from the host; commands may still read stale content for those paths.',
         } : {}),
         overlayHostPath: projectTreeHostPath(),
-        lspResync: lspResync || { status: 'up-to-date' },
         overlayBudget: budget,
         syncedAt: new Date().toISOString(),
       };
@@ -2679,8 +2523,7 @@ async function handleMessage(msg) {
         reply({});
         break;
       case 'tools/list':
-        // Sandbox tools + re-exported code-intelligence tools from the child.
-        reply({ tools: [...TOOLS, ...LSP.tools] });
+        reply({ tools: TOOLS });
         break;
       case 'tools/call': {
         const { name, arguments: args = {} } = params || {};
@@ -2694,17 +2537,6 @@ async function handleMessage(msg) {
             });
           } catch (e) {
             reply({ content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
-          }
-          break;
-        }
-        // Forward code-intelligence tools to the merged LSP child verbatim
-        // (the child already returns the MCP { content, isError } shape).
-        if (LSP.hasTool(name)) {
-          try {
-            const result = await LSP.call(name, args);
-            reply(result);
-          } catch (e) {
-            reply({ content: [{ type: 'text', text: `Error (code intelligence): ${e.message}` }], isError: true });
           }
           break;
         }

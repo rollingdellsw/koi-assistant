@@ -128,13 +128,10 @@ class SandboxServer {
     this.stderr = '';
     this.exited = null;
 
-    this.proc = spawn(process.execPath, [SERVER, '--project', project, '--state', state, '--no-lsp'], {
+    this.proc = spawn(process.execPath, [SERVER, '--project', project, '--state', state], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        // Belt and braces with --no-lsp: the code-intelligence child is
-        // irrelevant here and only adds startup latency and failure modes.
-        KOI_LSP_ENTRY: '',
         KOI_PROJECT: project,
       },
     });

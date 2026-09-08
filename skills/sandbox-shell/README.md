@@ -10,9 +10,9 @@ to the assistant but cannot be changed by it. Every write lands in a temporary o
 and the only way anything reaches your real repository is a git patch you review and apply
 yourself.
 
-It pairs shell execution with an LSP (Language Server Protocol) code-intelligence engine,
-so the assistant can navigate symbols, search the AST, and read diagnostics rather than
-grepping blindly.
+Code navigation is done with your own tools: the assistant runs `ripgrep`, `ast-grep` and
+your project's type-checker inside the sandbox, the same way you would. Nothing is
+indexed behind your back.
 
 The shell execution environment also provides a convenient way to connect your corporate
 database as context for any Koi AI session.
@@ -238,18 +238,16 @@ KOI_ASSUME_YES=1           # no prompts (scripted installs)
 ```
 Chrome side panel  ──WebSocket──▶  koi-gateway  ──stdio──▶  sandbox-shell-mcp
                                                                 │
-                                             ┌──────────────────┼──────────────────┐
-                                             ▼                  ▼                  ▼
-                                        bubblewrap          lsp_search        egress proxy
-                                       (fs isolation)    (code intelligence)  (network policy)
+                                             ┌──────────────────┴──────────────────┐
+                                             ▼                                     ▼
+                                        bubblewrap                            egress proxy
+                                       (fs isolation)                        (network policy)
 ```
 
 - **`koi-gateway`** — a WebSocket-to-stdio bridge, so the browser extension can speak to
   local MCP servers. Runs as a user service (`systemd --user` or `launchd`).
 - **`sandbox-shell-mcp`** — the MCP server that owns the sandbox: opens projects, builds
   overlays, runs commands, manages long-lived dev servers, exports patches.
-- **`lsp_search`** — embedded code intelligence, in three tiers: LSP for semantics
-  (definitions, references, diagnostics), `ast-grep` for structure, `ripgrep` for text.
 - **`koi-egress`** — the filtering proxy, only when network policy is on. A separate
   service, but tied to the gateway: restarting or stopping the gateway takes it along.
 
