@@ -25,7 +25,8 @@
  * Scenario (mirrors the hand-run procedure)
  * -----------------------------------------
  *   Turn 1   sandbox creates app-config-auto.txt, commits it in the overlay,
- *            exports BASE..HEAD to $KOI_OUTBOX
+ *            exports BASE..HEAD to $KOI_OUTBOX, and the paths that export
+ *            PRINTS must be openable on the host (see step 1b)
  *   Host     `git am` that patch, then mutate the file again and commit it
  *            -> host HEAD is now two commits ahead of the sandbox's parent and
  *               the file content differs from what the overlay holds
@@ -370,6 +371,27 @@ async function runTest() {
     check('turn 1 patch landed in the host-visible outbox', patchesAfterTurn1.length === 1,
       `outbox=${outbox} entries=${JSON.stringify(patchesAfterTurn1)}`);
     const turn1Patch = path.join(outbox, patchesAfterTurn1[0] || '');
+
+    // -- 1b. The exported path is the same string the user can open ------------
+    //
+    // The file landing in the outbox is necessary but not sufficient: what the
+    // session actually reports is whatever `git format-patch` printed. While
+    // the sandbox saw the outbox at /tmp/koi/outbox, that output named a path
+    // that exists nowhere on the host, and a correct export was routinely
+    // reported as a location holding nothing. Both halves are asserted here —
+    // the variable the skill tells the agent to use, and the text it gets back.
+    step('1b', '$KOI_OUTBOX and the printed patch paths are host paths');
+    const koiOutbox = (await server.execOk('outbox-path', 'printf %s "$KOI_OUTBOX"')).stdout.trim();
+    check('$KOI_OUTBOX is sandbox_info.outbox, not a sandbox-internal alias',
+      koiOutbox === outbox, `KOI_OUTBOX=${koiOutbox} outbox=${outbox}`);
+
+    const printedPatches = (block(turn1.stdout, 'PATCHES') || '')
+      .split('\n').map((l) => l.trim()).filter(Boolean);
+    check('git format-patch printed one path', printedPatches.length === 1,
+      JSON.stringify(printedPatches));
+    check('the printed path is the host path, and resolves to a real file',
+      printedPatches.every((l) => l.startsWith(outbox + path.sep) && fs.existsSync(l)),
+      `printed=${JSON.stringify(printedPatches)} outbox=${outbox}`);
 
     check('host repo is untouched by the sandbox commit',
       hostShOk(hostRepo, 'git rev-parse HEAD').stdout.trim() === hostBase &&

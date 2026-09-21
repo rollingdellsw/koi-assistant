@@ -514,6 +514,49 @@ function log(msg) {
 }
 
 // =============================================================================
+// Build identity — "is the running process the code on disk?"
+// =============================================================================
+// A long-lived server keeps serving whatever it loaded at import time. Edit the
+// file, forget to restart (or restart a unit pointing at a different copy) and
+// the fix is on disk while the bug is live — with a green test suite, because
+// tests spawn a fresh server from the checkout and never touch the running one.
+//
+// That is not hypothetical: it is how the outbox mask-shadowing bug survived
+// its own fix. The session that investigated had to infer the running version
+// from mount IDs in /proc/self/mountinfo, because nothing in the protocol could
+// answer "which code are you?". These fields answer it directly, and `stale`
+// answers the sharper question — whether the file has changed underneath us
+// since we loaded it, which is exactly the forgot-to-restart case.
+const PROCESS_STARTED_AT = new Date().toISOString();
+const BUILD_LOADED = readBuildIdentity();
+
+function readBuildIdentity() {
+  try {
+    const buf = fs.readFileSync(SELF_PATH);
+    return {
+      file: SELF_PATH,
+      sha256: crypto.createHash('sha256').update(buf).digest('hex').slice(0, 12),
+      mtime: fs.statSync(SELF_PATH).mtime.toISOString(),
+      bytes: buf.length,
+    };
+  } catch (e) {
+    return { file: SELF_PATH, sha256: null, mtime: null, bytes: null, error: e.message };
+  }
+}
+
+/** Build identity plus whether the file on disk has moved on without us. */
+function buildStatus() {
+  const onDisk = readBuildIdentity();
+  const stale = !!(BUILD_LOADED.sha256 && onDisk.sha256 && onDisk.sha256 !== BUILD_LOADED.sha256);
+  return {
+    ...BUILD_LOADED,
+    startedAt: PROCESS_STARTED_AT,
+    stale,
+    ...(stale ? { onDisk: { sha256: onDisk.sha256, mtime: onDisk.mtime, bytes: onDisk.bytes } } : {}),
+  };
+}
+
+// =============================================================================
 // Project state — mutable so the sandbox can switch projects at runtime
 // (sandbox_open_project) without a restart. The full host is always visible
 // read-only; the "project" only determines the writable overlay location,
@@ -562,6 +605,51 @@ function newSessionId() {
 // The current connection's session id. Rotated on `initialize`; may be pointed
 // at a prior session by an explicit resume.
 let SESSION_ID = newSessionId();
+
+// Conversation-scoped session key. A transport reconnect (idle socket closed
+// by the browser, a dropped WebSocket mid-build, a gateway-pooled process
+// serving a returning client) re-runs `initialize`, and rotating SESSION_ID on
+// every handshake made each reconnect look like a brand-new LLM session: the
+// next sandbox_open_project attached an EMPTY overlay and the model's
+// in-progress edits vanished from view. Only the client knows whether a
+// handshake continues an existing conversation, so it may say so by sending a
+// stable key in the initialize params:
+//
+//   params._meta['koi/sessionKey']                      (preferred)
+//   params.capabilities.experimental.koiSession.key     (SDK-friendly form)
+//
+// Same key as the previous handshake -> a reconnect: SESSION_ID and the
+// session's network grants are kept. The key is also recorded (as a digest) on
+// the session overlay it attaches, so the conversation finds its overlay again
+// after a server restart. A client that sends no key keeps the old behavior.
+let SESSION_KEY = null;
+
+function sessionKeyDigest(key) {
+  return crypto.createHash('sha256').update(String(key)).digest('hex').slice(0, 32);
+}
+
+function readSessionKeyFromInit(params) {
+  const k = params?._meta?.['koi/sessionKey'] ?? params?.capabilities?.experimental?.koiSession?.key;
+  return typeof k === 'string' && k.trim() !== '' ? k.trim() : null;
+}
+
+function sessionKeyDigestOf(stateDir) {
+  try { return fs.readFileSync(path.join(stateDir, 'sessionkey'), 'utf8').trim() || null; } catch { return null; }
+}
+
+/** Make `stateDir` the one overlay of this project that answers to `key`. */
+function claimSessionKey(sessionsRoot, stateDir, key) {
+  const digest = sessionKeyDigest(key);
+  let names = [];
+  try { names = fs.readdirSync(sessionsRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { /* none */ }
+  for (const name of names) {
+    const dir = path.join(sessionsRoot, name);
+    if (dir !== stateDir && sessionKeyDigestOf(dir) === digest) {
+      try { fs.unlinkSync(path.join(dir, 'sessionkey')); } catch { /* best effort */ }
+    }
+  }
+  try { fs.writeFileSync(path.join(stateDir, 'sessionkey'), digest + '\n'); } catch { /* best effort */ }
+}
 
 // Enumerate existing session overlays for a project (most recent first), with
 // a cheap "changed files" count so nothing in the overlay is ever invisible.
@@ -630,6 +718,12 @@ const OVERLAY_GC_PERIOD_MS = 5 * 60_000;   // idle safety net (long-running serv
 const OVERLAY_WALK_ENTRY_CAP = 500_000;    // bail out of pathological trees
 const OVERLAY_USAGE_TTL_MS = 10 * 60_000;  // cache TTL for non-live sessions
 const OVERLAY_INUSE_STALE_MS = 30 * 60_000;
+// A session overlay that still holds work when the server attaches a different
+// overlay for the same project is pinned for this long. Without the pin, the
+// detached overlay is only protected by its `inuse` marker (30 min), and a few
+// fresh sessions that each rebuild `target/` or `node_modules` can push the
+// cache over its cap and evict the one overlay holding the unexported work.
+const OVERLAY_DETACH_PIN_MS = 24 * 60 * 60_000;
 
 /** dir -> { bytes, files, newestMtimeMs, truncated, at } */
 const overlayUsageCache = new Map();
@@ -691,6 +785,20 @@ function touchSessionInUse() {
   } catch { /* best effort — worst case this overlay looks evictable */ }
 }
 
+/** Protect a detached session overlay from GC eviction until `until`. */
+function pinSession(dir, reason, ms = OVERLAY_DETACH_PIN_MS) {
+  const until = new Date(Date.now() + ms).toISOString();
+  try { fs.writeFileSync(path.join(dir, 'pinned'), JSON.stringify({ until, reason }) + '\n'); } catch { /* best effort */ }
+  return until;
+}
+
+function sessionPinned(dir) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'pinned'), 'utf8'));
+    return Date.parse(rec.until) > Date.now();
+  } catch { return false; }
+}
+
 /** True if another (or this) live process is attached to the session at `dir`. */
 function sessionInUse(dir) {
   let raw;
@@ -729,7 +837,7 @@ function listOverlaySessions() {
       const usage = sessionUsage(dir, { live });
       let label;
       try { label = fs.readFileSync(path.join(dir, 'label'), 'utf8').trim() || undefined; } catch { /* unlabeled */ }
-      const protectedBy = live ? 'live' : (sessionInUse(dir) ? 'in-use' : null);
+      const protectedBy = live ? 'live' : (sessionInUse(dir) ? 'in-use' : (sessionPinned(dir) ? 'pinned' : null));
       out.push({ dir, projectId, sessionId, label, live, protectedBy, ...usage });
     }
   }
@@ -994,6 +1102,7 @@ function setProject(projectPath, { resume = null, fresh = false, label = null } 
   //                         across open_project calls, so switch-back is stable.
   let sessionId = null;
   let resumed = false;
+  let resumedByKey = false;
   const persistDefault = process.env.KOI_SANDBOX_PERSIST === '1';
   const wantResume = resume != null ? resume : (persistDefault && !fresh ? true : null);
   if (fresh) {
@@ -1012,6 +1121,17 @@ function setProject(projectPath, { resume = null, fresh = false, label = null } 
       }
     } else if (sessions.length > 0) {
       sessionId = sessions[0].id; resumed = true;
+    }
+  } else if (SESSION_KEY) {
+    // The conversation already has an overlay for this project (from before a
+    // reconnect or a server restart): attach it instead of an empty one.
+    const digest = sessionKeyDigest(SESSION_KEY);
+    const byKey = listProjectSessions(sessionsRoot).find((s) => sessionKeyDigestOf(path.join(sessionsRoot, s.id)) === digest);
+    if (byKey) {
+      sessionId = byKey.id;
+      resumedByKey = true;
+      // Re-attaching the overlay we are already on is a continuation.
+      resumed = path.join(sessionsRoot, byKey.id) !== PROJ.state;
     }
   }
   if (!sessionId) sessionId = SESSION_ID;
@@ -1040,7 +1160,8 @@ function setProject(projectPath, { resume = null, fresh = false, label = null } 
   }
   let sessionLabel;
   try { sessionLabel = fs.readFileSync(path.join(state, 'label'), 'utf8').trim() || undefined; } catch { /* unlabeled */ }
-  Object.assign(PROJ, { path: p, id, state, sessionId, sessionLabel, sessionsRoot, resumed, startedFromHost, hostAbsent, greenfield, dirs });
+  if (SESSION_KEY) claimSessionKey(sessionsRoot, state, SESSION_KEY);
+  Object.assign(PROJ, { path: p, id, state, sessionId, sessionLabel, sessionsRoot, resumed, resumedByKey, startedFromHost, hostAbsent, greenfield, dirs });
   // Live pointer for the host-side `review` CLI: which project + session
   // overlay the server is currently attached to. Best-effort; review falls
   // back to --project / most-recent-session when absent or stale.
@@ -1227,10 +1348,105 @@ function composeSandboxPath(wrapperPrefix) {
 // the host (the thing we are deliberately avoiding).
 const GREENFIELD_MOUNT = '/tmp/koi/project';
 
+// Second, independent spelling of the outbox inside the sandbox (bwrap only).
+// It lives under our own /tmp tmpfs, so unlike the host-path bind it cannot be
+// shadowed by a credential mask no matter what --exclude contains. Kept as a
+// compatibility alias, and used as the automatic fallback when the delivery
+// self-check finds the host-path spelling unreachable.
+const OUTBOX_ALIAS_INSIDE = '/tmp/koi/outbox';
+
 // Host paths, used as-is inside the sandbox: the whole host tree is ro-bound at
 // /, so the scripts shipped next to this server are visible at their real path.
 const NET_SETUP = path.join(SELF_DIR, 'koi-net-setup.sh');
 const PASTA_BIN = process.env.KOI_PASTA_BIN || 'pasta';
+
+// Does this pasta forward host-loopback connections to the namespace's
+// LOOPBACK, or to its interface address?
+//
+// `-t auto` republishes ports the namespace binds onto host loopback, which is
+// what makes a sandbox dev server reachable from the browser. Newer passt
+// changed where those forwarded connections land: they now arrive on the
+// namespace's interface address rather than 127.0.0.1, so a dev server bound to
+// 127.0.0.1 inside (the default for Vite, Next, Rails, Flask, and most others)
+// never sees them. The port looks published from the host and the connection
+// dies at the last hop.
+//
+// The same release that changed the default added --host-lo-to-ns-lo to restore
+// it, so the flag's EXISTENCE is the version test: if pasta knows the option,
+// it has the new default and we want the old behaviour. Older builds neither
+// need it nor accept it, and passing an unknown flag makes pasta exit — hence
+// probing rather than assuming. Probed once; `pasta --help` is cheap but this
+// runs on every exec and every service start.
+//
+// Set KOI_PASTA_HOST_LO=0 to opt out (or 1 to force it on).
+const PASTA_HOST_LO_FLAG = '--host-lo-to-ns-lo';
+
+// Does this host need pasta pinned to IPv4?
+//
+// On WSL2 in NAT mode, a dev server published by `-t auto` is reachable at the
+// distro's eth0 address but NOT at localhost, and the failure is silent in a
+// confusing way: Windows gets "empty reply" on ::1 and "could not connect" on
+// 127.0.0.1 for the same port.
+//
+// Two IPv6 facts compose into that. First, pasta's host-side socket is
+// dual-stack (`ss` shows `*:8123`), and a dual-stack listener appears ONLY in
+// /proc/net/tcp6, never in /proc/net/tcp. WSL's localhost relay discovers
+// ports by reading those two tables, so it published the port on IPv6 alone —
+// hence connect-refused on 127.0.0.1. Second, pasta preserves the connection's
+// address family into the namespace, so the IPv6 half that DID get published
+// arrives as ::1 inside, where a dev server bound to 127.0.0.1 is not
+// listening: pasta accepts, finds nothing, and closes with no bytes. That is
+// the "empty reply", and it is what the browser hits, because Windows resolves
+// localhost to ::1 first.
+//
+// `-4` collapses both: the host socket lands in /proc/net/tcp where the relay
+// can see it, and the forwarded connection stays IPv4 all the way to an IPv4
+// server. Scoped to WSL-in-NAT because it is a workaround for that relay's
+// discovery, not a general improvement — mirrored networking shares Windows'
+// loopback and does not need it, and on Linux/macOS it would only strip IPv6
+// for no reason.
+//
+// Egress is unaffected: in policy mode everything outbound goes to squid at the
+// namespace's IPv4 gateway address (koi-net-setup.sh), which `-4` leaves alone.
+//
+// Set KOI_PASTA_IPV4=0 to opt out (or 1 to force it on).
+const PASTA_IPV4_FLAG = '-4';
+
+const pastaNeedsIpv4Only = (() => {
+  let cached = null;
+  return () => {
+    if (cached !== null) return cached;
+    const override = process.env.KOI_PASTA_IPV4;
+    if (override === '0') return (cached = false);
+    if (override === '1') return (cached = true);
+    let isWsl = !!process.env.WSL_DISTRO_NAME || !!process.env.WSL_INTEROP;
+    if (!isWsl) {
+      try { isWsl = /microsoft/i.test(fs.readFileSync('/proc/version', 'utf8')); } catch { /* not WSL */ }
+    }
+    // Mirrored networking shares the Windows loopback outright, so the relay
+    // (and its /proc table scan) is not in the path at all. Its marker is the
+    // synthetic loopback0 interface, which NAT mode does not have.
+    const mirrored = fs.existsSync('/sys/class/net/loopback0');
+    return (cached = isWsl && !mirrored);
+  };
+})();
+
+const pastaSupportsHostLo = (() => {
+  let cached = null;
+  return () => {
+    if (cached !== null) return cached;
+    const override = process.env.KOI_PASTA_HOST_LO;
+    if (override === '0') return (cached = false);
+    if (override === '1') return (cached = true);
+    try {
+      const r = spawnSync(PASTA_BIN, ['--help'], { encoding: 'utf8', timeout: 5000 });
+      cached = `${r.stdout || ''}${r.stderr || ''}`.includes(PASTA_HOST_LO_FLAG);
+    } catch {
+      cached = false;
+    }
+    return cached;
+  };
+})();
 
 function findBwrapBin() {
   if (process.env.KOI_BWRAP_BIN) return process.env.KOI_BWRAP_BIN;
@@ -1300,7 +1516,15 @@ class BwrapBackend {
     // Greenfield: mount at a sandbox-internal path (empty lower); the real host
     // path does not exist and is never created here.
     this.root = PROJ.hostAbsent ? GREENFIELD_MOUNT : PROJ.path;
-    this.outboxInside = '/tmp/koi/outbox'; // bind mount of PROJ.dirs.outbox
+    // The outbox is visible at its OWN host path, so $KOI_OUTBOX, the paths
+    // `git format-patch` prints, and the path the user is told to open are the
+    // same string. This used to be /tmp/koi/outbox, which meant every export
+    // printed a path that does not exist on the host, one line away from
+    // sandbox_info.outbox which does — and a session quoting the first path it
+    // saw handed the user a location holding nothing. The other two backends
+    // (seatbelt, exec) already report the host path here; this makes bwrap
+    // agree with them instead of being the one that needs a translation rule.
+    this.outboxInside = PROJ.dirs.outbox;
   }
 
   /** Build the argv that runs `shCmd` inside the sandbox. */
@@ -1320,13 +1544,77 @@ class BwrapBackend {
       // writable mount — the ro-bound root cannot grow new directories, so
       // /koi/bin would fail with "Can't mkdir parents". /tmp is our tmpfs.
       '--ro-bind', PROJ.dirs.bin, '/tmp/koi/bin',
-      // Outbox stays host-writable so exports survive.
-      '--bind', PROJ.dirs.outbox, '/tmp/koi/outbox',
       '--unshare-pid',
       '--die-with-parent',
     ];
+
+    // MASKS BEFORE BINDS — this order is load-bearing, not cosmetic.
+    //
+    // bwrap applies operations in argv order, and a mount placed over a
+    // directory SHADOWS every mount already inside it. The outbox lives at
+    // <state>/<project>/outbox, state defaults to ~/.koi/sandbox, and ~/.koi is
+    // on the credential mask list (it holds gateway-config.json and, under
+    // --net policy, network-policy.json). So binding the outbox first and
+    // masking ~/.koi second buried the bind under the mask's tmpfs: the bind
+    // still existed — it is visible in /proc/mounts, which made this look
+    // healthy — but nothing could reach it through the path.
+    //
+    // The failure was silent and total. `git format-patch -o "$KOI_OUTBOX"`
+    // mkdir -p'd its output directory inside the tmpfs, wrote the patch,
+    // printed host-looking paths and exited 0; `ls "$KOI_OUTBOX"` from inside
+    // then listed the file at full size. Every signal a session can observe
+    // said "delivered" while the host outbox stayed empty, and the tmpfs died
+    // with the exec. Sessions reported shipped patches that never existed.
+    //
+    // Emitting the masks first and re-binding the outbox afterwards inverts
+    // that: the tmpfs goes down over ~/.koi, then the outbox is mounted on top
+    // of it. Bind SOURCES resolve through bwrap's saved oldroot, so masking the
+    // destination-side path does not hide the source, and the destination's
+    // parents are mkdir'd in the (writable) tmpfs — the same mechanism that
+    // already lets /tmp/koi/bin exist under the tmpfs at /tmp. Everything else
+    // under ~/.koi stays masked; only the one leaf is carved back out.
     for (const d of CRED_DIRS) argv.push('--tmpfs', d);
     for (const f of CRED_FILES) argv.push('--ro-bind', '/dev/null', f);
+
+    // Outbox stays host-writable so exports survive. Bound at its own host
+    // path: the directory always exists by now (setProject creates it and
+    // ensureSessionDirs re-creates it ahead of every exec and service), so
+    // bwrap has a mountpoint even though the root is a ro-bind that cannot
+    // grow new leaves. The /tmp/koi/outbox spelling is kept as an alias so a
+    // session resumed mid-task, holding the old path from an earlier turn,
+    // does not start failing on it; it is also the fallback the delivery
+    // self-check switches to if the host-path spelling is ever unreachable
+    // again, since /tmp is our own tmpfs and no mask entry can shadow it.
+    argv.push('--bind', PROJ.dirs.outbox, PROJ.dirs.outbox);
+    argv.push('--bind', PROJ.dirs.outbox, OUTBOX_ALIAS_INSIDE);
+
+    // ...AND THEN SEAL THE MASK. The bind above carves out exactly ONE leaf:
+    // the outbox of the project that is open RIGHT NOW. Everything else under a
+    // masked dir is still the mask's own tmpfs -- and a tmpfs is WRITABLE.
+    //
+    // That turned every *wrong* outbox path into silent data loss with the exact
+    // signature of the mount-ordering bug fixed above:
+    //
+    //   git format-patch -o <state>/<stale-hash>/outbox ...
+    //     -> mkdir -p succeeds (tmpfs), the write succeeds, exit 0,
+    //        host-looking paths are printed, `ls` shows the patch at full
+    //        size -- and it evaporates when the exec's namespace dies.
+    //
+    // A wrong path is not hypothetical: the outbox is keyed by a hash of the
+    // project path, so it CHANGES under a session at sandbox_open_project (the
+    // projectless $HOME-scoped outbox is a different directory) and again on
+    // resume. A session quoting a path it read one turn too early hits exactly
+    // this, and every signal it can observe says "delivered".
+    //
+    // Remounting the mask read-only makes that failure LOUD: a stale path now
+    // fails with EROFS at mkdir/open instead of succeeding into a void. The
+    // nested outbox bind keeps its own mount flags, so the real outbox stays
+    // writable, and masked content stays just as hidden (the tmpfs is empty
+    // either way). Nothing inside the sandbox legitimately writes under these
+    // dirs: koi-net-setup.sh's in-sandbox `confine` path only installs nft
+    // rules and exports proxy vars, while `proxy` -- which does write
+    // <mask>/squid -- runs on the host, outside this namespace.
+    for (const d of CRED_DIRS) argv.push('--remount-ro', d);
 
     // Make common global caches writable but ephemeral to fix EROFS during installs
     const CACHE_DIRS = ['.npm', '.cargo/registry', '.cache/pip', '.cache/yarn', '.local/share/pnpm', '.gradle/caches'];
@@ -1365,8 +1653,14 @@ class BwrapBackend {
       // pasta creates the network namespace, gives it usermode networking, and
       // (`-t auto`) republishes ports the namespace binds onto host loopback —
       // which is how dev servers stay reachable from the browser without
-      // handing the sandbox the host's own network stack.
-      const pasta = [PASTA_BIN, '--config-net', '-t', 'auto', '-q', '--'];
+      // handing the sandbox the host's own network stack. --host-lo-to-ns-lo,
+      // where supported, keeps those forwarded connections landing on the
+      // namespace's loopback, so a server bound to 127.0.0.1 inside is
+      // reachable without being told to bind 0.0.0.0.
+      const pasta = [PASTA_BIN, '--config-net', '-t', 'auto',
+        ...(pastaSupportsHostLo() ? [PASTA_HOST_LO_FLAG] : []),
+        ...(pastaNeedsIpv4Only() ? [PASTA_IPV4_FLAG] : []),
+        '-q', '--'];
       return { cmd: pasta[0], args: [...pasta.slice(1), ...argv], spawnEnv: process.env };
     }
     return { cmd: argv[0], args: argv.slice(1), spawnEnv: process.env };
@@ -1421,16 +1715,26 @@ class SeatbeltBackend {
       ? ''
       : `(deny file-read* file-write*\n${maskRules})`;
 
+    // SBPL is last-match-wins, and the sandbox's own state (workspace, outbox,
+    // git wrapper) lives UNDER ~/.koi, which the standard exclude list masks.
+    // With the deny emitted last it therefore overrode the write allowances it
+    // was never meant to touch — the Linux twin of the bind-shadowing bug, and
+    // worse here, because the deny covers file-read* too: the CoW workspace
+    // clone and the outbox both became unreadable and unwritable, so the mac
+    // backend could neither work nor ship. Order is now: blanket deny, masks,
+    // then the state carve-out, so the narrower, deliberate rule wins.
     fs.writeFileSync(this.profile, `(version 1)
 (allow default)
 (deny file-write*)
-(allow file-write*
+${credRules}
+(allow file-read* file-write*
+  (subpath "${PROJ.state}")
   (subpath "${PROJ.dirs.workspace}")
-  (subpath "${PROJ.dirs.outbox}")
+  (subpath "${PROJ.dirs.outbox}"))
+(allow file-write*
   (subpath "/private/tmp")
   (subpath "/private/var/folders")
   (subpath "/dev"))
-${credRules}
 ${netRules}
 `);
   }
@@ -1682,12 +1986,156 @@ function copyHostFileOverUpper(hostFile, upperFile, mode) {
   }
 }
 
+// Where reconciliation keeps what it would otherwise overwrite. Both live under
+// the overlay's .git so the session can read them through its own tree and
+// `git status` never shows them. The walk must not descend into either.
+const PRESERVE_DIR = 'koi-preserved';
+const PRESERVE_SKIP_RELS = new Set([
+  path.join('.git', PRESERVE_DIR),
+  path.join('.git', 'refs', PRESERVE_DIR),
+]);
+
+function isGitMetaPath(rel) {
+  return rel === '.git' || rel.startsWith('.git' + path.sep);
+}
+
+// -- sync manifest ------------------------------------------------------------
+// "host mtime newer than the overlay copy" cannot tell a host change from an
+// overlay change, cannot see a host write that carries an older mtime (rsync -t,
+// tar x), and cannot notice host deletions. So every time reconciliation writes
+// a file into the overlay it records the host stat (mtime, ctime, size, inode)
+// and the resulting overlay stat. Next time:
+//   host stat unchanged              -> the host did not change; skip
+//   overlay stat unchanged           -> nothing in the overlay to lose
+//   both changed and contents differ -> a real conflict: preserve, then refresh
+// Files the overlay copied up on its own (the session edited them) have no
+// record; for those the old mtime rule decides, and anything that differs is
+// treated as session work.
+
+function syncManifestPath() {
+  return PROJ.state ? path.join(PROJ.state, 'sync-manifest.json') : null;
+}
+
+function loadSyncManifest() {
+  try {
+    const m = JSON.parse(fs.readFileSync(syncManifestPath(), 'utf8'));
+    if (m && typeof m === 'object' && m.files && typeof m.files === 'object') return m;
+  } catch { /* absent or corrupt: start over */ }
+  return { v: 1, files: {} };
+}
+
+function saveSyncManifest(m) {
+  const p = syncManifestPath();
+  if (!p) return;
+  try {
+    fs.writeFileSync(p + '.tmp', JSON.stringify(m));
+    fs.renameSync(p + '.tmp', p);
+  } catch (e) {
+    log(`reconcile: could not save sync manifest: ${e.message}`);
+  }
+}
+
+function hostStamp(st) {
+  return { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, ino: st.ino };
+}
+
+function sameHostStamp(a, b) {
+  return !!a && !!b && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.size === b.size && a.ino === b.ino;
+}
+
+function recordSync(manifest, rel, hostStat, upperFile) {
+  try {
+    const up = fs.statSync(upperFile);
+    manifest.files[rel] = { host: hostStamp(hostStat), upper: { mtimeMs: up.mtimeMs, size: up.size } };
+  } catch { delete manifest.files[rel]; }
+}
+
+// -- preservation helpers -----------------------------------------------------
+
+function filesEqual(a, b) {
+  try { return fs.readFileSync(a).equals(fs.readFileSync(b)); } catch { return false; }
+}
+
+/**
+ * Is this object already stored by git? `includeOverlay` also accepts loose
+ * objects the session wrote into the overlay's object store. An answer of
+ * false only ever causes an extra preserved copy, never a lost one — so a
+ * SHA-256 repo, a packed overlay store or a missing git binary all fail safe.
+ */
+function gitObjectKnown(sha, { type = null, includeOverlay = false } = {}) {
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha)) return false;
+  const upperDir = projectTreeHostPath();
+  if (includeOverlay && upperDir &&
+      fs.existsSync(path.join(upperDir, '.git', 'objects', sha.slice(0, 2), sha.slice(2)))) {
+    return true;
+  }
+  const r = spawnSync('git', ['-C', PROJ.path, 'cat-file', '-e', type ? `${sha}^{${type}}` : sha],
+    { stdio: 'ignore', timeout: 5000 });
+  return r.status === 0;
+}
+
+function gitBlobSha1(file) {
+  const buf = fs.readFileSync(file);
+  return crypto.createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex');
+}
+
+function preserveStamp() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+/** Copy the overlay's version of `rel` aside before the host version replaces it. */
+function preserveOverlayFile(rel, upperFile, stamp) {
+  const upperDir = projectTreeHostPath();
+  const isDir = (d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } };
+  // A worktree/submodule `.git` FILE cannot hold a subdirectory; fall back to
+  // the session state dir (host-visible, possibly not readable in the sandbox).
+  const gitDirUsable = isDir(path.join(PROJ.path, '.git')) || isDir(path.join(upperDir, '.git'));
+  const relPosix = rel.split(path.sep).join('/');
+  const hostDest = gitDirUsable
+    ? path.join(upperDir, '.git', PRESERVE_DIR, stamp, rel)
+    : path.join(PROJ.state, 'preserved', stamp, rel);
+  fs.mkdirSync(path.dirname(hostDest), { recursive: true });
+  fs.copyFileSync(upperFile, hostDest);
+  return {
+    path: relPosix,
+    // What the session can open: inside the sandbox tree when possible.
+    savedTo: gitDirUsable ? path.posix.join(BACKEND.root, '.git', PRESERVE_DIR, stamp, relPosix) : hostDest,
+  };
+}
+
+/**
+ * Before the host's branch ref replaces the overlay's, keep the overlay tip
+ * reachable if the host does not have that commit (unexported work, or work
+ * the user applied under a different sha). A ref, not a copy: `git log <ref>`.
+ */
+function preserveOverlayRef(rel, upperFile, hostFile, stamp) {
+  const headsPrefix = path.join('.git', 'refs', 'heads') + path.sep;
+  if (!rel.startsWith(headsPrefix)) return null;
+  let overlaySha, hostSha;
+  try {
+    overlaySha = fs.readFileSync(upperFile, 'utf8').trim();
+    hostSha = fs.readFileSync(hostFile, 'utf8').trim();
+  } catch { return null; }
+  if (!overlaySha || overlaySha === hostSha) return null;
+  if (gitObjectKnown(overlaySha, { type: 'commit' })) return null;
+  const branch = rel.slice(headsPrefix.length).split(path.sep).join('/');
+  const refRel = `refs/${PRESERVE_DIR}/${stamp}/${branch}`;
+  const dest = path.join(projectTreeHostPath(), '.git', ...refRel.split('/'));
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.writeFileSync(dest, overlaySha + '\n');
+  return { branch, sha: overlaySha, ref: refRel };
+}
+
 /**
  * Reconcile lower layer (host) mutations to the upper layer (overlay).
  * Fast, synchronous local check run before mutating tool handlers.
  *
- * Only files present in BOTH layers are refreshed: a host file with no overlay
- * copy is not shadowed, so overlayfs already shows it through the lower layer.
+ * Only files present in the overlay are considered: a host file with no
+ * overlay copy is not shadowed, so overlayfs already shows it through the
+ * lower layer. The sandbox view follows the host — when both sides changed a
+ * file, the host version is installed — but the overlay's version is never
+ * dropped silently: uncommitted content is copied aside and overlay-only
+ * commits keep a ref. Everything done is returned so the caller can report it.
  *
  * Never throws. This runs at the head of sandbox_exec, where an exception would
  * surface as the shell command itself failing — a maintenance step must not be
@@ -1696,56 +2144,172 @@ function copyHostFileOverUpper(hostFile, upperFile, mode) {
 function reconcileLowerToUpper() {
   const hostRoot = PROJ.path;
   const upperDir = projectTreeHostPath();
+  const result = { reconciled: 0, files: [], failures: [], preserved: [], preservedRefs: [], removed: [], truncated: false };
   if (!hostRoot || !upperDir || !fs.existsSync(hostRoot) || !fs.existsSync(upperDir)) {
-    return { reconciled: 0, files: [], failures: [] };
+    return result;
   }
   if (process.platform === 'darwin' && typeof BACKEND !== 'undefined' && BACKEND?.ensureGitAlternates) {
     BACKEND.ensureGitAlternates();
   }
-  const files = [];
-  const failures = [];
+  const { files, failures, preserved, preservedRefs, removed } = result;
+  const manifest = loadSyncManifest();
+  let manifestDirty = false;
+  const stamp = preserveStamp();
+  const seen = new Set();
   try {
-    for (const rel of collectOverlayFiles(upperDir)) {
+    const walked = collectOverlayFiles(upperDir);
+    result.truncated = walked.length >= RESYNC_MAX_FILES;
+    for (const rel of walked) {
+      seen.add(rel);
       const hostFile = path.join(hostRoot, rel);
       const upperFile = path.join(upperDir, rel);
       try {
-        // statSync + ENOENT beats an existsSync pair: one syscall each, and no
-        // window between the check and the copy.
-        const hostStat = fs.statSync(hostFile);
         const upperStat = fs.statSync(upperFile);
-        if (!hostStat.isFile() || hostStat.mtimeMs <= upperStat.mtimeMs) continue;
+        const entry = manifest.files[rel];
+        const rec = entry && entry.host && entry.upper ? entry : undefined;
+        const overlayChanged = !rec || upperStat.mtimeMs !== rec.upper.mtimeMs || upperStat.size !== rec.upper.size;
+
+        let hostStat = null;
+        try { hostStat = fs.statSync(hostFile); }
+        catch (e) { if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw e; }
+
+        if (!hostStat) {
+          // Deleted on the host. Propagate only a copy this function installed
+          // and the session has not touched since; anything else is session work.
+          if (rec && !overlayChanged) {
+            fs.unlinkSync(upperFile);
+            delete manifest.files[rel];
+            manifestDirty = true;
+            removed.push(rel.split(path.sep).join('/'));
+          }
+          continue;
+        }
+        if (!hostStat.isFile()) continue;
+
+        const hostChanged = rec ? !sameHostStamp(hostStamp(hostStat), rec.host) : hostStat.mtimeMs > upperStat.mtimeMs;
+        if (!hostChanged) continue;
+
+        if (hostStat.size === upperStat.size && filesEqual(hostFile, upperFile)) {
+          recordSync(manifest, rel, hostStat, upperFile); // same bytes: just re-baseline
+          manifestDirty = true;
+          continue;
+        }
+
+        if (overlayChanged) {
+          if (isGitMetaPath(rel)) {
+            const kept = preserveOverlayRef(rel, upperFile, hostFile, stamp);
+            if (kept) preservedRefs.push(kept);
+          } else if (!gitObjectKnown(gitBlobSha1(upperFile), { includeOverlay: true })) {
+            preserved.push(preserveOverlayFile(rel, upperFile, stamp));
+          }
+        }
         copyHostFileOverUpper(hostFile, upperFile, hostStat.mode);
+        recordSync(manifest, rel, hostStat, upperFile);
+        manifestDirty = true;
         files.push(rel);
       } catch (e) {
-        if (e.code === 'ENOENT') continue; // present in only one layer
+        if (e.code === 'ENOENT') continue; // vanished mid-walk
         failures.push({ path: rel, error: e.message });
       }
     }
   } catch (e) {
     failures.push({ path: '(walk)', error: e.message });
   }
+  if (!result.truncated) {
+    for (const rel of Object.keys(manifest.files)) {
+      if (!seen.has(rel)) { delete manifest.files[rel]; manifestDirty = true; }
+    }
+  }
+  if (manifestDirty) saveSyncManifest(manifest);
+  result.reconciled = files.length;
   if (failures.length) {
     log(`reconcile: ${failures.length} file(s) could NOT be refreshed from the host — ` +
       `the sandbox may be reading stale content: ` +
       failures.slice(0, 5).map((f) => `${f.path} (${f.error})`).join('; ') +
       (failures.length > 5 ? `; +${failures.length - 5} more` : ''));
   }
+  if (preserved.length || preservedRefs.length) {
+    log(`reconcile: preserved ${preserved.length} overlay file version(s) and ${preservedRefs.length} overlay ref(s) before refreshing from the host`);
+  }
+  if (result.truncated) {
+    log(`reconcile: walk stopped at ${RESYNC_MAX_FILES} overlay files — files beyond the cap were not checked against the host`);
+  }
   if (SYNC_DEBUG) {
-    log(`reconcile: ${files.length} refreshed, ${failures.length} failed` +
+    log(`reconcile: ${files.length} refreshed, ${removed.length} removed, ${failures.length} failed` +
       (files.length ? ` [${files.slice(0, 20).join(', ')}${files.length > 20 ? ', …' : ''}]` : ''));
   }
-  return { reconciled: files.length, files, failures };
+  return result;
 }
 
-function collectOverlayFiles(upperDir, relBase = '', acc = []) {
+/** Tool-result fields describing what reconciliation did; empty when nothing happened. */
+function hostSyncReport(rec) {
+  const out = {};
+  if (rec.files.length || rec.removed.length || rec.preserved.length || rec.preservedRefs.length) {
+    const toPosix = (r) => r.split(path.sep).join('/');
+    out.hostSync = {
+      refreshedFromHost: rec.files.slice(0, 20).map(toPosix),
+      ...(rec.files.length > 20 ? { refreshedMore: rec.files.length - 20 } : {}),
+      ...(rec.removed.length ? { removedBecauseDeletedOnHost: rec.removed.slice(0, 20) } : {}),
+      ...(rec.preserved.length ? { preservedOverlayVersions: rec.preserved } : {}),
+      ...(rec.preservedRefs.length ? { preservedOverlayRefs: rec.preservedRefs } : {}),
+      note: 'The host changed these paths since the overlay last saw them (e.g. the user applied patches), so the sandbox now shows the host versions.' +
+        (rec.preserved.length ? ' Your overlay copies held content git did not have; they were saved first — diff each savedTo against the file and re-apply what is still needed.' : '') +
+        (rec.preservedRefs.length ? ' Overlay commits the host does not have stay reachable at each preservedOverlayRefs[].ref (git log <ref>).' : '') +
+        ' If you noted a <base> sha for format-patch, re-read it with git rev-parse HEAD.',
+    };
+  }
+  const warnings = [];
+  if (rec.failures.length) {
+    warnings.push(`${rec.failures.length} file(s) could not be refreshed from the host and may be stale: ` +
+      rec.failures.slice(0, 5).map((f) => f.path).join(', '));
+  }
+  if (rec.truncated) {
+    warnings.push(`only the first ${RESYNC_MAX_FILES} overlay files were checked against the host; later ones may be stale`);
+  }
+  if (warnings.length) out.syncWarning = warnings.join('; ');
+  return out;
+}
+
+/**
+ * Does a session overlay hold anything worth keeping? Worktree files outside
+ * build/dependency dirs, or git refs written in the overlay (commits,
+ * branches). Used to decide whether detaching from it deserves a warning.
+ */
+function summarizeOverlayWork(stateDir) {
+  if (process.platform === 'darwin') {
+    // The clone backend's workspace is the whole tree, so "files present" says
+    // nothing about edits. Assume it may hold work.
+    return { hasWork: true, changedFiles: null, gitRefsWritten: null };
+  }
+  const upper = path.join(stateDir, 'upper');
+  const worktree = collectOverlayFiles(upper, '', [], { skipGit: true });
+  let gitRefsWritten = false;
+  try {
+    gitRefsWritten = countFilesRec(path.join(upper, '.git', 'refs', 'heads')) > 0 ||
+      fs.existsSync(path.join(upper, '.git', 'packed-refs'));
+  } catch { /* no overlay git state */ }
+  return {
+    hasWork: worktree.length > 0 || gitRefsWritten,
+    changedFiles: worktree.length,
+    ...(worktree.length >= RESYNC_MAX_FILES ? { changedFilesCapped: true } : {}),
+    sample: worktree.slice(0, 5).map((r) => r.split(path.sep).join('/')),
+    gitRefsWritten,
+  };
+}
+
+function collectOverlayFiles(upperDir, relBase = '', acc = [], { skipGit = false } = {}) {
   if (acc.length >= RESYNC_MAX_FILES) return acc;
   let entries;
   try { entries = fs.readdirSync(path.join(upperDir, relBase), { withFileTypes: true }); } catch { return acc; }
+  // Walk .git first: refs and index must reconcile even when a large worktree
+  // would exhaust RESYNC_MAX_FILES before readdir order reached them.
+  if (!relBase) entries.sort((a, b) => (b.name === '.git') - (a.name === '.git'));
   for (const e of entries) {
     if (acc.length >= RESYNC_MAX_FILES) break;
     const rel = relBase ? path.join(relBase, e.name) : e.name;
     if (e.isDirectory()) {
       if (RESYNC_SKIP_DIRS.has(e.name)) continue;
+      if (rel === '.git' && skipGit) continue;
       // Allow .git to be synced so host commits reflect in the sandbox, but skip other hidden dirs
       if (e.name.startsWith('.') && rel !== '.git') continue;
       // The object store is content-addressed and immutable: a path that
@@ -1757,7 +2321,9 @@ function collectOverlayFiles(upperDir, relBase = '', acc = []) {
       // before the walk reaches .git/refs and .git/index, which are the
       // entries that actually have to reconcile for a later commit to work.
       if (rel === path.join('.git', 'objects')) continue;
-      collectOverlayFiles(upperDir, rel, acc);
+      // Reconciliation's own safety copies exist only in the overlay.
+      if (PRESERVE_SKIP_RELS.has(rel)) continue;
+      collectOverlayFiles(upperDir, rel, acc, { skipGit });
     } else if (e.isFile()) {
       acc.push(rel);
     }
@@ -1781,6 +2347,9 @@ function capAppend(buf, chunk, cap) {
  * than quietly inheriting a session that is not the one it thinks it is.
  */
 let OVERLAY_RECREATED = false;
+
+/** Most recent detach from an overlay that still held work (sandbox_info note). */
+let LAST_DETACHED = null;
 
 /**
  * The open project lives in memory and outlives any single client, but the
@@ -1826,8 +2395,146 @@ function ensureSessionDirs() {
   try { installGitWrapper(); } catch { /* best effort */ }
 }
 
+// =============================================================================
+// Outbox delivery self-check
+// =============================================================================
+// The outbox is the only channel by which work leaves the sandbox, and nothing
+// ever PROVED it worked. That is how the mask-shadowing bug above survived: the
+// export wrote into a tmpfs that happened to sit at the right path, and every
+// check available from inside the sandbox — exit status, the paths git printed,
+// a follow-up `ls` — confirmed a file that would never exist on the host. A
+// session cannot tell those apart from inside, which makes this the server's
+// job, not the model's.
+//
+// So verify it the only way that means anything: write a nonce from INSIDE the
+// sandbox and read it back from the HOST. Once per session, off the hot path.
+// Ordering fixes get reverted; a probe keeps catching the next variant.
+// =============================================================================
+
+/** { key, ok, inside, fellBack, detail } for the current backend+session. */
+let OUTBOX_DELIVERY = null;
+
+function probeOutboxOnce(insidePath) {
+  const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const name = `.koi-delivery-probe-${nonce}`;
+  const hostPath = path.join(PROJ.dirs.outbox, name);
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  let r;
+  try {
+    const { cmd, args, spawnEnv } = BACKEND.wrap(
+      `mkdir -p ${q(insidePath)} && printf %s ${q(nonce)} > ${q(`${insidePath}/${name}`)}`, {});
+    r = spawnSync(cmd, args, { env: spawnEnv, encoding: 'utf8', timeout: 30_000 });
+  } catch (e) {
+    return { ok: false, detail: `could not spawn the probe: ${e.message}` };
+  }
+  let got = null;
+  try { got = fs.readFileSync(hostPath, 'utf8'); } catch { /* not delivered */ }
+  try { fs.unlinkSync(hostPath); } catch { /* nothing to clean */ }
+  if (got === nonce) return { ok: true };
+  if (got !== null) return { ok: false, detail: 'a file appeared on the host but its contents differ' };
+  const err = ((r && (r.stderr || '')) || '').trim().replace(/\s+/g, ' ').slice(0, 300);
+  return {
+    ok: false,
+    detail: r && r.status === 0
+      ? `the write succeeded inside the sandbox but nothing appeared at ${hostPath} — ${insidePath} is not the host outbox (a mask or another mount is shadowing the bind)`
+      : `the probe command failed inside the sandbox (exit ${r ? r.status : '?'})${err ? `: ${err}` : ''}`,
+  };
+}
+
+/**
+ * The NEGATIVE half of the delivery contract.
+ *
+ * probeOutboxOnce proves the current outbox path reaches the host. That alone is
+ * not enough: it only ever exercises the single leaf carved out of the mask, so
+ * it passed with full marks while every OTHER path under the mask silently
+ * swallowed writes into the mask's writable tmpfs. The bug it missed is the one
+ * sessions actually hit, because the outbox path changes under them
+ * (projectless -> project, and again on resume).
+ *
+ * So assert the complement: a plausible-but-WRONG outbox path must not look like
+ * a successful delivery. Writing there should fail outright; if it does succeed,
+ * the write must at least appear on the host. Succeeding AND vanishing is the
+ * silent-loss signature, and it gets reported.
+ */
+function probeStaleOutboxRejected() {
+  // Same shape as a real outbox (<state-base>/<project-hash>/outbox) but a hash
+  // no project maps to, and never created host-side -- so a pass leaves nothing
+  // behind and a host-side appearance is unambiguous.
+  const stale = path.join(stateBaseDir(), 'koi-stale-probe-0000000000', 'outbox');
+  const name = '.koi-stale-probe';
+  const q = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+  let r;
+  try {
+    const { cmd, args, spawnEnv } = BACKEND.wrap(
+      `mkdir -p ${q(stale)} && printf stale > ${q(`${stale}/${name}`)}`, {});
+    r = spawnSync(cmd, args, { env: spawnEnv, encoding: 'utf8', timeout: 30_000 });
+  } catch (e) {
+    return { ok: true, detail: `could not spawn the stale probe: ${e.message}` };
+  }
+  // Refused: the mask is sealed. Expected path.
+  if (r && r.status !== 0) return { ok: true };
+
+  let landed = false;
+  try { landed = fs.existsSync(path.join(stale, name)); } catch { /* treat as absent */ }
+  try { fs.rmSync(path.join(stateBaseDir(), 'koi-stale-probe-0000000000'), { recursive: true, force: true }); } catch { /* best effort */ }
+  if (landed) {
+    return { ok: false, detail: `a write to ${stale} succeeded and reached the host — the mask is not covering ${stateBaseDir()}.` };
+  }
+  return {
+    ok: false,
+    detail: `a write to ${stale} succeeded inside the sandbox but reached nothing on the host — ` +
+      'writes to a wrong outbox path are being swallowed by a writable mask tmpfs, so ' +
+      'format-patch to a stale or projectless outbox path exits 0, prints host-looking ' +
+      'paths, lists the file at full size, and delivers nothing.',
+  };
+}
+
+function verifyOutboxDelivery() {
+  const key = `${BACKEND?.name || 'none'}:${PROJ.state}`;
+  if (OUTBOX_DELIVERY && OUTBOX_DELIVERY.key === key) return OUTBOX_DELIVERY;
+
+  const inside = BACKEND.outboxInside;
+  const first = probeOutboxOnce(inside);
+  if (first.ok) {
+    // Delivery works for the CURRENT path. Now check that a WRONG path fails
+    // loudly rather than silently — the half that used to go unverified.
+    const stale = BACKEND?.name === 'bwrap-overlay' ? probeStaleOutboxRejected() : { ok: true };
+    if (!stale.ok) log(`outbox delivery: the live path works, but WRONG paths fail SILENTLY — ${stale.detail}`);
+    OUTBOX_DELIVERY = {
+      key, ok: true, inside, fellBack: false, detail: null,
+      staleSilent: stale.ok ? null : stale.detail,
+    };
+    return OUTBOX_DELIVERY;
+  }
+
+  // The host-path spelling did not reach the host. On bwrap there is a second,
+  // independent bind under our own /tmp tmpfs that no --exclude entry can
+  // shadow; a delivery at a less pretty path beats no delivery at all.
+  let detail = first.detail, fellBack = false;
+  if (BACKEND?.name === 'bwrap-overlay' && inside !== OUTBOX_ALIAS_INSIDE) {
+    const second = probeOutboxOnce(OUTBOX_ALIAS_INSIDE);
+    if (second.ok) {
+      BACKEND.outboxInside = OUTBOX_ALIAS_INSIDE;
+      fellBack = true;
+    } else {
+      detail += `; the ${OUTBOX_ALIAS_INSIDE} alias failed too (${second.detail})`;
+    }
+  }
+  OUTBOX_DELIVERY = { key, ok: fellBack, inside: BACKEND.outboxInside, fellBack, detail };
+  log(fellBack
+    ? `outbox delivery: ${inside} does not reach the host (${detail}). $KOI_OUTBOX now points at ${OUTBOX_ALIAS_INSIDE}, which does. Exports still land in ${PROJ.dirs.outbox} on the host.`
+    : `outbox delivery: BROKEN — ${detail}. Exports from this session will NOT reach the host; sessions are being warned.`);
+  return OUTBOX_DELIVERY;
+}
+
+/** Commands whose whole point is to ship something out of the sandbox. */
+const SHIPPING_CMD_RE = /KOI_OUTBOX|format-patch|git\s+bundle/;
+
 function execInSandbox(shCmd, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, outputCap = OUTPUT_CAP } = {}) {
   ensureSessionDirs();
+  // Probed once per session, before the first command runs, so a broken outbox
+  // is known by the time anything tries to use it.
+  const delivery = verifyOutboxDelivery();
   return new Promise((resolve) => {
     const { cmd, args, spawnEnv } = BACKEND.wrap(shCmd, { cwd });
     const child = spawn(cmd, args, {
@@ -1853,6 +2560,15 @@ function execInSandbox(shCmd, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, outputCap =
             'On Ubuntu 24.04 run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n' +
             'or grant setuid permissions: sudo chmod u+s $(which bwrap)';
         }
+      }
+      // A shipping command that "succeeded" into a broken outbox is the exact
+      // shape of the original bug: exit 0, plausible paths, nothing delivered.
+      // Contradict it here, where the session is actually reading.
+      if (!delivery.ok && SHIPPING_CMD_RE.test(shCmd)) {
+        stderr += `\n[koi-sandbox] OUTBOX DELIVERY IS BROKEN — this export did NOT reach the host.\n` +
+          `  ${delivery.detail}\n` +
+          `  Do not tell the user anything was shipped. Report this failure instead;\n` +
+          `  the work is still in the overlay, host-visible at ${projectTreeHostPath()}.\n`;
       }
       resolve({ exitCode: code ?? -1, signal, stdout, stderr, timedOut });
     };
@@ -2058,7 +2774,9 @@ const TOOLS = [
       'read files (cat/sed/rg), build/test (make/cargo/npm/pytest), inspect changes (git status/diff), ' +
       'checkpoint work (git add/commit — commits live in the overlay .git, the host repo is untouched) ' +
       'and ship (git format-patch -o "$KOI_OUTBOX" <base>..HEAD writes host-visible patch files). ' +
-      'Working directory defaults to the project root. Returns exit code, stdout, stderr.',
+      'Working directory defaults to the project root. Returns exit code, stdout, stderr. ' +
+      'Before the command runs, host-side changes (e.g. patches the user applied) are reconciled into the overlay; ' +
+      'when that changed anything the result carries hostSync (refreshed/removed paths, and saved copies of any overlay content that was replaced).',
     displayMessage: '🧪 sandbox $ {{command}}{{#cwd}}  (in {{cwd}}){{/cwd}}',
     inputSchema: {
       type: 'object',
@@ -2146,7 +2864,7 @@ const TOOLS = [
   {
     name: 'sandbox_open_project',
     tier: 'safe',
-    description: 'Open a project directory on the host: sets the writable overlay location, working directory, and relative path root. New sessions start each project FRESH from the host tree; re-opening within this session CONTINUES its overlay. Pass resume to reattach a previous session overlay (see sandbox_info.priorSessions), or fresh:true to force a clean overlay mid-session. Existing running services are NOT stopped.',
+    description: 'Open a project directory on the host: sets the writable overlay location, working directory, and relative path root. New sessions start each project FRESH from the host tree; re-opening within this session CONTINUES its overlay. Do NOT call this just to recover from a dropped connection — call sandbox_info first; if project and session are unchanged, keep working. Pass resume to reattach a previous session overlay (see sandbox_info.priorSessions), or fresh:true to force a clean overlay mid-session. If the response contains detachedSession or resumeHint and you are continuing the same task, resume that session immediately. Existing running services are NOT stopped.',
     displayMessage: '📂 Opening project {{path}}',
     inputSchema: {
       type: 'object',
@@ -2172,7 +2890,7 @@ const TOOLS = [
   {
     name: 'overlay_fs_sync',
     tier: 'safe',
-    description: 'Reconcile the overlay with the host tree: refresh every overlay file the host has modified since it was copied, so the sandbox stops reading stale content. Run it when the user says they changed or applied something on their side.',
+    description: 'Reconcile the overlay with the host tree now and report what changed. This already happens automatically before every sandbox_exec; call it only to get the report without running a command. Refreshes overlay files the host modified, removes overlay copies of files the host deleted, and saves overlay content it replaces (see hostSync).',
     displayMessage: '🔄 Syncing overlay filesystem',
     inputSchema: { type: 'object', properties: {} },
   },
@@ -2191,6 +2909,9 @@ const TOOLS = [
 
 const handlers = {
   async sandbox_exec({ command, cwd, timeout_ms, max_output }) {
+    // Keep this overlay's `inuse` marker fresh for the whole session, not just
+    // the 30 minutes after sandbox_open_project.
+    touchSessionInUse();
     const rec = reconcileLowerToUpper();
     const dir = cwd ? resolveRel(cwd).abs : BACKEND.root;
     // Clamp the per-stream cap to [1 KiB, OUTPUT_CAP]; callers use small caps
@@ -2208,12 +2929,10 @@ const handlers = {
       stdout: r.stdout,
       stderr: r.stderr,
       ...overlayPressureMeta(),
-      // A failed refresh means this command may have read a stale file. Say so
-      // rather than letting the session act on content it cannot tell is old.
-      ...(rec.failures.length ? {
-        syncWarning: `${rec.failures.length} file(s) could not be refreshed from the host and may be stale: ` +
-          rec.failures.slice(0, 5).map((f) => f.path).join(', '),
-      } : {}),
+      // What reconciliation did before the command ran: refreshed, removed and
+      // preserved paths (hostSync), and anything that may still be stale
+      // (syncWarning). Silence here used to hide overwritten session edits.
+      ...hostSyncReport(rec),
       ...(truncated ? { truncated: true, outputCap: cap, hint: 'Output hit the cap. Re-run piped through tail/grep, or raise max_output if you truly need more.' } : {}),
     };
   },
@@ -2285,16 +3004,64 @@ const handlers = {
 
   async sandbox_open_project({ path: p, resume = null, fresh = false, label = null }) {
     try {
+      const prev = PROJ.state ? { state: PROJ.state, sessionId: PROJ.sessionId, path: PROJ.path } : null;
       setProject(p, { resume, fresh, label });
       const prior = listProjectSessions(PROJ.sessionsRoot).filter((s) => s.id !== PROJ.sessionId);
       const baseKind = PROJ.resumed ? 'RESUMED' : (PROJ.startedFromHost ? 'FRESH' : 'CONTINUING');
+
+      // Leaving an overlay that still holds work for the same project is how
+      // edits "vanish": a reconnect re-ran initialize, and re-opening the
+      // project attached a new overlay. Say so, name the exact resume call, and
+      // pin the old overlay so the disk cache cannot evict it meanwhile.
+      let detachedSession = null;
+      if (prev && prev.state !== PROJ.state && prev.path === PROJ.path) {
+        const work = summarizeOverlayWork(prev.state);
+        // An overlay claimed by a DIFFERENT session key belongs to another
+        // conversation: keep it safe, but do not advise resuming it here.
+        const prevKey = sessionKeyDigestOf(prev.state);
+        const otherConversation = !!SESSION_KEY && !!prevKey && prevKey !== sessionKeyDigest(SESSION_KEY);
+        if (work.hasWork && otherConversation) {
+          pinSession(prev.state, 'detached-other-conversation');
+        } else if (work.hasWork) {
+          const deliberate = !!fresh || resume != null;
+          detachedSession = {
+            session: prev.sessionId,
+            ...work,
+            pinnedUntil: pinSession(prev.state, 'detached-with-work'),
+            action: deliberate
+              ? 'You explicitly switched overlays; the previous one is kept (pinned) in case you need it.'
+              : `If you are continuing the same task, call sandbox_open_project({ path: ${JSON.stringify(PROJ.path)}, resume: ${JSON.stringify(prev.sessionId)} }) now — this new overlay does not contain that work.`,
+          };
+          LAST_DETACHED = { ...detachedSession, at: new Date().toISOString(), deliberate };
+        }
+      }
+      // A FRESH overlay after a server restart has no `prev` to compare with,
+      // so also point at the most recent prior overlay that holds work.
+      let resumeHint = null;
+      if (baseKind === 'FRESH' && !fresh && !detachedSession && !PROJ.greenfield) {
+        const myKey = SESSION_KEY ? sessionKeyDigest(SESSION_KEY) : null;
+        for (const cand of prior.slice(0, 3)) {
+          // Never point a conversation at an overlay another conversation claimed.
+          const candKey = sessionKeyDigestOf(path.join(PROJ.sessionsRoot, cand.id));
+          if (myKey && candKey && candKey !== myKey) continue;
+          const work = summarizeOverlayWork(path.join(PROJ.sessionsRoot, cand.id));
+          if (work.hasWork) {
+            resumeHint = `Prior overlay ${cand.id}${cand.label ? ` (label ${cand.label})` : ''} holds work ` +
+              `(${work.changedFiles ?? 'unknown'} changed file(s)${work.gitRefsWritten ? ', overlay git refs' : ''}). ` +
+              `If this continues that task, call sandbox_open_project({ path: ${JSON.stringify(PROJ.path)}, resume: ${JSON.stringify(cand.id)} }).`;
+            break;
+          }
+        }
+      }
       const gfNote = PROJ.greenfield
         ? `GREENFIELD: this path does not exist on the host. The overlay is empty and the host is untouched — build the project from scratch here. DELIVERY IS ALREADY GUARANTEED: everything you write lands in ${projectTreeHostPath()} on the host, and the user is handed \`cp -r <that>/. <project>/\` at the end of the run, whether or not you commit, export, or finish. So do not spend budget protecting the work from being lost — it cannot be. Do still \`git init\`, WRITE .gitignore FIRST (node_modules/, dist/, build/, target/, .venv/, __pycache__/, .next/, coverage/, *.log, .env), then \`git add -A && git commit\`: that is what makes the result REVIEWABLE rather than a directory the user has to excavate. Optionally also \`SHA=$(git rev-parse --short HEAD); BR=$(git symbolic-ref --quiet --short HEAD) || { git checkout -B main; BR=main; }; rm -f "$KOI_OUTBOX"/project-*.bundle; git bundle create "$KOI_OUTBOX/project-$SHA.bundle" "$BR" HEAD\` for a clean-history clone; never a bare project.bundle (a fixed name overwrites silently, and a bundle carrying only HEAD clones detached). format-patch/git am do NOT apply — there is no host base to apply a delta onto.`
         : null;
       const baseNote = gfNote || {
         FRESH: 'FRESH session: overlay is empty; you are working from the host tree exactly as it exists on disk (the stable base the user sees).',
         CONTINUING: 'CONTINUING this connection\'s session: reusing the overlay you already opened here (your in-progress edits are present).',
-        RESUMED: 'RESUMED a previous session overlay (edits from that session are present on top of the host tree).',
+        RESUMED: PROJ.resumedByKey
+          ? 'RESUMED this conversation\'s overlay (matched by session key after a reconnect or server restart; your earlier edits are present).'
+          : 'RESUMED a previous session overlay (edits from that session are present on top of the host tree).',
       }[baseKind];
       return {
         success: true,
@@ -2315,7 +3082,12 @@ const handlers = {
         // Host-side live review of this overlay (for the USER, not for you):
         reviewCommand: `node ${SELF_PATH} review --watch`,
         priorSessions: prior,
-        note: (baseKind === 'FRESH'
+        ...(detachedSession ? { detachedSession } : {}),
+        ...(resumeHint ? { resumeHint } : {}),
+        note: (detachedSession && !LAST_DETACHED.deliberate
+          ? `WARNING: this call detached overlay ${detachedSession.session}, which holds work for this project. ${detachedSession.action} `
+          : '')
+          + (baseKind === 'FRESH'
           ? 'New empty overlay activated.'
           : baseKind === 'CONTINUING'
             ? 'Existing session overlay reactivated.'
@@ -2333,6 +3105,7 @@ const handlers = {
 
   async sandbox_reset() {
     BACKEND.reset();
+    try { fs.rmSync(syncManifestPath(), { force: true }); } catch { /* none */ }
     overlayUsageCache.delete(PROJ.state); // the freed space must show up immediately
     return { success: true, session: PROJ.sessionId, note: 'overlay/workspace wiped back to host state; in-overlay git commits are gone (patches already in the outbox survive)' };
   },
@@ -2344,6 +3117,26 @@ const handlers = {
       project: PROJ.path,
       sandboxRoot: BACKEND.root,
       network: OPTS.net,
+      // How a port bound INSIDE the sandbox becomes reachable from the host
+      // browser. Stated here because the rule is not guessable from inside: the
+      // namespace is per-exec, so a server started in one sandbox_exec is
+      // invisible to a curl run in the next one, and on a pasta without
+      // --host-lo-to-ns-lo a server bound to 127.0.0.1 is invisible to the
+      // browser as well.
+      ...(OPTS.net === 'policy' && BACKEND.name === 'bwrap-overlay'
+        ? {
+            devServerAccess: {
+              publishedTo: 'host loopback, same port (pasta -t auto)',
+              bindInside: pastaSupportsHostLo()
+                ? '127.0.0.1 or 0.0.0.0 — both reachable'
+                : '0.0.0.0 REQUIRED — this pasta forwards host loopback to the namespace interface, so a 127.0.0.1-bound server is unreachable (npm run dev -- --host 0.0.0.0)',
+              namespaceScope: 'one network namespace PER exec/service: a server started in one call is not reachable by localhost from another call. Start the server and probe it in the SAME command, or read the service log.',
+              ...(pastaNeedsIpv4Only()
+                ? { hostPlatform: 'WSL2 in NAT mode: pasta is pinned to IPv4 (-4) so the port lands in /proc/net/tcp where the Windows localhost relay can find it. localhost:<port> works from Windows. IPv6 is not forwarded into the sandbox; a server bound to ::1 only will be unreachable.' }
+                : {}),
+            },
+          }
+        : {}),
       ...(OPTS.net === 'policy' ? { networkPolicy: networkPolicySummary() } : {}),
       state: PROJ.state,
       session: PROJ.sessionId,
@@ -2376,7 +3169,27 @@ const handlers = {
           : 'tmpfs / /dev/null binds (Linux): the paths above are absent from the sandbox filesystem.',
       services: listRunningServices(),
       servicesAll: listAllServices(),
+      // Equal to `outbox` on every backend now — the sandbox sees the outbox at
+      // its host path. Kept as a field so existing clients keep working, and so
+      // a backend that ever cannot do this has somewhere to say so.
       outboxInside: BACKEND.outboxInside,
+      // Which code is answering. Compare against the checkout before trusting
+      // that a fix is live; `stale: true` means this process loaded a version
+      // of its own file that no longer exists on disk.
+      build: buildStatus(),
+      // VERIFIED, not assumed: a nonce written from inside the sandbox was read
+      // back from the host path above. Anything less than `verified` means an
+      // export can exit 0 and still deliver nothing.
+      outboxDelivery: (() => {
+        const d = verifyOutboxDelivery();
+        if (!d.ok) return `BROKEN — ${d.detail}`;
+        const base = d.fellBack
+          ? `verified via ${d.inside} (the host-path spelling was unreachable; files still land in ${PROJ.dirs.outbox})`
+          : 'verified (nonce written inside, read back on the host)';
+        // Both halves must hold: the right path delivers AND a wrong one fails
+        // loudly. Reporting only the first is how silent loss stayed invisible.
+        return d.staleSilent ? `${base}; WARNING: ${d.staleSilent}` : base;
+      })(),
       projectOpened: PROJ.path !== os.homedir(),
       gitWorkflow: PROJ.greenfield
         ? {
@@ -2396,6 +3209,18 @@ const handlers = {
             hostApply: 'git am <outbox>/*.patch (repo projects), or git apply per file (non-git projects)',
           },
       notes: [
+        ...(buildStatus().stale
+          ? [`THIS PROCESS IS RUNNING STALE CODE: ${SELF_PATH} has changed on disk since this server loaded it (loaded ${BUILD_LOADED.sha256}, on disk ${readBuildIdentity().sha256}). Any fix in that file is NOT live here. Restart the gateway before trusting behaviour or reporting a bug against the current source — and note that a test suite run from the checkout will pass while this process still misbehaves.`]
+          : []),
+        ...(verifyOutboxDelivery().staleSilent
+          ? [`OUTBOX PATHS FAIL SILENTLY: exports to the CURRENT $KOI_OUTBOX are delivered, but a wrong outbox path does not error — ${verifyOutboxDelivery().staleSilent} This matters because the outbox is keyed by a hash of the project path: it changes at sandbox_open_project and on resume. Re-read it from the LATEST sandbox_info / sandbox_open_project response immediately before every export, and never quote one from an earlier turn.`]
+          : []),
+        ...(!verifyOutboxDelivery().ok
+          ? [`OUTBOX DELIVERY IS BROKEN: a nonce written to $KOI_OUTBOX from inside the sandbox did not appear on the host (${verifyOutboxDelivery().detail}). format-patch / git bundle will still exit 0 and still print paths — they are writing somewhere that never reaches the user. Do NOT claim anything was shipped. The overlay itself is host-visible at ${projectTreeHostPath()}; use that, and tell the user the outbox is broken.`]
+          : []),
+        ...(LAST_DETACHED && !LAST_DETACHED.deliberate && LAST_DETACHED.session !== PROJ.sessionId
+          ? [`DETACHED OVERLAY WITH WORK: at ${LAST_DETACHED.at} this server moved off overlay ${LAST_DETACHED.session} for this project (${LAST_DETACHED.changedFiles ?? 'unknown'} changed file(s)${LAST_DETACHED.gitRefsWritten ? ', overlay git refs' : ''}). It is pinned until ${LAST_DETACHED.pinnedUntil}. ${LAST_DETACHED.action}`]
+          : []),
         ...(OVERLAY_RECREATED
           ? ['OVERLAY RECREATED: this session\'s overlay directories had been deleted on the host and were recreated empty. Any writes, commits or services from before that point are GONE, and the session/greenfield/services fields above describe the session as it is NOW, not as it was. Re-check git log and the outbox before trusting continuity notes from an earlier session.']
           : []),
@@ -2447,6 +3272,7 @@ const handlers = {
       // one path stayed invisible because the other still worked.
       const rec = reconcileLowerToUpper();
       const hostUpdated = rec.reconciled;
+      const report = hostSyncReport(rec);
 
       // 2. Invalidate disk cache and usage stats
       overlayUsageCache.delete(PROJ.state);
@@ -2456,6 +3282,7 @@ const handlers = {
         success: true,
         session: PROJ.sessionId,
         hostMutationsReconciled: hostUpdated,
+        ...report,
         ...(rec.failures.length ? {
           reconcileFailures: rec.failures,
           hint: 'Some overlay files could not be refreshed from the host; commands may still read stale content for those paths.',
@@ -2491,12 +3318,22 @@ async function handleMessage(msg) {
 
   try {
     switch (method) {
-      case 'initialize':
-        // A new client connection = a new session. Rotate so every project
-        // opened on this connection starts fresh from the host tree (unless the
-        // caller explicitly resumes). This holds even when the gateway pools
-        // this process across connections.
-        SESSION_ID = newSessionId();
+      case 'initialize': {
+        // A new conversation = a new session: rotate so every project it opens
+        // starts fresh from the host tree (unless it explicitly resumes). A
+        // RECONNECT of the same conversation is not a new session — when the
+        // client sends the same session key as the previous handshake, keep
+        // SESSION_ID and the session's network grants. Without a key the two
+        // cannot be told apart, so the old rotate-on-every-handshake behavior
+        // stays, and sandbox_open_project warns when that detaches work.
+        const key = readSessionKeyFromInit(params);
+        const reconnect = key !== null && key === SESSION_KEY;
+        SESSION_KEY = key;
+        if (reconnect) {
+          log(`initialize: same session key — reconnect of session ${SESSION_ID}; overlay and grants kept`);
+        } else {
+          SESSION_ID = newSessionId();
+        }
         // A client that cannot show a dialog must not be asked. Re-read on
         // every initialize: the same pooled server process is reused across
         // connections, and the next client may be a headless one.
@@ -2504,9 +3341,9 @@ async function handleMessage(msg) {
         if (OPTS.net === 'policy' && !CLIENT_CAN_PROMPT) {
           log('client did not declare the elicitation capability — network prompts are unavailable, so anything outside the allowlist will be denied.');
         }
-        // Session-scoped network grants belong to the connection that made
+        // Session-scoped network grants belong to the conversation that made
         // them; a new client must not inherit "allow evil.example.com".
-        NET_BROKER?.resetSession(SESSION_ID);
+        if (!reconnect) NET_BROKER?.resetSession(SESSION_ID);
         // The previous connection's overlay just became garbage — good moment
         // to check the cache budget.
         scheduleOverlayGc('initialize');
@@ -2516,6 +3353,7 @@ async function handleMessage(msg) {
           serverInfo: { name: 'koi-sandbox-shell', version: '2.2.0' },
         });
         break;
+      }
       case 'notifications/initialized':
       case 'initialized':
         break; // notification, no reply
@@ -2573,6 +3411,14 @@ process.stdin.on('data', (chunk) => {
       try { settle(msg); } catch (e) { log(`approval reply handler threw: ${e.message}`); }
       continue;
     }
+    // Handshake and liveness never wait behind a running tool call. A client
+    // that reconnects during a long build used to have its `initialize` queued
+    // behind that build, time out, and drop again. Neither touches the open
+    // project, so answering them immediately cannot race a command.
+    if (msg.method === 'initialize' || msg.method === 'ping') {
+      handleMessage(msg).catch(() => {});
+      continue;
+    }
     inFlight++;
     queue = queue.then(() => handleMessage(msg)).catch(() => {}).finally(() => { inFlight--; });
   }
@@ -2584,4 +3430,7 @@ process.stdin.on('end', () => {
   }, 50);
 });
 
+// Printed at startup so `journalctl --user -u koi-gateway | grep build=` answers
+// "which code is the live service running?" without attaching to anything.
+log(`build=${BUILD_LOADED.sha256} mtime=${BUILD_LOADED.mtime} file=${BUILD_LOADED.file}`);
 log('ready (stdio MCP)');

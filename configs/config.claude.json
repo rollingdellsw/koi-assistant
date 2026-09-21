@@ -2,7 +2,7 @@
   "llm": {
     "provider": "anthropic",
     "apiKey": "sk-dummy-key",
-    "model": "claude-opus-4-8",
+    "model": "claude-opus-5",
     "contextWindow": 1000000,
     "comment": "Reminder LLM when remaining contextWindow is less than 10000",
     "baseUrl": "http://localhost:8317",
@@ -15,7 +15,7 @@
   },
   "executor": {
     "enabled": true,
-    "model": "claude-sonnet-5",
+    "model": "claude-opus-5",
     "timeoutMs": 180000,
     "maxIterations": 20
   },

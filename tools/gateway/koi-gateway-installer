@@ -656,6 +656,12 @@ EOF
   local bwrap_path; bwrap_path="$(find_bwrap || true)"
   [ -n "${bwrap_path}" ] && printf 'Environment=KOI_BWRAP_BIN=%s\n' "${bwrap_path}"
   cat <<'EOF'
+# Child MCP servers inherit this PATH. A systemd user unit does not source
+# ~/.profile, so a tool installed to ~/.local/bin (uvx, pipx), ~/.cargo/bin or
+# ~/go/bin is invisible to it: a server configured as "command": "uvx" dies
+# with `spawn uvx ENOENT` while working perfectly in the user's own shell.
+# %h is systemd's home specifier, so this carries across users and hosts.
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/go/bin:%h/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 Restart=on-failure
 RestartSec=3
 # Covers the proxy readiness poll, which is bounded at 20s inside

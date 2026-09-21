@@ -1,6 +1,6 @@
 ---
 name: sandbox-shell
-version: 2.4.0
+version: 2.5.0
 description: >-
   A shell on the user's machine inside a safety sandbox — the bridge to the
   local filesystem and toolchain. Load this whenever a task touches the
@@ -93,7 +93,7 @@ including code navigation — is a command you run in it.
    is `$KOI_OUTBOX`. For a GREENFIELD project the overlay tree is itself
    host-visible at `sandbox_info.overlayHostPath` and the user copies it out —
    delivery there is automatic and cannot fail. See "Shipping changes".
-3. **Edits Are Shell Writes:** All edits are made via `sandbox_exec` (e.g. atomic Python scripts or `cat << 'EOF' > file`). They land in the overlay, and every later command reads through the overlay — so a tool you run in the next turn already sees them. Nothing needs to be re-synced. If the **user** changes a file on the host mid-session, call `overlay_fs_sync` to pull their version in.
+3. **Edits Are Shell Writes:** All edits are made via `sandbox_exec` (e.g. atomic Python scripts or `cat << 'EOF' > file`). They land in the overlay, and every later command reads through the overlay — so a tool you run in the next turn already sees them. Nothing needs to be re-synced. If the **user** changes files on the host mid-session (e.g. applies your patches), every `sandbox_exec` pulls their versions in automatically before it runs, and reports it in `hostSync` — read that field when it appears (see "When the host changes under you").
 4. **No Guessing:** Never guess the outbox path or context lines for a patch. Always read the file or call `sandbox_info` first.
 5. **Masked Paths:** The host's `/tmp`, `/run`, and credential files (`~/.ssh`, `~/.aws`, etc.) are hidden for security. **Never** tell the user these files "do not exist". Explicitly state: _"This path is masked from the sandbox."_ If you need them for a build, ask the user to restart the MCP server with `--allow-creds`.
 
@@ -107,6 +107,27 @@ For sustained work on one codebase (editing, building, testing, shipping patches
 
 1. Call `sandbox_open_project({ path })`. This sets the shell/overlay scope: the writable overlay location, the working directory, and the relative path root. Each new session starts from a **fresh overlay over the host tree**. Its response includes the `outbox` for that project.
 2. Call `sandbox_info` for the full picture (backend, services, `gitWorkflow`).
+3. **Note the `session` id** from the response. It is how you get your overlay back if the connection drops.
+
+## Connection drops and session continuity
+
+A dropped connection ("Connection closed", a failed tool call, the side panel
+reconnecting while the user was away) does **not** lose your overlay — but
+re-opening the project the wrong way can detach you from it.
+
+1. **Do not call `sandbox_open_project` as a reflex.** Call `sandbox_info` first.
+   If `project` and `session` are what you had, just continue: your edits and
+   commits are all there.
+2. If the session differs (the server restarted, or it was switched), call
+   `sandbox_open_project({ path, resume: "<your session id>" })`.
+3. If any `sandbox_open_project` response contains **`detachedSession`** or
+   **`resumeHint`**, and you are continuing the same task, make the `resume`
+   call it names **immediately**, before any edit. A `WARNING:` at the start of
+   `note` means the overlay you just got does not contain your earlier work.
+   Detached overlays are pinned for 24h, so this is always recoverable if you
+   act on it.
+
+Never report work as lost without checking `priorSessions` first.
 
 > **The outbox path changes with the project.** It is keyed by a hash of the
 > project path, so a value you noted before `sandbox_open_project` is stale the
@@ -225,7 +246,21 @@ npm test && python3 -m pyflakes ...
 - **Transactional safety:** If any `assert` fails, the file is never written to disk.
 - **1-turn turnaround:** Edit, build, lint, and test occur in a single round trip.
 - **No diff context failures:** Raw multiline strings bypass patch fuzzing and line-number mismatches.
-- **Visibility:** Shell writes land in the overlay, and every later command reads through it — the next `ast-grep`/`rg`/`tsc` run already sees them. `overlay_fs_sync` is only for the reverse direction: pulling in a change the _user_ made on the host.
+- **Visibility:** Shell writes land in the overlay, and every later command reads through it — the next `ast-grep`/`rg`/`tsc` run already sees them. Host-side changes flow the other way automatically at the start of each `sandbox_exec`; `overlay_fs_sync` only produces the same report without running a command.
+
+### When the host changes under you
+
+If a `sandbox_exec` result contains `hostSync`, the user changed files on their
+side (usually by applying your patches) and the sandbox now shows **their**
+versions of the listed paths:
+
+- `refreshedFromHost` — re-read these before editing them again; your mental copy is stale.
+- `preservedOverlayVersions` — your overlay copy held content git did not have (uncommitted work). It was saved to `savedTo` before the host version replaced it. `diff` it against the file and re-apply whatever is still needed; do not assume the edit is present.
+- `preservedOverlayRefs` — overlay commits the host does not have stay reachable at `ref` (`git log <ref>`). After the user applied your patches this is normally just the pre-apply copy of the same work.
+- `removedBecauseDeletedOnHost` — the host deleted these; your untouched overlay copy followed.
+
+Then run `git rev-parse HEAD` for a new `<base>` before the next export. A
+`syncWarning` means some paths could not be checked or refreshed and may be stale.
 
 **Shell is `bash` (`/bin/bash`).** Commands run through `bash -c`, so standard
 bash syntax (such as `[[ ... ]]`, process substitution `<(...)`, and `${PIPESTATUS[@]}`)
@@ -302,7 +337,7 @@ The default timeout for `sandbox_exec` is 120,000ms (2 minutes). For heavy comma
 ## Typical session
 
 1. `sandbox_info`; `sandbox_open_project`; `git rev-parse HEAD` as `<base>`.
-   _(If the user applies your patches mid-session, run `git rev-parse HEAD` again to get the new `<base>` before making further edits, or you will export duplicate patches)._
+   _(If the user applies your patches mid-session, the next `sandbox_exec` reports it in `hostSync`; run `git rev-parse HEAD` again to get the new `<base>` before making further edits, or you will export duplicate patches)._
 2. Explore with `rg` / `ast-grep` via `sandbox_exec`.
 3. Edit with atomic in-memory Python script via `sandbox_exec`.
 4. Build/test with `sandbox_exec`.

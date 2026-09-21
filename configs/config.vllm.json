@@ -3,11 +3,11 @@
     "provider": "vllm",
     "apiKey": "${VLLM_API_KEY}",
     "model": "Qwen3.6-27B-FP8",
-    "contextWindow": 200000,
+    "contextWindow": 262144,
     "baseUrl": "https://vllm.rollingdell.com/v1",
     "temperature": 1.0,
     "topP": 0.95,
-    "maxTokens": 61440,
+    "maxTokens": 65536,
     "thinking": {
       "enabled": true,
       "budgetLevel": "high",

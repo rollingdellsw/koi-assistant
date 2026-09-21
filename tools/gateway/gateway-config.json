@@ -24,6 +24,21 @@
         "--net",
         "policy"
       ]
+    },
+    "blender": {
+      "command": "podman",
+      "args": [
+        "exec",
+        "-i",
+        "-e",
+        "DISABLE_TELEMETRY=true",
+        "-e",
+        "BLENDER_HOST=127.0.0.1",
+        "-e",
+        "BLENDER_PORT=9876",
+        "koi-blender",
+        "/config/.local/bin/blender-mcp"
+      ]
     }
   }
 }
