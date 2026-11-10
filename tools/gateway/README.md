@@ -157,17 +157,18 @@ multi-user host, do not run it until token auth exists.
 
 ### What the sandbox guarantees (Linux `bwrap-overlay` backend)
 
-| Property        | Behavior                                                                                                                                                   |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Host filesystem | Visible **read-only** throughout the sandbox                                                                                                               |
-| Writes          | Land in a per-project, per-session overlay; the real project tree is never mutated                                                                         |
-| Session base    | Every client connection starts each project from a **fresh overlay over the host tree**. A previous session's unshipped edits are never silently inherited |
-| Delivery        | `git format-patch -o "$KOI_OUTBOX"` exports to a host-visible outbox that **you** apply with `git am`. This is the only channel out                        |
-| Credentials     | Masked paths come **entirely from `--exclude`** — the server has no built-in list. The environment is cleared regardless                                   |
-| `git push`      | Blocked by a git wrapper (guidance; the real protection is credential masking)                                                                             |
-| Network         | `host` / `loopback` / `policy` — see [Network egress](#network-egress)                                                                                     |
-| Services        | Long-running dev servers are owned by the server (`sandbox_start_service` and friends)                                                                     |
-| Reset           | `sandbox_reset` wipes the current session's overlay; exported patches survive                                                                              |
+| Property        | Behavior                                                                                                                                                        |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host filesystem | Visible **read-only** throughout the sandbox                                                                                                                    |
+| Writes          | Land in a per-project, per-session overlay; the real project tree is never mutated                                                                              |
+| `/tmp`          | The session's own scratch dir (`<state>/sessions/<id>/tmp`, bound at `/tmp`): writable, kept across commands, wiped by `sandbox_reset`. Never the host's `/tmp` |
+| Session base    | Every client connection starts each project from a **fresh overlay over the host tree**. A previous session's unshipped edits are never silently inherited      |
+| Delivery        | `git format-patch -o "$KOI_OUTBOX"` exports to a host-visible outbox that **you** apply with `git am`. This is the only channel out                             |
+| Credentials     | Masked paths come **entirely from `--exclude`** — the server has no built-in list. The environment is cleared regardless                                        |
+| `git push`      | Blocked by a git wrapper (guidance; the real protection is credential masking)                                                                                  |
+| Network         | `host` / `loopback` / `policy` — see [Network egress](#network-egress)                                                                                          |
+| Services        | Long-running dev servers are owned by the server (`sandbox_start_service` and friends)                                                                          |
+| Reset           | `sandbox_reset` wipes the current session's overlay; exported patches survive                                                                                   |
 
 **Backends by platform:**
 
@@ -306,6 +307,25 @@ the request and asks you in the side panel, with `once` / `session` / `always` s
 "Always" answers persist to `~/.koi/network-policy.json`. Cloud metadata endpoints are
 denied outright and cannot be approved.
 
+**Who is asked.** One proxy serves every sandbox server on the machine — the gateway's, and
+any other program that runs `sandbox-shell-mcp.mjs --net policy` (a headless agent
+runtime, a second gateway). Each server mints a random token, puts it in its sandbox's
+proxy URL (`http://koi:<token>@…`, so every proxied request carries it as
+`Proxy-Authorization`), and listens for prompts on `~/.koi/approval.d/<token>.sock`. The
+proxy's helper asks only the socket named by the request's token:
+
+- a server whose client can show a dialog (it declared MCP `elicitation`) opens its socket
+  on first connect, and gets the prompts for its own sandbox and no other;
+- a server whose client cannot (a headless runtime) never opens one, so anything outside the
+  allowlist is **denied** for its sandbox — it is never offered to someone else's dialog,
+  and it no longer takes over or deletes another server's socket;
+- a request with no token (a tool that ignores proxy credentials) is asked on the shared
+  `~/.koi/approval.sock`, which current servers do not bind, so it is denied.
+
+The token routes prompts; it grants nothing. Git is told to send it unasked
+(`GIT_HTTP_PROXY_AUTHMETHOD=basic`); curl, Python, pip and npm send it on their own.
+After upgrading, restart the gateway so squid picks up the new helper format.
+
 Loopback is always allowed and is not part of the allowlist. `localhost`, `*.localhost`,
 `127.0.0.0/8` and `::1` are decided in the policy engine itself, so the sandbox is never
 asked to approve a service it is already running. An explicit `!localhost` deny still
@@ -402,9 +422,22 @@ at once.
 
 ### Disk retention
 
-Prior-session overlays are kept on disk — that is what makes `resume` possible — and are
-**never garbage-collected automatically**. Overlays holding build artifacts
-(`node_modules/`, `target/`) get large.
+Prior-session overlays are kept on disk — that is what makes `resume` possible — until the
+total under `--state` passes `--max-overlay-size` (default 10GB), after which the least
+recently used are deleted. An overlay holding build artifacts (`node_modules/`, `target/`)
+can be several GB, so the cap is what stands between a long-running agent and a full host
+disk. **Live** overlays are never deleted: this server's own, any whose `inuse` marker names
+a process still running, and a detached overlay holding unexported work (pinned 24 h).
+
+**The cap is per deployment, not per process.** One state dir is shared by every process that
+runs `sandbox-shell-mcp.mjs` — the gateway's (`gateway-config.json`) and any other program's
+(a headless agent runtime spawns the same file from its own config, where its own flag wins).
+Each server therefore enforces the **largest** cap declared by a live sibling, read from that
+sibling's `inuse` marker. `sandbox_info.overlayBudget.capFrom` names which setting governs
+and `ownCapBytes` shows what this process was started with, so a mismatch is visible instead
+of mysterious: if you raise the cap in one config and `sandbox_info` still reports the old
+number, another spawn site has its own value — grep `--max-overlay-size` across every config
+that starts this server.
 
 Prune them with `rm -rf ~/.koi/sandbox/<project-hash>/sessions/<session-id>/`. Because the
 outbox is **project-level**, pruning a session overlay does **not** destroy its exported

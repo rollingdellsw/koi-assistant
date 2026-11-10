@@ -20,7 +20,7 @@
       "args": [
         "./sandbox-shell-mcp.mjs",
         "--max-overlay-size",
-        "10GB",
+        "100GB",
         "--net",
         "policy"
       ]

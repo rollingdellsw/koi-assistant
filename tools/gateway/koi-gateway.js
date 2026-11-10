@@ -13,6 +13,7 @@ import { WebSocketServer } from 'ws';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 
 // =============================================================================
 // Crash-proofing
@@ -338,26 +339,72 @@ class Gateway {
   constructor(config) {
     this.config = config;
     this.wss = null;
+    this.server = null;
+    this.port = config.port;
     this.mcpProcesses = new Map(); // serverName -> MCPProcess
     this.connectionSeq = 0;
   }
 
   start() {
-    // Loopback only: the gateway now fronts arbitrary code execution
-    // (sandbox-shell), so it must never be reachable from the LAN.
-    this.wss = new WebSocketServer({ host: '127.0.0.1', port: this.config.port });
+    const bindHttp = (server, port, label) => {
+      this.server = server;
+      this.port = port;
+      this.recordPort(port);
+      this.wss = new WebSocketServer({ server });
 
-    console.log(`[Gateway] Listening on ws://localhost:${this.config.port}`);
-    console.log(`[Gateway] Available MCP servers: ${Object.keys(this.config.servers).join(', ')}`);
-    console.log(`[Gateway] Auth mode: ${this.config.auth.mode}`);
+      console.log(`[Gateway] Listening on ws://localhost:${port}${label ? ` (${label})` : ''}`);
+      console.log(`[Gateway] Available MCP servers: ${Object.keys(this.config.servers).join(', ')}`);
+      console.log(`[Gateway] Auth mode: ${this.config.auth.mode}`);
 
-    this.wss.on('connection', (ws, req) => {
-      this.handleConnection(ws, req);
+      this.wss.on('connection', (ws, req) => {
+        this.handleConnection(ws, req);
+      });
+
+      this.wss.on('error', (error) => {
+        console.error('[Gateway] Server error:', error.message);
+      });
+    };
+
+    // 1. Systemd socket activation: LISTEN_FDS=1 means systemd passed socket FD 3
+    if (process.env.LISTEN_FDS === '1' || process.env.LISTEN_FDS === 'true') {
+      const server = http.createServer();
+      delete process.env.LISTEN_FDS;
+      delete process.env.LISTEN_PID;
+      delete process.env.LISTEN_FDNAMES;
+      server.listen({ fd: 3 }, () => {
+        const addr = server.address();
+        const port = typeof addr === 'object' ? addr.port : addr;
+        bindHttp(server, port, 'systemd socket');
+      });
+      return;
+    }
+
+    // 2. Standard TCP bind with dynamic port fallback on EADDRINUSE
+    const server = http.createServer();
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE' && this.config.port !== 0) {
+        console.warn(`[Gateway] Port ${this.config.port} in use; falling back to dynamic port (port 0)...`);
+        server.listen(0, '127.0.0.1', () => {
+          const port = server.address().port;
+          bindHttp(server, port, 'dynamic port');
+        });
+        return;
+      }
+      console.error('[Gateway] Server error:', err.message);
     });
 
-    this.wss.on('error', (error) => {
-      console.error('[Gateway] Server error:', error.message);
+    server.listen(this.config.port, '127.0.0.1', () => {
+      const port = server.address().port;
+      bindHttp(server, port, '');
     });
+  }
+
+  recordPort(port) {
+    try {
+      const stateDir = process.env.KOI_HOME || path.join(process.env.HOME || '', '.koi');
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.writeFileSync(path.join(stateDir, 'gateway.port'), String(port));
+    } catch (_) {}
   }
 
   async handleConnection(ws, req) {
@@ -371,7 +418,7 @@ class Gateway {
       return;
     }
 
-    const url = new URL(req.url, `http://localhost:${this.config.port}`);
+    const url = new URL(req.url, `http://localhost:${this.port || this.config.port}`);
     const pathParts = url.pathname.split('/').filter(Boolean);
 
     // Expected path: /mcp/{serverName}
@@ -546,8 +593,15 @@ class Gateway {
       }
     });
 
-    ws.on('close', () => {
-      console.log(`[Gateway] Connection closed for ${serverName}`);
+    let lastFrameAt = Date.now();
+    ws.on('message', () => { lastFrameAt = Date.now(); });
+    ws.on('close', (code, reason) => {
+      // 1006 = the TCP connection vanished without a close frame (a relay or
+      // network drop); 1000/1001 = the extension closed it on purpose.
+      console.log(
+        `[Gateway] Connection closed for ${serverName}: code=${code} ` +
+        `reason=${JSON.stringify(String(reason || ''))} idle=${Date.now() - lastFrameAt}ms`,
+      );
       if (mcpProcess) {
         mcpProcess.removeMessageHandler(messageHandler);
         // MCP process is kept alive for reuse by subsequent connections.

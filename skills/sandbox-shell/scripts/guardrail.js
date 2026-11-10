@@ -277,11 +277,12 @@ module.exports = {
 
       // Only claim "masked" when the command actually touched a masked path.
       //
-      // Two things make the naive check wrong:
-      //  1. $KOI_OUTBOX resolves to /tmp/koi/outbox and the sandbox's own
-      //     scratch space is /tmp/koi — both are fully readable/writable. A
-      //     bare /tmp match therefore flags paths the skill itself hands out.
-      //  2. "No such file or directory" is matched anywhere in the output, so
+      // /tmp is NOT on this list: inside the sandbox it is the session's own
+      // writable scratch dir (kept across execs), so a missing file there is
+      // simply missing -- calling it "masked" sent sessions hunting for a
+      // security boundary that does not exist.
+      //
+      // The naive check is also wrong because "No such file or directory" is matched anywhere in the output, so
       //     a compound command whose LATER stage prints it (a build, a test
       //     runner) gets its SUCCESSFUL earlier stage overridden with a
       //     security error.
@@ -290,8 +291,6 @@ module.exports = {
       // and the agent was instructed to tell the user a path that exists is
       // masked. Require a real masked path AND a co-located failure.
       const MASKED = [
-        // /tmp, but NOT the sandbox's own /tmp/koi tree.
-        /(?:^|[\s"'=:])\/tmp\/(?!koi(?:\/|\b))/,
         /(?:^|[\s"'=:~])[^\s"']*\/\.ssh(?:\/|\b)/,
         /(?:^|[\s"'=:~])[^\s"']*\/\.aws(?:\/|\b)/,
         /(?:^|[\s"'=:~])[^\s"']*\/\.npmrc\b/,

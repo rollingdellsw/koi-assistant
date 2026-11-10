@@ -47,7 +47,12 @@
  *                   sandbox's writable view — wiping it is a host-side op
  *     - disk gc:    same reason. Session overlays are a CACHE (see
  *                   --max-overlay-size, default 10GB): once the total exceeds
- *                   the cap the OLDEST overlays are deleted automatically
+ *                   the cap the OLDEST overlays are deleted automatically.
+ *                   The state dir is shared by every server that runs this
+ *                   file, so the cap enforced is the LARGEST one any live
+ *                   sibling declares (see effectiveOverlayCapBytes) — otherwise
+ *                   a server started with the default churns forever against a
+ *                   deployment that raised the cap in another config.
  *     - open_project/info: server state management
  *
  * Usage (spawned by koi-gateway.js, see gateway-config.json):
@@ -67,6 +72,7 @@ import { fileURLToPath } from 'url';
 import {
   DEFAULT_POLICY_PATH, DEFAULT_BROKER_SOCK, KOI_HOME,
   ensurePolicy, loadPolicy, ApprovalBroker,
+  newSandboxToken, sandboxBrokerSock,
 } from './koi-net-policy.mjs';
 
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -325,6 +331,9 @@ function mainUsage() {
     '                        Overlays are a cache: over the cap the oldest ones are',
     '                        deleted automatically. The live/in-use overlays and the',
     '                        per-project outbox (exported patches) are never evicted.',
+    '                        The cap is per DEPLOYMENT: --state is shared by every',
+    '                        process running this file, so the largest cap declared',
+    '                        by a live sibling governs (sandbox_info says which).',
     '  -h, --help            show this help and exit.',
     '',
     'Debug / review command:',
@@ -382,21 +391,47 @@ function parseSizeSpec(spec, fallback) {
   const m = /^(\d+(?:\.\d+)?)\s*([a-z]*)b?$/.exec(s.replace(/ib\b/g, 'b'));
   const unit = m ? SIZE_UNITS[m[2] || 'b'] ?? SIZE_UNITS[`${m[2]}b`] : undefined;
   if (!m || !unit) {
-    process.stderr.write(`[sandbox-shell] WARNING: bad size value '${spec}' — using ${formatBytes(fallback)}\n`);
+    process.stderr.write(`[sandbox-shell] WARNING: bad size value '${spec}' — using ${formatCap(fallback)}\n`);
     return fallback;
   }
   return Math.round(parseFloat(m[1]) * unit);
 }
 
+/** A byte COUNT, for humans: 0 is `0B`. For a cap use formatCap. */
 function formatBytes(n) {
-  if (!n) return 'unlimited';
+  if (!n) return '0B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
   let i = 0, v = n;
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return `${v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)}${u[i]}`;
 }
 
+/**
+ * A disk CAP, for humans: 0 means no cap, so it reads `unlimited`. Kept apart
+ * from formatBytes because model-facing fields used to say "unlimited" for a
+ * count of 0 bytes (heldByOtherLiveSessionsHuman, lastSweep.freed).
+ */
+function formatCap(n) {
+  return n ? formatBytes(n) : 'unlimited';
+}
+
 const DEFAULT_MAX_OVERLAY_BYTES = 10 * 1024 ** 3; // 10GB
+
+/**
+ * `http_port 127.0.0.1:<N>` from the egress proxy's generated config
+ * (koi-net-setup.sh proxy writes it to $KOI_SQUID_DIR/koi-squid.conf), or
+ * null when there is none or it cannot be read.
+ */
+function proxyPortFromSquidConf() {
+  const dir = process.env.KOI_SQUID_DIR || path.join(KOI_HOME, 'squid');
+  try {
+    const m = /^\s*http_port\s+(?:\S*:)?(\d+)\b/m.exec(fs.readFileSync(path.join(dir, 'koi-squid.conf'), 'utf8'));
+    const n = m ? Number(m[1]) : NaN;
+    return Number.isInteger(n) && n > 0 && n < 65536 ? n : null;
+  } catch {
+    return null;
+  }
+}
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -432,7 +467,7 @@ function parseArgs() {
     else if (args[i] === '--net' && args[i + 1]) out.net = args[++i];
     else if (args[i] === '--net-policy' && args[i + 1]) out.netPolicy = path.resolve(args[++i]);
     else if (args[i] === '--net-allow' && args[i + 1]) out.netAllow = path.resolve(args[++i]);
-    else if (args[i] === '--proxy-port' && args[i + 1]) out.proxyPort = Number(args[++i]);
+    else if (args[i] === '--proxy-port' && args[i + 1]) { out.proxyPort = Number(args[++i]); out.proxyPortGiven = true; }
     else if (args[i] === '--state' && args[i + 1]) out.state = path.resolve(args[++i]);
     else if ((args[i] === '--max-overlay-size' || args[i] === '--max-overlay') && args[i + 1]) {
       out.maxOverlayBytes = parseSizeSpec(args[++i], DEFAULT_MAX_OVERLAY_BYTES);
@@ -447,6 +482,18 @@ function parseArgs() {
     process.stderr.write(
       `sandbox-shell-mcp: unknown --net mode '${out.net}' (expected host|loopback|policy)\n`);
     process.exit(1);
+  }
+  if (out.net === 'policy' && !out.proxyPortGiven && !process.env.KOI_PROXY_PORT) {
+    // No port named: use the one the running proxy was configured with. The
+    // gateway's installer picks a free port when 3129 is taken and records it
+    // only in its own unit, so another program running this server (an agent
+    // runtime) assumed 3129 and exited at boot with "nothing is listening".
+    // The proxy's generated config is the one place that always knows.
+    const found = proxyPortFromSquidConf();
+    if (found !== null && found !== out.proxyPort) {
+      process.stderr.write(`[sandbox-shell] egress proxy port ${found}, read from the running proxy's config\n`);
+      out.proxyPort = found;
+    }
   }
   if (out.net === 'policy') {
     if (process.env.KOI_NET_TEST === '1') {
@@ -465,7 +512,11 @@ function parseArgs() {
       // proxy is supposed to be UP, so "port free" would be the failure and
       // "port busy" the success. Using the wrong mode here made a correctly
       // running proxy abort the sandbox with "port is already in use".
-      const probe = spawnSync(path.join(SELF_DIR, 'koi-net-setup.sh'), ['preflight', '--running'], { encoding: 'utf8' });
+      // The port this server will use, not whatever the environment says:
+      // with --proxy-port (or a discovered port) they differ.
+      const probe = spawnSync(path.join(SELF_DIR, 'koi-net-setup.sh'), ['preflight', '--running'], {
+        encoding: 'utf8', env: { ...process.env, KOI_PROXY_PORT: String(out.proxyPort) },
+      });
       const report = `${probe.stdout || ''}${probe.stderr || ''}`;
       if (probe.error || probe.status !== 0) {
         process.stderr.write(
@@ -566,7 +617,7 @@ function buildStatus() {
 
 let BACKEND = null; // assigned after the initial setProject()
 
-const PROJ = { path: null, id: null, state: null, sessionId: null, dirs: null };
+const PROJ = { path: null, id: null, state: null, sessionId: null, dirs: null, stack: [] };
 
 /**
  * Host-visible directory holding this session's project tree.
@@ -658,11 +709,16 @@ function listProjectSessions(sessionsRoot) {
   try { names = fs.readdirSync(sessionsRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); }
   catch { return []; }
   const out = names.map((name) => {
-    const upper = path.join(sessionsRoot, name, 'upper');
+    const sessionDir = path.join(sessionsRoot, name);
     let changed = 0, mtimeMs = 0, label;
-    try { changed = countFilesRec(upper); } catch { /* ignore */ }
-    try { mtimeMs = fs.statSync(path.join(sessionsRoot, name)).mtimeMs; } catch { /* ignore */ }
-    try { label = fs.readFileSync(path.join(sessionsRoot, name, 'label'), 'utf8').trim() || undefined; } catch { /* unlabeled */ }
+    // Count the live upper AND any layers sealed by a fork: after forking, a
+    // session's own work sits in frozen-* and its upper is empty, so counting
+    // only `upper` would report a busy session as having nothing in it.
+    try {
+      for (const layer of overlayLayerDirs(sessionDir)) changed += countFilesRec(layer);
+    } catch { /* ignore */ }
+    try { mtimeMs = fs.statSync(sessionDir).mtimeMs; } catch { /* ignore */ }
+    try { label = fs.readFileSync(path.join(sessionDir, 'label'), 'utf8').trim() || undefined; } catch { /* unlabeled */ }
     return { id: name, changedFiles: changed, mtimeMs, ...(label ? { label } : {}) };
   });
   out.sort((a, b) => b.mtimeMs - a.mtimeMs);
@@ -679,9 +735,92 @@ function countFilesRec(dir) {
   return n;
 }
 
+/**
+ * Read a forked session's inherited lower layers, oldest (deepest) first.
+ *
+ * Written by sandbox_fork_session as a `stack` file holding absolute upperdir
+ * paths. A missing file means an ordinary session: no inherited layers.
+ * Layers that no longer exist (evicted by the overlay cache) are dropped --
+ * with a loud log, because the result is a session whose ancestry silently
+ * regressed to an older state.
+ */
+/**
+ * The session directory that owns a layer path.
+ *
+ * Layers are `<session>/upper` (a live session's own) or `<session>/frozen-*`
+ * (sealed by a fork). Both are one level below the session dir, so protecting
+ * the layer means protecting that directory.
+ */
+/** This session's own writable layer plus any it sealed when forked. */
+function overlayLayerDirs(sessionDir) {
+  const out = [path.join(sessionDir, 'upper')];
+  try {
+    for (const e of fs.readdirSync(sessionDir, { withFileTypes: true })) {
+      if (e.isDirectory() && e.name.startsWith('frozen-')) out.push(path.join(sessionDir, e.name));
+    }
+  } catch { /* none */ }
+  return out;
+}
+
+function layerSessionDir(layer) {
+  return path.dirname(layer);
+}
+
+function readSessionStack(stateDir) {
+  let raw;
+  try { raw = fs.readFileSync(path.join(stateDir, 'stack'), 'utf8'); }
+  catch { return []; }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    const dir = line.trim();
+    if (!dir) continue;
+    if (fs.existsSync(dir)) out.push(dir);
+    else log(`WARNING: forked session ${path.basename(stateDir)} lost inherited layer ${dir} (evicted?); its view has regressed`);
+  }
+  return out;
+}
+
+/**
+ * Mark every session overlay in a fork's ancestry as in-use, so the disk cache
+ * cannot evict a layer a live session is still mounting. A parent that exits
+ * stops refreshing its own `inuse` file, so without this its upper -- which is
+ * the child's lower -- becomes an eviction candidate while the child runs.
+ */
+function touchInheritedLayers() {
+  for (const layer of (PROJ.stack || [])) {
+    const dir = layerSessionDir(layer);
+    try {
+      fs.writeFileSync(path.join(dir, 'inuse'),
+        JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n');
+    } catch { /* best effort */ }
+  }
+}
+
 /** Root of all sandbox state: <base>/<projectId>/{sessions/<sessionId>,outbox}. */
 function stateBaseDir() {
   return OPTS.state || path.join(os.homedir(), '.koi', 'sandbox');
+}
+
+/** ~/.koi/persist/<basename>-<id>: readable name, collision-free key. */
+function persistDirFor(projectPath, id) {
+  const name = (path.basename(projectPath) || 'root').replace(/[^\w.-]+/g, '_');
+  return path.join(os.homedir(), '.koi', 'persist', `${name}-${id}`);
+}
+
+// The persist dir is bound writable into the sandbox, so the sandbox can plant
+// symlinks INSIDE it; those are harmless in there (their targets under ~/.koi
+// are masked) but a HOST process writing into the same dir would follow them.
+// Host-side writers must therefore refuse symlinks themselves (code-tour's
+// Save does). Here we only refuse to bind a persist root that is itself, or
+// sits under, a symlink — that would carve an arbitrary host dir out of the
+// mask.
+function assertNotSymlinked(dir) {
+  const stop = path.join(os.homedir(), '.koi');
+  for (let d = dir; d.startsWith(stop + path.sep); d = path.dirname(d)) {
+    let st;
+    try { st = fs.lstatSync(d); } catch { continue; }
+    if (st.isSymbolicLink()) throw new Error(`refusing to use ${dir}: ${d} is a symlink`);
+  }
 }
 
 // =============================================================================
@@ -727,6 +866,36 @@ const OVERLAY_DETACH_PIN_MS = 24 * 60 * 60_000;
 
 /** dir -> { bytes, files, newestMtimeMs, truncated, at } */
 const overlayUsageCache = new Map();
+
+/**
+ * The budget to enforce: this server's own cap, raised to the largest cap any
+ * LIVE sibling server declares in its `inuse` marker. The overlay cache is one
+ * shared tree, so one budget must govern it; a server started with the 10GB
+ * default must not churn against a deployment that configured 100GB elsewhere
+ * (which is exactly what happened between the gateway's server and an agent
+ * runtime's, and why sessions vanished from under a running agent).
+ * A cap of 0 means "no cap" for the server that set it, and wins for that
+ * server only: a sibling that explicitly disabled enforcement does not switch
+ * the shared cache off for everyone, since the cap is what protects the host's
+ * disk and an uncapped server must not be able to remove that protection.
+ * Returns { bytes, from } — `from` names who set it, for sandbox_info and the
+ * pressure note, so a wrong cap is attributable instead of mysterious.
+ */
+function effectiveOverlayCapBytes(sessions = listOverlaySessions()) {
+  let bytes = MAX_OVERLAY_BYTES;
+  let from = MAX_OVERLAY_BYTES ? 'this server (--max-overlay-size / KOI_SANDBOX_MAX_OVERLAY)' : 'this server (--max-overlay-size 0)';
+  for (const s of sessions) {
+    if (!s.protectedBy || !Number.isFinite(s.capBytes)) continue;
+    if (s.live) continue;                       // own cap already counted
+    if (bytes === 0 || s.capBytes > bytes) {    // own "unlimited" stays unlimited
+      bytes = s.capBytes;
+      from = `session ${s.label || s.sessionId} (project ${s.projectId}, pid ${s.pid ?? '?'})`;
+    }
+  }
+  return { bytes, from };
+}
+
+let capFromSiblingLogged = false;
 
 /** Result of the most recent sweep; surfaced in sandbox_info. */
 let LAST_OVERLAY_GC = null;
@@ -780,9 +949,21 @@ function sessionUsage(dir, { live = false } = {}) {
 function touchSessionInUse() {
   if (!PROJ.state) return;
   try {
+    // `cap` declares what THIS server believes the disk budget is. The state dir
+    // is shared by every server that runs this file (the gateway's, an agent
+    // runtime's), and each one used to enforce only its own --max-overlay-size
+    // against the shared total: a server started with the 10GB default then
+    // churns forever against a 100GB deployment, because the bytes it cannot
+    // evict (another server's live overlay) already exceed its cap. A sweep
+    // therefore honours the LARGEST cap declared by a live session (see
+    // effectiveOverlayCapBytes), which makes the flag per-deployment instead of
+    // per-process.
     fs.writeFileSync(path.join(PROJ.state, 'inuse'),
-      JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n');
+      JSON.stringify({ pid: process.pid, at: new Date().toISOString(), cap: MAX_OVERLAY_BYTES }) + '\n');
   } catch { /* best effort — worst case this overlay looks evictable */ }
+  // Inherited layers are load-bearing for a forked session: evicting one
+  // rewrites history under a running agent.
+  touchInheritedLayers();
 }
 
 /** Protect a detached session overlay from GC eviction until `until`. */
@@ -801,14 +982,21 @@ function sessionPinned(dir) {
 
 /** True if another (or this) live process is attached to the session at `dir`. */
 function sessionInUse(dir) {
+  const rec = sessionInUseRecord(dir);
+  return rec ? rec.live : false;
+}
+
+/** The `inuse` marker of a session that belongs to a process still alive. */
+function sessionInUseRecord(dir) {
   let raw;
-  try { raw = fs.readFileSync(path.join(dir, 'inuse'), 'utf8'); } catch { return false; }
+  try { raw = fs.readFileSync(path.join(dir, 'inuse'), 'utf8'); } catch { return null; }
   let rec;
-  try { rec = JSON.parse(raw); } catch { return false; }
+  try { rec = JSON.parse(raw); } catch { return null; }
   const at = Date.parse(rec.at || '');
-  if (!Number.isFinite(at) || Date.now() - at > OVERLAY_INUSE_STALE_MS) return false;
-  if (!rec.pid) return false;
-  try { process.kill(rec.pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  if (!Number.isFinite(at) || Date.now() - at > OVERLAY_INUSE_STALE_MS) return null;
+  if (!rec.pid) return null;
+  try { process.kill(rec.pid, 0); return { ...rec, live: true }; }
+  catch (e) { return e.code === 'EPERM' ? { ...rec, live: true } : null; }
 }
 
 /** Structural guard: only ever delete <base>/<projectId>/sessions/<sessionId>. */
@@ -835,10 +1023,24 @@ function listOverlaySessions() {
       const dir = path.join(sessionsRoot, sessionId);
       const live = PROJ.state === dir;
       const usage = sessionUsage(dir, { live });
+      const marker = live ? { cap: MAX_OVERLAY_BYTES } : sessionInUseRecord(dir);
       let label;
       try { label = fs.readFileSync(path.join(dir, 'label'), 'utf8').trim() || undefined; } catch { /* unlabeled */ }
-      const protectedBy = live ? 'live' : (sessionInUse(dir) ? 'in-use' : (sessionPinned(dir) ? 'pinned' : null));
-      out.push({ dir, projectId, sessionId, label, live, protectedBy, ...usage });
+      const protectedBy = live ? 'live'
+        : (sessionInUse(dir) ? 'in-use'
+        : (sessionPinned(dir) ? 'pinned'
+        : ((PROJ.stack || []).some((l) => layerSessionDir(l) === dir) ? 'fork-parent' : null)));
+      out.push({
+        dir, projectId, sessionId, label, live, protectedBy, ...usage,
+        // Whose overlay this is, for the pressure note: this session, an
+        // earlier session of this same process (left behind by
+        // sandbox_open_project; its marker carries our pid), another live
+        // server, or nobody (evictable). Only the third is "someone else's".
+        owner: live ? 'this-session'
+          : (!marker ? 'none'
+          : (marker.pid === process.pid ? 'this-server' : 'other-live-session')),
+        capBytes: Number.isFinite(marker?.cap) ? marker.cap : null,
+      });
     }
   }
   return out;
@@ -877,16 +1079,33 @@ function rmrf(target) {
  * in LAST_OVERLAY_GC for sandbox_info).
  */
 function enforceOverlayBudget(reason = 'periodic') {
-  if (!MAX_OVERLAY_BYTES) return null;
   const sessions = listOverlaySessions();
+  const cap = effectiveOverlayCapBytes(sessions);
+  if (!cap.bytes) return null;
   let total = sessions.reduce((n, s) => n + s.bytes, 0);
   const result = {
     at: new Date().toISOString(), reason,
-    limit: MAX_OVERLAY_BYTES, limitHuman: formatBytes(MAX_OVERLAY_BYTES),
+    limit: cap.bytes, limitHuman: formatCap(cap.bytes), capFrom: cap.from,
     usedBefore: total, sessions: sessions.length, evicted: [], freedBytes: 0,
+    // Who the remaining bytes belong to, so the pressure note can say whether
+    // THIS session is the one to blame.
+    heldByOthers: sessions.filter((s) => s.owner === 'other-live-session')
+      .reduce((n, s) => n + s.bytes, 0),
   };
-  if (total > MAX_OVERLAY_BYTES) {
-    const target = Math.floor(MAX_OVERLAY_BYTES * OVERLAY_GC_LOW_WATER);
+  // Say it once per episode when a sibling's setting is what governs: a server
+  // whose own flag says 512MB enforcing a 8GB budget must be visible on the host
+  // (journalctl -u koi-gateway), or the number in sandbox_info looks wrong.
+  if (cap.bytes !== MAX_OVERLAY_BYTES) {
+    if (!capFromSiblingLogged) {
+      capFromSiblingLogged = true;
+      log(`overlay cache: enforcing ${formatCap(cap.bytes)} (largest cap declared by a live session) ` +
+          `not this server's ${formatCap(MAX_OVERLAY_BYTES)} — from ${cap.from}`);
+    }
+  } else {
+    capFromSiblingLogged = false;
+  }
+  if (total > cap.bytes) {
+    const target = Math.floor(cap.bytes * OVERLAY_GC_LOW_WATER);
     const candidates = sessions
       .filter((s) => !s.protectedBy && isEvictableSessionDir(s.dir))
       .sort((a, b) => a.newestMtimeMs - b.newestMtimeMs); // oldest first
@@ -906,18 +1125,20 @@ function enforceOverlayBudget(reason = 'periodic') {
   }
   result.used = total;
   result.usedHuman = formatBytes(total);
-  result.overBudget = total > MAX_OVERLAY_BYTES;
+  result.overBudget = total > cap.bytes;
   if (result.evicted.length) {
     log(`overlay cache: freed ${formatBytes(result.freedBytes)} by evicting ${result.evicted.length} old session overlay(s) — ` +
-        `now ${formatBytes(total)} / ${formatBytes(MAX_OVERLAY_BYTES)} (${reason})`);
+        `now ${formatBytes(total)} / ${formatCap(cap.bytes)} (${reason})`);
   }
   if (result.overBudget) {
     // Nothing evictable left: what remains is the live session (and any
     // sibling server's). We do NOT delete in-progress work to satisfy a cache
     // cap — say so loudly instead, and surface it to the session (see
     // overlayPressureMeta) so the model can stop installing things.
-    log(`overlay cache: STILL OVER BUDGET — ${formatBytes(total)} / ${formatBytes(MAX_OVERLAY_BYTES)} ` +
-        'with only live/in-use overlays left. Raise --max-overlay-size or free space manually.');
+    log(`overlay cache: STILL OVER BUDGET — ${formatBytes(total)} / ${formatCap(cap.bytes)} ` +
+        `with only live/in-use overlays left (cap from ${cap.from}; ` +
+        `${formatBytes(result.heldByOthers)} of it another live server's). ` +
+        'Raise --max-overlay-size on the server that owns the largest cap, or free space manually.');
   }
   LAST_OVERLAY_GC = result;
   return result;
@@ -956,20 +1177,31 @@ if (MAX_OVERLAY_BYTES) {
 
 /** Budget status for sandbox_info (uses the usage cache; live session rescanned). */
 function overlayBudgetStatus() {
-  if (!MAX_OVERLAY_BYTES) {
+  const sessions = listOverlaySessions();
+  const cap = effectiveOverlayCapBytes(sessions);
+  if (!cap.bytes) {
     return { limit: 0, limitHuman: 'unlimited', enforcement: 'disabled (--max-overlay-size 0)' };
   }
-  const sessions = listOverlaySessions();
   const used = sessions.reduce((n, s) => n + s.bytes, 0);
   const mine = sessions.find((s) => s.live);
+  const heldByOthers = sessions.filter((s) => s.owner === 'other-live-session')
+    .reduce((n, s) => n + s.bytes, 0);
   return {
-    limit: MAX_OVERLAY_BYTES,
-    limitHuman: formatBytes(MAX_OVERLAY_BYTES),
+    limit: cap.bytes,
+    limitHuman: formatCap(cap.bytes),
+    // Which setting won, and where it came from: with several servers sharing
+    // one state dir, "my flag says 100GB but the number says 10GB" was
+    // undiagnosable from the outside.
+    capFrom: cap.from,
+    ownCapBytes: MAX_OVERLAY_BYTES,
+    ownCapHuman: formatCap(MAX_OVERLAY_BYTES),
+    heldByOtherLiveSessions: heldByOthers,
+    heldByOtherLiveSessionsHuman: formatBytes(heldByOthers),
     used, usedHuman: formatBytes(used),
     sessions: sessions.length,
     thisSessionBytes: mine ? mine.bytes : 0,
     thisSessionHuman: formatBytes(mine ? mine.bytes : 0),
-    overBudget: used > MAX_OVERLAY_BYTES,
+    overBudget: used > cap.bytes,
     lastSweep: LAST_OVERLAY_GC
       ? { at: LAST_OVERLAY_GC.at, reason: LAST_OVERLAY_GC.reason, evicted: LAST_OVERLAY_GC.evicted.length, freed: formatBytes(LAST_OVERLAY_GC.freedBytes) }
       : null,
@@ -1000,20 +1232,56 @@ function networkPolicySummary() {
     file: OPTS.netPolicy,
     proxyPort: OPTS.proxyPort,
     unmatched: policy.default === 'ask'
-      ? 'prompts the user (denied when no session is attached to answer)'
+      ? (CLIENT_CAN_PROMPT
+        ? 'prompts the user (denied when no session is attached to answer)'
+        : 'denied: this client cannot prompt the user, so only the allowlist below is reachable')
       : policy.default,
     allowed: policy.rules.filter((r) => r.decision === 'allow').map(fmt),
     denied: policy.rules.filter((r) => r.decision === 'deny').map(fmt),
   };
 }
 
+// The pressure block is model-facing prose attached to tool RESULTS, so repeating
+// it on every call was two problems at once: it burned tokens for a condition the
+// agent cannot act on, and it read as a fresh alarm each time. One block per GC
+// episode (reset whenever a sweep finds the cache back under budget) is enough to
+// change behaviour; the full state stays available in sandbox_info.
+const OVERLAY_PRESSURE_REPEAT_MS = 10 * 60_000;  // re-alarm at most every 10 min
+let lastPressureAtMs = 0;
+let lastPressureEpisode = null;
+
 function overlayPressureMeta() {
-  if (!LAST_OVERLAY_GC || !LAST_OVERLAY_GC.overBudget) return {};
+  if (!LAST_OVERLAY_GC || !LAST_OVERLAY_GC.overBudget) { lastPressureEpisode = null; return {}; }
+  // An "episode" is the same condition: over budget under the same cap, set by
+  // the same server. NOT the byte total: that moves with every file a command
+  // writes, so keying on it re-alarmed on nearly every call of a working agent
+  // - the very repetition this limit exists to stop. Getting back under budget
+  // ends the episode (above); a different cap starts a new one.
+  const episode = `${LAST_OVERLAY_GC.limit}|${LAST_OVERLAY_GC.capFrom}`;
+  const now = Date.now();
+  if (episode === lastPressureEpisode && now - lastPressureAtMs < OVERLAY_PRESSURE_REPEAT_MS) return {};
+  lastPressureEpisode = episode; lastPressureAtMs = now;
+  // Say WHOSE bytes these are. "Raise --max-overlay-size" was the wrong advice
+  // when the over-budget bytes belonged to another server's live session: the
+  // agent was being nagged about a cap it never set, by a sibling process whose
+  // flag defaulted to 10GB while the deployment said 100GB.
+  const heldByOthers = LAST_OVERLAY_GC.heldByOthers || 0;
+  const blame = heldByOthers > 0
+    ? `${formatBytes(heldByOthers)} of it belongs to ANOTHER live server's session, which is never evicted`
+    : 'it is this session\'s own overlay that is over budget';
   return {
     diskPressure: {
       used: LAST_OVERLAY_GC.usedHuman,
       limit: LAST_OVERLAY_GC.limitHuman,
-      hint: 'The sandbox overlay cache is over its disk cap and only live sessions remain, so nothing more can be reclaimed automatically. Avoid writing large trees (node_modules, build output, downloads) into the overlay; they are not part of the deliverable. Ship finished work to the outbox and let the user raise --max-overlay-size if the project genuinely needs more.',
+      capFrom: LAST_OVERLAY_GC.capFrom,
+      hint: 'The sandbox overlay cache is over its disk cap (' + LAST_OVERLAY_GC.usedHuman + ' of '
+        + LAST_OVERLAY_GC.limitHuman + ', cap from ' + (LAST_OVERLAY_GC.capFrom || 'this server')
+        + '), only live sessions remain, and ' + blame
+        + '. This is not something the agent can fix by working differently: do not change your '
+        + 'approach for it, do not retry anything because of it, and do not report it as a failure. '
+        + 'Keep large artifacts out of the overlay and ship finished work to the outbox. A person '
+        + 'raises --max-overlay-size on the server that owns the largest cap, or clears space under '
+        + 'the state dir.',
     },
   };
 }
@@ -1139,12 +1407,26 @@ function setProject(projectPath, { resume = null, fresh = false, label = null } 
   const state = path.join(sessionsRoot, sessionId);
   // "fresh" == this session's overlay does not exist yet == starting from host.
   const startedFromHost = !fs.existsSync(path.join(state, 'upper'));
+  // A FORKED session inherits its ancestors' upperdirs as extra read-only
+  // LOWER layers (see sandbox_fork_session). A fork must never COPY the
+  // parent's upper: a deletion is recorded there as a 0:0 character device
+  // (an overlayfs whiteout) and mknod is EPERM for an unprivileged user, so
+  // a userspace copy silently resurrects every file the parent deleted.
+  // Stacking is both correct and O(1).
+  const stack = readSessionStack(state);
   const dirs = {
     upper: path.join(state, 'upper'),         // overlayfs upperdir (linux)
     work: path.join(state, 'work'),           // overlayfs workdir  (linux)
     lower: path.join(state, 'lower'),         // EMPTY greenfield lower (linux)
     workspace: path.join(state, 'workspace'), // CoW clone          (darwin)
     bin: path.join(state, 'bin'),             // git wrapper etc., first on PATH
+    // The sandbox's /tmp (linux). Host-backed and per SESSION, so a file
+    // written to /tmp in one sandbox_exec is still there in the next. It used
+    // to be a bare `--tmpfs /tmp`, i.e. per EXEC: every command got an empty
+    // /tmp, a session wrote a file, came back for it a turn later and found
+    // nothing -- and the guardrail then told it the path was "masked". Wiped
+    // by sandbox_reset and evicted with the session overlay.
+    tmp: path.join(state, 'tmp'),
     // Exported patches (host-visible). PROJECT-level, not per-session: the
     // patch series is the topic's durable deliverable and must survive a
     // pruned/abandoned session overlay (a topic recovers by `git am`-ing the
@@ -1153,7 +1435,15 @@ function setProject(projectPath, { resume = null, fresh = false, label = null } 
     // sessions of one topic dedupe naturally. (Concurrent sessions on the
     // same project already corrupt shared sandbox state and are unsupported.)
     outbox: path.join(projectRoot, 'outbox'),
+    // Personal, durable, host-visible store for things a skill keeps on the
+    // user's behalf (e.g. code-tour's saved tours under $KOI_PERSIST/tour).
+    // Not a deliverable like the outbox and never part of the project tree:
+    // ~/.koi/persist/<basename>-<id>/. Hardcoded under ~/.koi (not --state) so
+    // a server run on the host and a sandboxed one agree on the path. Outside
+    // <state>/<id>/sessions, so the overlay disk-budget sweep never touches it.
+    persist: persistDirFor(p, id),
   };
+  assertNotSymlinked(dirs.persist);
   for (const d of Object.values(dirs)) fs.mkdirSync(d, { recursive: true });
   if (label != null && String(label).trim() !== '') {
     try { fs.writeFileSync(path.join(state, 'label'), String(label).trim() + '\n'); } catch { /* best effort */ }
@@ -1161,7 +1451,7 @@ function setProject(projectPath, { resume = null, fresh = false, label = null } 
   let sessionLabel;
   try { sessionLabel = fs.readFileSync(path.join(state, 'label'), 'utf8').trim() || undefined; } catch { /* unlabeled */ }
   if (SESSION_KEY) claimSessionKey(sessionsRoot, state, SESSION_KEY);
-  Object.assign(PROJ, { path: p, id, state, sessionId, sessionLabel, sessionsRoot, resumed, resumedByKey, startedFromHost, hostAbsent, greenfield, dirs });
+  Object.assign(PROJ, { path: p, id, state, sessionId, sessionLabel, sessionsRoot, resumed, resumedByKey, startedFromHost, hostAbsent, greenfield, dirs, stack });
   // Live pointer for the host-side `review` CLI: which project + session
   // overlay the server is currently attached to. Best-effort; review falls
   // back to --project / most-recent-session when absent or stale.
@@ -1332,6 +1622,11 @@ const BASE_ENV = {
   NPM_CONFIG_CACHE: '/tmp/koi/npm-cache',
   YARN_CACHE_FOLDER: '/tmp/koi/yarn-cache',
   PIP_CACHE_DIR: '/tmp/koi/pip-cache',
+  // Module search paths the launcher chose (e.g. a society agent gets each
+  // skill's own <skill>/env here). Passed through, never invented: --clearenv
+  // would otherwise drop them and a skill's installed deps would vanish.
+  ...(process.env.PYTHONPATH ? { PYTHONPATH: process.env.PYTHONPATH } : {}),
+  ...(process.env.NODE_PATH ? { NODE_PATH: process.env.NODE_PATH } : {}),
 };
 
 /** Keep wrapper dir first, then host PATH (fnm/nvm/volta/...). */
@@ -1533,12 +1828,22 @@ class BwrapBackend {
       '--ro-bind', '/', '/',
       '--dev', '/dev',
       '--proc', '/proc',
-      '--tmpfs', '/tmp',
+      // /tmp is this session's own scratch dir (see PROJ.dirs.tmp): writable,
+      // kept across execs, never the host's /tmp. It must come before every
+      // mount below that lives under /tmp (koi/bin, koi/project, koi/outbox),
+      // or it would shadow them.
+      '--bind', PROJ.dirs.tmp, '/tmp',
       '--tmpfs', '/run',
       // Overlay: read-write view of the project, backed by upper/work on the
       // host. Greenfield uses an EMPTY scratch lower and a sandbox-internal dest
       // (this.root) so the host tree is never required to exist — nor created.
       '--overlay-src', PROJ.hostAbsent ? PROJ.dirs.lower : PROJ.path,
+      // Inherited layers of a FORKED session, deepest ancestor first. Later
+      // --overlay-src is the higher layer, so a child's own upper still wins,
+      // then its parent's, then the host tree. This is why a fork is O(1) and
+      // why it reproduces the parent's deletions faithfully: the parent's
+      // whiteouts are read by overlayfs itself rather than copied by us.
+      ...(PROJ.stack || []).flatMap((upper) => ['--overlay-src', upper]),
       '--overlay', PROJ.dirs.upper, PROJ.dirs.work, this.root,
       // Tool wrappers first on PATH. NOTE: mountpoints must live under a
       // writable mount — the ro-bound root cannot grow new directories, so
@@ -1587,6 +1892,9 @@ class BwrapBackend {
     // again, since /tmp is our own tmpfs and no mask entry can shadow it.
     argv.push('--bind', PROJ.dirs.outbox, PROJ.dirs.outbox);
     argv.push('--bind', PROJ.dirs.outbox, OUTBOX_ALIAS_INSIDE);
+    // $KOI_PERSIST: same reasoning as the outbox — it lives under the masked
+    // ~/.koi, so it MUST be bound after the masks or it is silently shadowed.
+    argv.push('--bind', PROJ.dirs.persist, PROJ.dirs.persist);
 
     // ...AND THEN SEAL THE MASK. The bind above carves out exactly ONE leaf:
     // the outbox of the project that is open RIGHT NOW. Everything else under a
@@ -1636,7 +1944,10 @@ class BwrapBackend {
       ...BASE_ENV,
       PATH: composeSandboxPath('/tmp/koi/bin'),
       KOI_OUTBOX: this.outboxInside, // git format-patch -o "$KOI_OUTBOX" lands on the host
-      ...(OPTS.net === 'policy' ? { KOI_PROXY_PORT: String(OPTS.proxyPort) } : {}),
+      KOI_PERSIST: PROJ.dirs.persist, // personal durable store, host-visible at the same path
+      // KOI_PROXY_TOKEN: confine puts it in the proxy URL, so the proxy can
+      // tell this sandbox's requests from every other sandbox's.
+      ...(OPTS.net === 'policy' ? { KOI_PROXY_PORT: String(OPTS.proxyPort), KOI_PROXY_TOKEN: NET_TOKEN } : {}),
     };
     for (const [k, v] of Object.entries(env)) argv.push('--setenv', k, String(v));
     argv.push('--chdir', cwd || this.root);
@@ -1667,10 +1978,15 @@ class BwrapBackend {
   }
 
   reset() {
+    // Only this session's own writable layer. Frozen layers below it are
+    // shared with any fork taken from this session and are immutable by
+    // contract -- deleting one would corrupt a running branch.
     rmrf(PROJ.dirs.upper);
     rmrf(PROJ.dirs.work);
+    rmrf(PROJ.dirs.tmp);
     fs.mkdirSync(PROJ.dirs.upper, { recursive: true });
     fs.mkdirSync(PROJ.dirs.work, { recursive: true });
+    fs.mkdirSync(PROJ.dirs.tmp, { recursive: true });
   }
 }
 
@@ -1730,7 +2046,8 @@ ${credRules}
 (allow file-read* file-write*
   (subpath "${PROJ.state}")
   (subpath "${PROJ.dirs.workspace}")
-  (subpath "${PROJ.dirs.outbox}"))
+  (subpath "${PROJ.dirs.outbox}")
+  (subpath "${PROJ.dirs.persist}"))
 (allow file-write*
   (subpath "/private/tmp")
   (subpath "/private/var/folders")
@@ -1781,12 +2098,16 @@ ${netRules}
       ...BASE_ENV,
       PATH: `${PROJ.dirs.bin}:` + (process.env.PATH || '/usr/local/bin:/usr/bin:/bin'),
       KOI_OUTBOX: this.outboxInside,
+      KOI_PERSIST: PROJ.dirs.persist,
     };
     // Mask credentials by pointing tools at empty config where env allows.
     env.GIT_SSH_COMMAND = 'false'; // ssh-based fetch/push both blocked on mac backend
     if (OPTS.net === 'policy') {
-      const proxy = `http://127.0.0.1:${OPTS.proxyPort}`;
+      // This sandbox's token as proxy credentials (koi-net-policy.mjs,
+      // "Per-sandbox identity"); git must be told to send them unasked.
+      const proxy = `http://koi:${NET_TOKEN}@127.0.0.1:${OPTS.proxyPort}`;
       Object.assign(env, {
+        GIT_HTTP_PROXY_AUTHMETHOD: 'basic',
         HTTP_PROXY: proxy, HTTPS_PROXY: proxy, http_proxy: proxy, https_proxy: proxy,
         NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost',
       });
@@ -1822,7 +2143,7 @@ class ExecBackend { // DEV/TEST ONLY — no isolation
     return {
       cmd: SHELL_BIN,
       args: ['-c', `cd ${JSON.stringify(cwd || this.root)} && ${shCmd}`],
-      spawnEnv: { ...process.env, ...BASE_ENV, PATH: `${PROJ.dirs.bin}:${process.env.PATH}`, KOI_OUTBOX: this.outboxInside },
+      spawnEnv: { ...process.env, ...BASE_ENV, PATH: `${PROJ.dirs.bin}:${process.env.PATH}`, KOI_OUTBOX: this.outboxInside, KOI_PERSIST: PROJ.dirs.persist },
     };
   }
   reset() {}
@@ -1834,7 +2155,7 @@ function pickBackend() {
   return new BwrapBackend();
 }
 BACKEND = pickBackend();
-log(`backend=${BACKEND.name} project=${PROJ.path} net=${OPTS.net} state=${PROJ.state} overlayCap=${formatBytes(MAX_OVERLAY_BYTES)}`);
+log(`backend=${BACKEND.name} project=${PROJ.path} net=${OPTS.net} state=${PROJ.state} overlayCap=${formatCap(MAX_OVERLAY_BYTES)}`);
 
 // =============================================================================
 // Network approval bridge (--net policy)
@@ -1882,6 +2203,25 @@ let NET_BROKER = null;
  */
 let CLIENT_CAN_PROMPT = false;
 
+/**
+ * This server's identity on the shared proxy (koi-net-policy.mjs,
+ * "Per-sandbox identity"). Every sandboxed command carries it in its proxy
+ * URL, and the proxy's helper asks only `approval.d/<token>.sock` about them.
+ *
+ * The broker is started lazily, by the first client that CAN prompt. A
+ * server whose clients cannot (a headless agent runtime) never creates a
+ * socket, so its asks are denied at the helper -- and it never touches the
+ * shared socket or anyone else's, which is what used to happen: every
+ * policy-mode server unlinked and re-bound the one shared socket at boot and
+ * unlinked it at exit, taking the gateway's prompts with it.
+ */
+const NET_TOKEN = OPTS.net === 'policy' ? newSandboxToken() : null;
+
+function startNetBrokerOnce() {
+  if (NET_BROKER === null || NET_BROKER.server !== null) return;
+  NET_BROKER.start();
+}
+
 if (OPTS.net === 'policy') {
   try {
     ensurePolicy(OPTS.netPolicy, OPTS.netAllow);
@@ -1889,7 +2229,7 @@ if (OPTS.net === 'policy') {
     log(`WARNING: could not seed network policy ${OPTS.netPolicy}: ${e.message}`);
   }
   NET_BROKER = new ApprovalBroker({
-    socketPath: OPTS.netSock,
+    socketPath: sandboxBrokerSock(NET_TOKEN, OPTS.netSock),
     log,
     asker: async (req) => {
       if (!CLIENT_CAN_PROMPT) {
@@ -1936,7 +2276,7 @@ if (OPTS.net === 'policy') {
         scope: content.scope || 'once',
       };
     },
-  }).start();
+  });
 }
 
 // =============================================================================
@@ -2367,12 +2707,30 @@ let LAST_DETACHED = null;
  * a correct recovery; for a greenfield project the tree was already gone, and
  * an empty project is at least an honest one.
  */
+function sandboxPathsTable() {
+  const linux = BACKEND?.name === 'bwrap-overlay';
+  return [
+    { path: PROJ.hostAbsent ? GREENFIELD_MOUNT : PROJ.path, what: 'the project (open one with sandbox_open_project)',
+      writable: true, persists: 'session overlay (until sandbox_reset / eviction)', hostVisible: 'no: ship it (outbox) to make it real' },
+    { path: '/ (everything else, incl. $HOME)', what: 'the host, as-is',
+      writable: false, persists: '-', hostVisible: 'it IS the host: read-only, writes fail with EROFS' },
+    { path: '/tmp', what: linux ? "this session's own scratch dir (not the host's /tmp)" : 'scratch dir',
+      writable: true, persists: linux ? 'across execs, for this session; wiped by sandbox_reset' : 'backend-dependent', hostVisible: 'no' },
+    { path: '$KOI_OUTBOX = ' + PROJ.dirs.outbox, what: 'delivery: the only place a file reaches the host',
+      writable: true, persists: 'yes, across sessions (may hold files from earlier runs)', hostVisible: 'yes, same path. Keyed by a hash of the project path: re-read it after sandbox_open_project' },
+    { path: '$KOI_PERSIST = ' + PROJ.dirs.persist, what: "the user's personal store for things a skill keeps for them (not the project, not a deliverable)",
+      writable: true, persists: 'yes, across sessions; never evicted', hostVisible: 'yes, same path. Keyed by project: re-read it after sandbox_open_project' },
+    { path: 'credentials: ' + [...CRED_DIRS, ...CRED_FILES].join(', '), what: 'masked',
+      writable: false, persists: '-', hostVisible: 'absent/unreadable inside; say "masked", never "missing"' },
+  ];
+}
+
 function ensureSessionDirs() {
   if (!PROJ || !PROJ.dirs) return;
   // Only the host-backed overlay plumbing. `workspace` (darwin CoW clone) is
   // deliberately excluded: an empty directory is NOT an equivalent recovery
   // there, and silently minting one would hide the loss.
-  const needed = [PROJ.dirs.upper, PROJ.dirs.work, PROJ.dirs.lower, PROJ.dirs.bin, PROJ.dirs.outbox];
+  const needed = [PROJ.dirs.upper, PROJ.dirs.work, PROJ.dirs.lower, PROJ.dirs.bin, PROJ.dirs.tmp, PROJ.dirs.outbox, PROJ.dirs.persist];
   const missing = needed.filter((d) => d && !fs.existsSync(d));
   if (missing.length === 0) return;
   for (const d of missing) {
@@ -2881,6 +3239,18 @@ const TOOLS = [
     },
   },
   {
+    name: 'sandbox_fork_session',
+    tier: 'safe',
+    description: 'Create a NEW session overlay that starts from THIS session\'s current state, including uncommitted edits, and return its id. The fork is O(1): the child stacks this session\'s layers read-only rather than copying them, so forking a session that touched a 2GB tree costs nothing. Use it to run an independent attempt (a swarm branch, a risky refactor) without the two views colliding: writes on either side are invisible to the other from this moment on. The caller attaches the fork by passing the returned session id to sandbox_open_project({ path, resume: <id> }) — normally in a DIFFERENT process/agent, since one server has one live session.',
+    displayMessage: '🌱 Forking sandbox session',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Human-readable tag for the fork (e.g. a branch or agent id); resumable by this label.' },
+      },
+    },
+  },
+  {
     name: 'sandbox_reset',
     tier: 'safe',
     description: 'Discard ALL of THIS session\'s sandbox changes (wipe the current session\'s overlay / workspace back to the host state; other sessions\' overlays are untouched). This is a host-side operation the shell cannot perform: the overlay upperdir is outside the sandbox. Also discards any git commits made in the overlay (exported patches in the outbox survive). Running services keep their processes but lose file state.',
@@ -2895,6 +3265,26 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'view_images',
+    tier: 'safe',
+    description:
+      'Look at image files the sandbox can see: each one is returned to you as an image. Use it to check '
+      + 'anything visual you produced in the shell (a chart or diagram from Python, a page rendered to PNG, '
+      + 'a screenshot file). Paths are as your shell sees them (absolute, or relative to the project root); '
+      + 'the overlay and /tmp work, masked credential paths do not. PNG, JPEG, GIF, WebP; convert other '
+      + 'formats first (e.g. pdftoppm -png). At most 6 per call. resolution: low (480px), standard '
+      + '(1080px, default, reads normal text), high (1920px, small print).',
+    displayMessage: '🖼️ Viewing {{paths}}',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 6, description: 'Image files, in the order to show them.' },
+        resolution: { type: 'string', enum: ['low', 'standard', 'high'], description: 'Longest side the images are scaled down to (default standard).' },
+      },
+      required: ['paths'],
+    },
+  },
+  {
     name: 'sandbox_info',
     tier: 'safe',
     description: 'Show sandbox configuration: backend, project root, network mode, state dirs, running services.',
@@ -2906,6 +3296,65 @@ const TOOLS = [
 // =============================================================================
 // Tool implementations
 // =============================================================================
+
+const VIEW_DIMS = { low: 480, standard: 1080, high: 1920 };
+const VIEW_MAX_FILES = 6;
+const VIEW_MAX_INPUT = 40 * 1024 * 1024;
+const VIEW_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+/**
+ * view_images: copy each file, as the sandbox sees it, into the outbox
+ * (scaled down with ImageMagick or Pillow when one is there), read the copy on
+ * the host side and delete it. Returns MCP content parts, images included.
+ */
+async function viewImages({ paths, resolution }) {
+  const list = Array.isArray(paths) ? paths.filter((p) => typeof p === 'string' && p) : (typeof paths === 'string' ? [paths] : []);
+  if (!list.length) return { error: 'paths: give at least one image file' };
+  if (list.length > VIEW_MAX_FILES) return { error: `${list.length} files: at most ${VIEW_MAX_FILES} per call. View the most important first.` };
+  const tier = resolution || 'standard';
+  const dim = VIEW_DIMS[tier];
+  if (!dim) return { error: `resolution '${tier}': use low, standard or high` };
+  touchSessionInUse();
+  reconcileLowerToUpper();
+  const parts = [];
+  for (const p of list) {
+    const tag = crypto.randomBytes(8).toString('hex');
+    const script = [
+      'set -e',
+      `p=${shQuote(p)}`,
+      '[ -e "$p" ] || { echo "no such file" >&2; exit 2; }',
+      '[ -f "$p" ] || { echo "not a file" >&2; exit 2; }',
+      `n=$(stat -c %s -- "$p" 2>/dev/null || stat -f %z -- "$p"); [ "$n" -le ${VIEW_MAX_INPUT} ] || { echo "$n bytes; at most ${VIEW_MAX_INPUT} can be viewed" >&2; exit 2; }`,
+      'd="$KOI_OUTBOX/.koi-view"; mkdir -p "$d"',
+      `o="$d/${tag}"`,
+      // Scale down when a tool for it exists; otherwise send the file as is.
+      `if command -v convert >/dev/null 2>&1 && convert -- "$p[0]" -resize '${dim}x${dim}>' "png:$o" 2>/dev/null; then echo "png $o";`,
+      `elif python3 -c 'import PIL' 2>/dev/null && python3 - "$p" "$o" <<'PY' 2>/dev/null; then echo "png $o"; else cp -- "$p" "$o"; echo "raw $o"; fi`,
+      'import sys; from PIL import Image',
+      `im = Image.open(sys.argv[1]); im.seek(0); im.thumbnail((${dim}, ${dim})); im.save(sys.argv[2], 'PNG')`,
+      'PY',
+    ].join('\n');
+    const r = await execInSandbox(script, { cwd: BACKEND.root, timeoutMs: 60_000, outputCap: 4096 });
+    const last = (r.stdout || '').trim().split('\n').pop() || '';
+    const m = /^(png|raw) (.+)$/.exec(last);
+    if (r.exitCode !== 0 || !m || !m[2].endsWith(tag)) {
+      parts.push({ type: 'text', text: `${p}: ${((r.stderr || '').trim() || last || `exit ${r.exitCode}`).slice(0, 300)}` });
+      continue;
+    }
+    let bytes;
+    try { bytes = fs.readFileSync(m[2]); } catch (e) { parts.push({ type: 'text', text: `${p}: reading the copy failed (${e.message})` }); continue; }
+    finally { try { fs.unlinkSync(m[2]); } catch { /* already gone */ } }
+    let mime = 'image/png';
+    if (m[1] === 'raw') {
+      mime = VIEW_MIME[path.extname(p).slice(1).toLowerCase()];
+      if (!mime) { parts.push({ type: 'text', text: `${p}: not a PNG, JPEG, GIF or WebP file (and no ImageMagick/Pillow to convert it)` }); continue; }
+    }
+    parts.push({ type: 'text', text: `${p} (${bytes.length} bytes${m[1] === 'raw' ? ', not scaled: no ImageMagick or Pillow in the sandbox' : `, scaled to at most ${dim}px`})` });
+    parts.push({ type: 'image', data: bytes.toString('base64'), mimeType: mime });
+  }
+  return { parts };
+}
 
 const handlers = {
   async sandbox_exec({ command, cwd, timeout_ms, max_output }) {
@@ -3078,6 +3527,7 @@ const handlers = {
         // projects mid-session cannot keep using a stale value it noted at
         // startup and hand the user a path that does not exist.
         outbox: PROJ.dirs.outbox,
+        persist: PROJ.dirs.persist,
         overlayHostPath: projectTreeHostPath(),
         // Host-side live review of this overlay (for the USER, not for you):
         reviewCommand: `node ${SELF_PATH} review --watch`,
@@ -3103,11 +3553,97 @@ const handlers = {
     }
   },
 
+  async sandbox_fork_session({ label = null } = {}) {
+    try {
+      if (!PROJ.state) return { success: false, error: 'no project is open; call sandbox_open_project first' };
+      if (process.platform === 'darwin') {
+        // The clone backend has no layer stack to inherit -- forking there
+        // means copying the whole workspace, which is a different cost model.
+        // Refuse rather than silently giving the caller an O(repo) surprise.
+        return { success: false, error: 'sandbox_fork_session is Linux/overlayfs only (the macOS backend has no layer stack to inherit)' };
+      }
+
+      // Flush anything buffered for this session so the child's inherited view
+      // matches what this session can currently see.
+      touchSessionInUse();
+
+      // FREEZE, then branch. An overlayfs lower layer must be immutable: if
+      // the child stacked this session's LIVE upperdir, every later write by
+      // the parent would appear inside the child, which is the opposite of a
+      // fork. (That is not hypothetical -- it is what the first version of
+      // this did, and test-fork-session.mjs caught it.)
+      //
+      // So the parent's current upper is sealed into an immutable layer and
+      // BOTH sides continue on fresh, empty uppers above it. After the fork
+      // parent and child are siblings over a common frozen base, and neither
+      // can see the other's writes. Sealing is a rename -- O(1), no copy, so
+      // whiteouts are preserved exactly as the kernel wrote them.
+      const frozen = path.join(PROJ.state, `frozen-${newSessionId()}`);
+      fs.renameSync(PROJ.dirs.upper, frozen);
+      fs.mkdirSync(PROJ.dirs.upper, { recursive: true });
+      // overlayfs requires a workdir that is empty and on the same filesystem
+      // as the upper; the old one belongs to the layer just sealed.
+      try { rmrf(PROJ.dirs.work); } catch { /* best effort */ }
+      fs.mkdirSync(PROJ.dirs.work, { recursive: true });
+
+      // Deepest-first, matching the order wrap() emits --overlay-src in.
+      const stack = [...(PROJ.stack || []), frozen];
+      // The parent now reads through the frozen layer too, so its own view is
+      // unchanged by the fork. Persisted so a later resume rebuilds it.
+      PROJ.stack = stack;
+      fs.writeFileSync(path.join(PROJ.state, 'stack'), stack.join('\n') + '\n');
+
+      const childId = newSessionId();
+      const childDir = path.join(PROJ.sessionsRoot, childId);
+      for (const d of ['upper', 'work', 'lower', 'bin']) {
+        fs.mkdirSync(path.join(childDir, d), { recursive: true });
+      }
+      fs.writeFileSync(path.join(childDir, 'stack'), stack.join('\n') + '\n');
+      if (label != null && String(label).trim() !== '') {
+        fs.writeFileSync(path.join(childDir, 'label'), String(label).trim() + '\n');
+      }
+      // Keep the whole ancestry alive: the child mounts every one of these
+      // layers, and this process may well exit before the child is done with
+      // them. Frozen layers live inside their session directory, so pinning
+      // the session protects them.
+      for (const layer of stack) {
+        pinSession(layerSessionDir(layer), 'fork-parent');
+      }
+      pinSession(childDir, 'fork-child-unattached');
+
+      log(`forked session ${PROJ.sessionId} -> ${childId} (${stack.length} inherited layer(s), sealed ${path.basename(frozen)})`);
+      return {
+        success: true,
+        session: childId,
+        parent: PROJ.sessionId,
+        project: PROJ.path,
+        ...(label ? { label } : {}),
+        inheritedLayers: stack.length,
+        attach: `sandbox_open_project({ path: ${JSON.stringify(PROJ.path)}, resume: ${JSON.stringify(childId)} })`,
+        note: 'The fork sees this session\'s files as they are NOW, read-only, with its own writable layer on top. '
+          + 'From here the two sessions diverge: neither sees the other\'s later writes. '
+          + 'The outbox is shared PROJECT-wide and is NOT forked — concurrent branches writing exports will collide there.',
+      };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  },
+
   async sandbox_reset() {
     BACKEND.reset();
     try { fs.rmSync(syncManifestPath(), { force: true }); } catch { /* none */ }
     overlayUsageCache.delete(PROJ.state); // the freed space must show up immediately
-    return { success: true, session: PROJ.sessionId, note: 'overlay/workspace wiped back to host state; in-overlay git commits are gone (patches already in the outbox survive)' };
+    const forked = (PROJ.stack || []).length > 0;
+    return {
+      success: true,
+      session: PROJ.sessionId,
+      ...(forked ? { inheritedLayers: PROJ.stack.length } : {}),
+      // On a fork, "back to host state" would be a lie: reset drops only THIS
+      // session's writable layer, and the inherited ones are read-only anyway.
+      note: forked
+        ? `this session's own writes are wiped; it reverts to the forked-from state (${PROJ.stack.length} inherited layer(s) are read-only and untouched). In-overlay git commits made in THIS session are gone (patches already in the outbox survive)`
+        : 'overlay/workspace wiped back to host state; in-overlay git commits are gone (patches already in the outbox survive)',
+    };
   },
 
   async sandbox_info() {
@@ -3148,12 +3684,24 @@ const handlers = {
       // when the session dies mid-way. On an existing project it holds only
       // changed files, so it is a diagnostic, not a deliverable.
       overlayHostPath: projectTreeHostPath(),
+      ...((PROJ.stack || []).length ? {
+        forkedSession: {
+          inheritedLayers: PROJ.stack.length,
+          note: "This overlay was created by sandbox_fork_session: it starts from its parent's state and diverged there. The parent's later writes are NOT visible here, and yours are not visible to it.",
+        },
+      } : {}),
       sessionBase: PROJ.greenfield ? 'empty (greenfield — project does not exist on host yet)'
         : PROJ.resumed ? 'resumed-overlay'
         : (PROJ.startedFromHost ? 'host-tree (fresh)' : 'host-tree + this session\'s edits'),
       priorSessions: PROJ.sessionsRoot ? listProjectSessions(PROJ.sessionsRoot).filter((s) => s.id !== PROJ.sessionId) : [],
       overlayBudget: overlayBudgetStatus(),
       outbox: PROJ.dirs.outbox,
+      persist: PROJ.dirs.persist,
+      // Every path a session can see, in one place: what is writable, what
+      // outlives the session, what the host can see. Sessions kept rediscovering
+      // this by trial and error (pip --user -> EROFS, mkdir ~/x -> EROFS, a
+      // /tmp file gone one exec later).
+      paths: sandboxPathsTable(),
       reviewCommand: `node ${SELF_PATH} review --watch`,
       // Report what is ACTUALLY enforced by the live backend, not the
       // configured wish-list. The exec backend masks nothing at all, and
@@ -3234,7 +3782,7 @@ const handlers = {
           ? [`OVERLAY CACHE GC: ${LAST_OVERLAY_GC.evicted.length} old session overlay(s) were deleted to stay under the ${LAST_OVERLAY_GC.limitHuman} disk cap (${LAST_OVERLAY_GC.evicted.map((e) => e.label || e.session).join(', ')}). Those sessions can no longer be resumed; exported patches/bundles in the outbox are unaffected.`]
           : []),
         ...(LAST_OVERLAY_GC && LAST_OVERLAY_GC.overBudget
-          ? [`DISK PRESSURE: overlay cache is at ${LAST_OVERLAY_GC.usedHuman} against a ${LAST_OVERLAY_GC.limitHuman} cap and only live sessions remain, so nothing more can be reclaimed. Keep large artifacts (node_modules, build output, downloads) out of the overlay and ship finished work to the outbox.`]
+          ? [`DISK PRESSURE: overlay cache is at ${LAST_OVERLAY_GC.usedHuman} against a ${LAST_OVERLAY_GC.limitHuman} cap (cap from ${LAST_OVERLAY_GC.capFrom}; ${formatBytes(LAST_OVERLAY_GC.heldByOthers || 0)} of the bytes are another live server's session, which is never evicted), with only live sessions left, so nothing more can be reclaimed. This is deployment configuration, not the agent's doing — it needs no change of approach. Keep large artifacts (node_modules, build output, downloads) out of the overlay and ship finished work to the outbox.`]
           : []),
         'Host PATH is inherited (toolchains via fnm/nvm/rustup/pyenv work if on host PATH).',
         'Code navigation is shell-based: rg for text, ast-grep for structure, the project\'s own compiler/LSP CLI for semantics — all through sandbox_exec, all reading through the overlay. There are no navigation tools on this endpoint.',
@@ -3341,6 +3889,7 @@ async function handleMessage(msg) {
         if (OPTS.net === 'policy' && !CLIENT_CAN_PROMPT) {
           log('client did not declare the elicitation capability — network prompts are unavailable, so anything outside the allowlist will be denied.');
         }
+        if (CLIENT_CAN_PROMPT) startNetBrokerOnce();
         // Session-scoped network grants belong to the conversation that made
         // them; a new client must not inherit "allow evil.example.com".
         if (!reconnect) NET_BROKER?.resetSession(SESSION_ID);
@@ -3365,6 +3914,16 @@ async function handleMessage(msg) {
         break;
       case 'tools/call': {
         const { name, arguments: args = {} } = params || {};
+        if (name === 'view_images') {
+          try {
+            const r = await viewImages(args);
+            if (r.error) reply({ content: [{ type: 'text', text: r.error }], isError: true });
+            else reply({ content: r.parts, isError: !r.parts.some((x) => x.type === 'image') });
+          } catch (e) {
+            reply({ content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
+          }
+          break;
+        }
         const handler = handlers[name];
         if (handler) {
           try {

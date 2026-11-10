@@ -142,6 +142,15 @@ trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 130' INT
 trap cleanup EXIT
 
+# squid's own log. Its FATALs land here, not on stdout/stderr, so without this
+# a proxy that dies at boot is reported with an empty log.
+dump_squid_cache_log() {
+  local f="${KOI_SQUID_DIR:-${KOI_HOME:-$HOME/.koi}/squid}/cache.log"
+  [ -s "$f" ] || return 0
+  echo "  squid cache.log (last 20 lines, $f):" >&2
+  tail -n 20 "$f" | sed 's/^/  | /' >&2
+}
+
 start_proxy() {
   PROXY_LOG="$(mktemp -t koi-egress.XXXXXX.log)"
   /bin/bash ./koi-net-setup.sh proxy >"$PROXY_LOG" 2>&1 &
@@ -155,6 +164,7 @@ start_proxy() {
     if ! kill -0 "$PROXY_PID" 2>/dev/null; then
       echo "run-gateway: the egress proxy exited during startup. Its log:" >&2
       sed 's/^/  | /' "$PROXY_LOG" >&2
+      dump_squid_cache_log
       wait "$PROXY_PID" 2>/dev/null || true
       PROXY_PID=""
       return 1
@@ -171,6 +181,7 @@ start_proxy() {
   echo "run-gateway: the egress proxy did not start listening on 127.0.0.1:${KOI_PROXY_PORT}" >&2
   echo "  within 20s. Its log:" >&2
   sed 's/^/  | /' "$PROXY_LOG" >&2
+  dump_squid_cache_log
   return 1
 }
 

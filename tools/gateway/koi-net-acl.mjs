@@ -8,8 +8,17 @@
 //   reply:                <channel-id> SP OK|ERR [SP key="value"]... LF
 //
 // The fields are whatever koi-squid.conf's `external_acl_type` format string
-// asks for; this helper expects, in order:  %DST %PORT %METHOD %URI
-// Squid percent-encodes each field, so they are decoded before use.
+// asks for; this helper expects, in order:
+//   %DST %PORT %METHOD %URI %>{Proxy-Authorization}
+// Squid percent-encodes each field, so they are decoded before use. The last
+// one is optional (an older squid config sends four fields).
+//
+// Who is asked: the request's Proxy-Authorization carries the token of the
+// sandbox it came from (koi-net-policy.mjs, "Per-sandbox identity"), and an
+// ask goes to THAT sandbox's broker socket only. If it has none -- its client
+// cannot prompt, or the server has exited -- the ask is denied; it is never
+// offered to another sandbox's user. A request without a token is asked on
+// the shared --sock, as before.
 //
 // Decision order:
 //   1. policy file explicit deny        -> ERR
@@ -30,6 +39,7 @@ import path from 'path';
 import {
   DEFAULT_POLICY_PATH, DEFAULT_BROKER_SOCK,
   loadPolicy, evaluate, upsertRule, ApprovalClient,
+  sandboxBrokerSock, tokenFromProxyAuth,
 } from './koi-net-policy.mjs';
 
 function parseArgs(argv) {
@@ -64,11 +74,14 @@ function usage() {
   process.stdout.write([
     'usage: koi-net-acl.mjs [--policy FILE] [--sock PATH] [--timeout-ms MS] [--debug]',
     '',
-    '  Squid external ACL helper. Reads "[id] DST PORT METHOD URI" lines on stdin,',
+    '  Squid external ACL helper. Reads "[id] DST PORT METHOD URI [PROXY-AUTH]"',
+    '  lines on stdin,',
     '  writes "[id] OK" / "[id] ERR message=..." on stdout.',
     '',
     `  --policy      policy file (default ${DEFAULT_POLICY_PATH})`,
-    `  --sock        approval broker socket (default ${DEFAULT_BROKER_SOCK})`,
+    `  --sock        approval broker socket for requests with no sandbox token`,
+    `                (default ${DEFAULT_BROKER_SOCK}); per-sandbox sockets live`,
+    '                in approval.d/ next to it',
     '  --timeout-ms  how long to hold a request waiting for the user (default 60000,',
     '                or KOI_APPROVAL_TIMEOUT_MS). A late answer is still recorded,',
     '                so a slower click means "retry", not "denied".',
@@ -104,14 +117,34 @@ function currentPolicy() {
   return policy;
 }
 
-/** Session-scoped grants. Cleared when the broker reports a new session. */
-let sessionRules = [];
-
-const approvals = new ApprovalClient({ socketPath: OPTS.sock, timeoutMs: OPTS.timeoutMs });
-approvals.onSessionReset = (session) => {
-  sessionRules = [];
-  debug(`session reset (${session}) — session grants cleared`);
+/**
+ * Session-scoped grants, per sandbox ('' = requests with no token). A grant
+ * one person made for their session must not open the host for another
+ * sandbox, and one sandbox starting a new session clears only its own.
+ */
+const sessionRulesBy = new Map();
+const sessionRulesOf = (token) => {
+  let r = sessionRulesBy.get(token);
+  if (r === undefined) { r = []; sessionRulesBy.set(token, r); }
+  return r;
 };
+
+/** One broker connection per sandbox socket, made on first ask. */
+const approvalClients = new Map();
+function approvalsFor(token) {
+  let c = approvalClients.get(token);
+  if (c === undefined) {
+    const socketPath = token ? sandboxBrokerSock(token, OPTS.sock) : OPTS.sock;
+    c = new ApprovalClient({ socketPath, timeoutMs: OPTS.timeoutMs });
+    c.onSessionReset = (session) => {
+      sessionRulesBy.set(token, []);
+      debug(`session reset (${session}) for ${token || 'unattributed'} — its session grants cleared`);
+    };
+    approvalClients.set(token, c);
+  }
+  return c;
+}
+const closeApprovals = () => { for (const c of approvalClients.values()) c.close(); };
 
 /**
  * `CONNECT github.com:443` carries no method or path: over TLS the proxy sees
@@ -125,9 +158,10 @@ function describe(host, port, method) {
     : `${method} ${host}:${port}`;
 }
 
-async function decide(host, port, method, uri) {
+async function decide(host, port, method, uri, token = '') {
   if (host === '') return { ok: false, message: 'no destination host' };
 
+  const sessionRules = sessionRulesOf(token);
   const verdict = evaluate(currentPolicy(), { host, port }, sessionRules);
   if (verdict.decision === 'allow') {
     debug(`allow ${host}:${port} (rule ${verdict.rule?.host ?? 'default'})`);
@@ -160,7 +194,7 @@ async function decide(host, port, method, uri) {
     }
   };
 
-  const answer = await approvals.ask({
+  const answer = await approvalsFor(token).ask({
     host,
     port,
     method,
@@ -175,7 +209,11 @@ async function decide(host, port, method, uri) {
       applyScope(a);
     },
   });
-  debug(`ask ${host}:${port} -> ${answer.decision}/${answer.scope}`);
+  debug(`ask ${host}:${port} (${token || 'unattributed'}) -> ${answer.decision}/${answer.scope}`);
+  if (token && answer.noChannel) {
+    answer.reason = 'not in the network allowlist, and nobody can approve it for this sandbox '
+      + '(its client cannot prompt, or its server has exited)';
+  }
 
   // A timeout is not a decision: recording it would write a `deny` rule for a
   // question the user is still looking at.
@@ -209,9 +247,10 @@ async function handleLine(line) {
   const port = Number(unesc(fields[1])) || 443;
   const method = unesc(fields[2]).toUpperCase();
   const uri = unesc(fields[3]);
+  const token = tokenFromProxyAuth(unesc(fields[4])) || '';
 
   try {
-    reply(channel, await decide(host, port, method, uri));
+    reply(channel, await decide(host, port, method, uri, token));
   } catch (e) {
     reply(channel, { ok: false, message: `policy helper error: ${e.message}` });
   }
@@ -228,5 +267,5 @@ process.stdin.on('data', (chunk) => {
   // every other request behind it.
   for (const line of lines) if (line.trim() !== '') void handleLine(line);
 });
-process.stdin.on('end', () => { approvals.close(); process.exit(0); });
-process.on('SIGTERM', () => { approvals.close(); process.exit(0); });
+process.stdin.on('end', () => { closeApprovals(); process.exit(0); });
+process.on('SIGTERM', () => { closeApprovals(); process.exit(0); });

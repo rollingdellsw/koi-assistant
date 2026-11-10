@@ -40,9 +40,57 @@ import crypto from 'crypto';
 export const KOI_HOME = process.env.KOI_HOME || path.join(os.homedir(), '.koi');
 export const DEFAULT_POLICY_PATH =
   process.env.KOI_NETWORK_POLICY || path.join(KOI_HOME, 'network-policy.json');
-/** Broker socket. Not per-session: Squid and its helper outlive one session. */
+/**
+ * The shared broker socket. Only requests that carry NO sandbox identity are
+ * asked here (a tool that ignored the proxy credentials, or a server older
+ * than per-sandbox routing). Current servers never bind it: each one asks on
+ * its own socket, see sandboxBrokerSock().
+ */
 export const DEFAULT_BROKER_SOCK =
   process.env.KOI_NETWORK_SOCK || path.join(KOI_HOME, 'approval.sock');
+
+// -----------------------------------------------------------------------------
+// Per-sandbox identity
+// -----------------------------------------------------------------------------
+// One proxy serves every sandbox server on the machine (the gateway's, and any
+// other process that spawns sandbox-shell-mcp.mjs --net policy), and all their
+// traffic reaches it from 127.0.0.1. So that an "ask" reaches the person who
+// owns the request -- or nobody -- each server mints a random token, puts it
+// in the sandbox's proxy URL as Basic credentials (http://koi:<token>@gw:port),
+// and listens on a socket named after it. Squid hands the helper the
+// Proxy-Authorization header; the helper asks that socket and no other.
+//
+// The token is an address, not a secret that grants anything: forging another
+// sandbox's token could at most route an ask to that sandbox's dialog, which
+// still shows the host being requested. Nothing is allowed by holding one.
+
+export const SANDBOX_TOKEN_RE = /^[0-9a-f]{32}$/;
+
+export function newSandboxToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/** `<dir of the shared socket>/approval.d/<token>.sock` */
+export function sandboxBrokerSock(token, baseSock = DEFAULT_BROKER_SOCK) {
+  if (!SANDBOX_TOKEN_RE.test(token)) throw new Error('bad sandbox token');
+  return path.join(path.dirname(baseSock), 'approval.d', `${token}.sock`);
+}
+
+/**
+ * The sandbox token from a Proxy-Authorization value (`Basic base64(koi:T)`),
+ * or null when absent or not one of ours. Never throws: a malformed header is
+ * just an unattributed request.
+ */
+export function tokenFromProxyAuth(value) {
+  const m = /^\s*basic\s+([A-Za-z0-9+/=]+)\s*$/i.exec(value || '');
+  if (!m) return null;
+  let decoded;
+  try { decoded = Buffer.from(m[1], 'base64').toString('utf8'); } catch { return null; }
+  const i = decoded.indexOf(':');
+  if (i < 0) return null;
+  const token = decoded.slice(i + 1);
+  return SANDBOX_TOKEN_RE.test(token) ? token : null;
+}
 
 const VALID_DECISIONS = new Set(['allow', 'deny', 'ask']);
 
@@ -406,7 +454,7 @@ export class ApprovalClient {
   async ask({ host, port, method, uri, onLate }) {
     const ok = await this.connect();
     if (!ok) {
-      return { decision: 'deny', scope: 'once', reason: 'no approval channel (no session attached)' };
+      return { decision: 'deny', scope: 'once', noChannel: true, reason: 'no approval channel (no session attached)' };
     }
     const id = crypto.randomUUID();
     return new Promise((resolve) => {

@@ -30,6 +30,11 @@ acl koi_local src ::1/128
 acl koi_ports port 80 443
 acl CONNECT method CONNECT
 
+# %>{Proxy-Authorization} is how the helper knows WHICH sandbox asked: every
+# sandbox server puts its own token in its proxy URL (koi-net-policy.mjs,
+# "Per-sandbox identity"). There is no auth_param, so squid never challenges;
+# clients send the Basic credentials preemptively (git is told to with
+# GIT_HTTP_PROXY_AUTHMETHOD=basic).
 # The policy helper. concurrency=32 so one parked approval dialog does not
 # stall the other 31 requests a package install has in flight. ttl=0 because
 # the helper owns caching — Squid caching a decision would outlive a "once"
@@ -38,7 +43,7 @@ acl CONNECT method CONNECT
 # answer while re-checking, which would quietly extend a one-time grant.
 external_acl_type koi_policy \
   ttl=0 negative_ttl=0 grace=0 concurrency=32 children-max=1 children-startup=1 \
-  %DST %PORT %METHOD %URI \
+  %DST %PORT %METHOD %URI %>{Proxy-Authorization} \
   @NODE@ @HELPER@ --policy @POLICY@ --sock @SOCK@
 
 acl koi_allowed external koi_policy
@@ -80,6 +85,9 @@ maximum_object_size_in_memory 0 KB
 access_log stdio:@CACHEDIR@/access.log
 cache_log @CACHEDIR@/cache.log
 pid_filename @CACHEDIR@/squid.pid
+# Default is /var/spool/squid/netdb.state, which a user-level squid cannot
+# write ("netdbSaveState ... Permission denied" in cache.log every hour).
+netdb_filename stdio:@CACHEDIR@/netdb.state
 coredump_dir @CACHEDIR@
 
 # Single worker. SMP mode adds shared-memory segments and a coordinator process

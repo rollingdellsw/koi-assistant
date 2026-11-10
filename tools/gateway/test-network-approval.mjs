@@ -49,6 +49,7 @@ import { fileURLToPath } from 'url';
 import {
   parseAllowFile, loadPolicy, savePolicy, emptyPolicy, ensurePolicy,
   hostMatches, evaluate, upsertRule, isLoopbackHost,
+  ApprovalBroker, newSandboxToken, sandboxBrokerSock, tokenFromProxyAuth,
 } from './koi-net-policy.mjs';
 
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -97,6 +98,18 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 // =============================================================================
 async function suitePolicy() {
   if (!suite(1, 'Policy engine')) return;
+
+  await test('a sandbox token is read back from its proxy credentials only', () => {
+    const t = newSandboxToken();
+    const basic = (s) => `Basic ${Buffer.from(s).toString('base64')}`;
+    assert.equal(tokenFromProxyAuth(basic(`koi:${t}`)), t);
+    assert.equal(tokenFromProxyAuth(`  basic ${Buffer.from(`koi:${t}`).toString('base64')} `), t);
+    for (const v of ['', null, undefined, '-', 'Bearer x', basic('koi:short'), basic(t), basic(`koi:${t}x`), 'Basic !!!']) {
+      assert.equal(tokenFromProxyAuth(v), null, `accepted ${v}`);
+    }
+    assert.match(sandboxBrokerSock(t, '/k/approval.sock'), new RegExp(`^/k/approval\\.d/${t}\\.sock$`));
+    assert.throws(() => sandboxBrokerSock('../../etc/x', '/k/approval.sock'));
+  });
 
   await test('exact and wildcard host matching', () => {
     assert.equal(hostMatches('github.com', 'github.com'), true);
@@ -283,7 +296,10 @@ async function suitePolicy() {
 // =============================================================================
 
 /** Drive koi-net-acl.mjs the way Squid does. */
-function startHelper({ policyFile, sock, timeoutMs = 4000, concurrency = true }) {
+function startHelper({ policyFile, sock, timeoutMs = 4000, concurrency = true, token = null }) {
+  // The 5th field is what squid sends for %>{Proxy-Authorization}: the
+  // sandbox's token as Basic credentials, or "-" when the client sent none.
+  const auth = token ? `Basic ${Buffer.from(`koi:${token}`).toString('base64')}` : '-';
   const args = ['--policy', policyFile, '--sock', sock, '--timeout-ms', String(timeoutMs)];
   const child = spawn(process.execPath, [HELPER, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
   const waiters = new Map();
@@ -309,7 +325,8 @@ function startHelper({ policyFile, sock, timeoutMs = 4000, concurrency = true })
       const id = String(++seq);
       return new Promise((resolve) => {
         waiters.set(id, resolve);
-        const fields = [host, port, method, uri].map(encodeURIComponent).join(' ');
+        const fields = [host, port, method, uri].map(encodeURIComponent).join(' ')
+          + ' ' + (auth === '-' ? '-' : encodeURIComponent(auth));
         child.stdin.write(concurrency ? `${id} ${fields}\n` : `${fields}\n`);
       });
     },
@@ -491,6 +508,20 @@ async function waitForSocket(p, ms = 8000) {
   return false;
 }
 
+/** The token of the one per-sandbox broker socket under `home`, once it accepts. */
+async function waitForSandboxSocket(home, ms = 8000) {
+  const dir = path.join(home, 'approval.d');
+  const started = Date.now();
+  while (Date.now() - started < ms) {
+    const names = fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => n.endsWith('.sock')) : [];
+    if (names.length === 1 && await waitForSocket(path.join(dir, names[0]), 200)) {
+      return names[0].slice(0, -'.sock'.length);
+    }
+    await wait(100);
+  }
+  return null;
+}
+
 async function suiteLoop() {
   if (!suite(3, 'Approval loop (server + helper + fake side panel)')) return;
 
@@ -506,6 +537,7 @@ async function suiteLoop() {
   cleanup.push(() => server.stop());
 
   let helper = null;
+  let token = null;
   try {
     await test('server starts in policy mode and seeds a policy file', async () => {
       const init = await server.rpc('initialize', {
@@ -515,7 +547,9 @@ async function suiteLoop() {
       });
       assert.ok(init.serverInfo, 'no serverInfo in initialize result');
       assert.ok(fs.existsSync(policyFile), `policy file not created at ${policyFile}`);
-      assert.ok(await waitForSocket(sock), `approval broker never listened on ${sock}`);
+      token = await waitForSandboxSocket(home);
+      assert.ok(token, `approval broker never listened in ${path.join(home, 'approval.d')}`);
+      assert.ok(!fs.existsSync(sock), 'the server must not bind the shared socket');
     });
 
     await test('sandbox_network_policy reports the seeded rules', async () => {
@@ -527,7 +561,7 @@ async function suiteLoop() {
       assert.match(body.unmatched, /prompts the user/);
     });
 
-    helper = startHelper({ policyFile, sock, timeoutMs: 15_000 });
+    helper = startHelper({ policyFile, sock, timeoutMs: 15_000, token });
     cleanup.push(() => helper.stop());
 
     await test('pre-allowed host never reaches the user', async () => {
@@ -660,7 +694,7 @@ async function suiteLoop() {
       // "approve it and retry" first and keeps the prompt open. The regression
       // this guards: throwing the late answer away, which made the retry
       // prompt all over again — an approval the user gave and never got.
-      const slow = startHelper({ policyFile, sock, timeoutMs: 1200 });
+      const slow = startHelper({ policyFile, sock, timeoutMs: 1200, token });
       try {
         let release;
         const held = new Promise((r) => { release = r; });
@@ -705,6 +739,82 @@ async function suiteLoop() {
 // =============================================================================
 // 4. Over the gateway WebSocket (optional)
 // =============================================================================
+// =============================================================================
+// 3b. Isolation: several sandbox servers share one proxy
+// =============================================================================
+// The regression: every policy-mode server unlinked and re-bound the ONE
+// shared broker socket, so a headless server (an agent runtime that cannot
+// prompt) took the gateway's prompts away, and deleted the socket on exit.
+// And with one socket, nothing said whose request a prompt was about.
+
+async function suiteIsolation() {
+  if (!suite(3, 'Isolation between sandbox servers (shared proxy)')) return;
+
+  const home = tmpHome('iso');
+  const project = path.join(home, 'project');
+  fs.mkdirSync(project, { recursive: true });
+  cleanup.push(() => fs.rmSync(home, { recursive: true, force: true }));
+  const policyFile = path.join(home, 'network-policy.json');
+  const shared = path.join(home, 'approval.sock');
+
+  // Stands in for whoever owns the shared socket (an older server).
+  const sharedAsked = [];
+  const owner = new ApprovalBroker({
+    socketPath: shared,
+    asker: async (req) => { sharedAsked.push(req.host); return { decision: 'allow', scope: 'once' }; },
+  }).start();
+  cleanup.push(() => owner.stop());
+  assert.ok(await waitForSocket(shared), 'fake shared broker did not start');
+
+  const headless = startServer({ home, project });
+  cleanup.push(() => headless.stop());
+  let helper = null;
+  try {
+    await test('a client that cannot prompt gets no socket, and leaves the shared one alone', async () => {
+      await headless.rpc('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        clientInfo: { name: 'headless-agent', version: '1.0.0' },
+      });
+      await wait(400);
+      const dir = path.join(home, 'approval.d');
+      const socks = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+      assert.deepEqual(socks, [], `a headless server created ${socks}`);
+      assert.ok(await waitForSocket(shared, 500), 'the shared socket was taken over');
+      const res = await headless.rpc('tools/call', { name: 'sandbox_network_policy', arguments: {} });
+      assert.match(JSON.parse(res.content[0].text).unmatched, /^denied/);
+    });
+
+    await test('an ask with a sandbox token reaches no other sandbox', async () => {
+      helper = startHelper({ policyFile, sock: shared, timeoutMs: 3000, token: newSandboxToken() });
+      const r = await helper.ask('stranger.test');
+      assert.ok(r.startsWith('ERR'), `expected a denial, got ${r}`);
+      assert.match(r, /nobody can approve/, r);
+      assert.deepEqual(sharedAsked, [], 'a tokened ask leaked to the shared socket');
+    });
+
+    await test('an ask with no token still goes to the shared socket', async () => {
+      const legacy = startHelper({ policyFile, sock: shared, timeoutMs: 3000 });
+      try {
+        assert.equal(await legacy.ask('legacy.test'), 'OK');
+        assert.deepEqual(sharedAsked, ['legacy.test']);
+      } finally {
+        legacy.stop();
+      }
+    });
+
+    await test('a server exiting does not delete the shared socket', async () => {
+      headless.stop();
+      await wait(500);
+      assert.ok(fs.existsSync(shared), 'the shared socket was unlinked by another server');
+      assert.ok(await waitForSocket(shared, 500), 'the shared socket stopped accepting');
+    });
+  } finally {
+    helper?.stop();
+    headless.stop();
+  }
+}
+
 async function suiteGateway() {
   if (gatewayUrl === null) return;
   if (!suite(4, `Gateway round trip (${gatewayUrl})`)) return;
@@ -970,6 +1080,17 @@ async function suiteEnforcement() {
     const r = await inConfine('echo "ran=$? proxy=$HTTPS_PROXY"');
     assert.match(r.out, /ran=0/, `payload did not run: ${r.out}${r.err}`);
     assert.match(r.out, /proxy=http:\/\/127\.0\.0\.1:3199/, 'HTTPS_PROXY not exported');
+  });
+
+  await test('the sandbox token rides in the proxy URL, and git is told to send it', async () => {
+    const t = newSandboxToken();
+    const r = await inNetns(
+      `KOI_PROXY_HOST=127.0.0.1 KOI_PROXY_PORT=3199 KOI_PROXY_TOKEN=${t} ` +
+      `${shq(SETUP)} confine -- /bin/bash -c ${shq('echo "p=$HTTPS_PROXY t=${KOI_PROXY_TOKEN:-unset} g=$GIT_HTTP_PROXY_AUTHMETHOD"')}`,
+    );
+    assert.match(r.out, new RegExp(`p=http://koi:${t}@127\\.0\\.0\\.1:3199 `), r.out + r.err);
+    assert.match(r.out, /t=unset/, 'KOI_PROXY_TOKEN should not linger in the payload env');
+    assert.match(r.out, /g=basic/, r.out);
     assert.equal(r.code, 0, `confine exited ${r.code}: ${r.err}`);
   });
 
@@ -1000,6 +1121,7 @@ async function main() {
   await suitePolicy();
   await suiteHelper();
   await suiteLoop();
+  await suiteIsolation();
   await suiteGateway();
   await suiteLiveProxy();
   await suiteEnforcement();

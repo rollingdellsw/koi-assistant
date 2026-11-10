@@ -54,6 +54,14 @@ KOI_SQUID_SERVICE="$(printf '%s' "${KOI_SQUID_SERVICE}" | tr -cd '[:alnum:]')"
 : "${KOI_NETWORK_SOCK:=${KOI_HOME}/approval.sock}"
 : "${KOI_SQUID_DIR:=${KOI_HOME}/squid}"
 
+# nft and squid live in /usr/sbin on Debian/Ubuntu, and a PATH handed down by
+# a service manager (a systemd unit's EnvironmentFile, an agent runtime) often
+# stops at /bin. Then preflight reports both MISSING with the packages
+# installed, the sandbox server exits at boot, and `confine` would refuse
+# every command for "nft missing". Look where they are installed.
+case ":${PATH}:" in *:/usr/sbin:*) ;; *) PATH="${PATH}:/usr/local/sbin:/usr/sbin:/sbin" ;; esac
+export PATH
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Is something LISTENING on this port?
@@ -289,11 +297,34 @@ cmd_proxy() {
     echo "koi-net-setup: this squid does not accept -n; using the default shm namespace." >&2
   fi
 
+  # A stale pid file from an earlier boot. Squid refuses to start when the pid
+  # it names is alive -- and after a reboot that pid is routinely reused by an
+  # unrelated process (seen: the distro squid.service, running as root, so
+  # kill(pid,0) gives EPERM, which squid also counts as "already running").
+  # It exits before cache.log is opened, so nothing explains the failure.
+  # Only OUR squid may hold this pid file: if the named process is not a squid
+  # started with our config, the file is stale and goes.
+  local pidf="${KOI_SQUID_DIR}/squid.pid" oldpid
+  if [ -f "$pidf" ]; then
+    oldpid="$(tr -cd '0-9' < "$pidf")"
+    if [ -n "$oldpid" ] && tr '\0' ' ' < "/proc/${oldpid}/cmdline" 2>/dev/null | grep -qF -- "${conf}"; then
+      echo "koi-net-setup: our squid (pid ${oldpid}) is still running; refusing to start a second one." >&2
+      exit 1
+    fi
+    echo "koi-net-setup: removing stale ${pidf} (pid ${oldpid:-?} is not our squid)" >&2
+    rm -f "$pidf"
+  fi
+
   # Our own stale segments, from a crash or a SIGKILL. Scoped to our service
   # name so this can never delete a running squid's memory.
   rm -f "/dev/shm/${KOI_SQUID_SERVICE}-"*.shm 2>/dev/null || true
 
-  exec squid -N "${nflag[@]}" -f "${conf}"
+  # -d 1: also copy cache.log messages (level 0-1, i.e. every FATAL and
+  # startup error) to stderr. Without it squid writes them ONLY to
+  # ${KOI_SQUID_DIR}/cache.log, so run-gateway.sh's captured proxy log was
+  # empty exactly when it mattered: "the egress proxy exited during startup.
+  # Its log:" followed by nothing.
+  exec squid -N -d 1 "${nflag[@]}" -f "${conf}"
 }
 
 # -----------------------------------------------------------------------------
@@ -325,7 +356,14 @@ table inet koi {
   }
 }
 NFT
-    export HTTP_PROXY="http://${gw}:${KOI_PROXY_PORT}"
+    # The sandbox's token as proxy credentials: it is how the proxy's helper
+    # routes an approval prompt to this sandbox's owner and nobody else
+    # (koi-net-policy.mjs, "Per-sandbox identity"). Absent = unattributed.
+    export HTTP_PROXY="http://${KOI_PROXY_TOKEN:+koi:${KOI_PROXY_TOKEN}@}${gw}:${KOI_PROXY_PORT}"
+    unset KOI_PROXY_TOKEN
+    # libcurl under git waits for a 407 before sending proxy credentials
+    # (proxyAuthMethod=anyauth), and this proxy never sends one.
+    export GIT_HTTP_PROXY_AUTHMETHOD=basic
     export HTTPS_PROXY="${HTTP_PROXY}"
     export http_proxy="${HTTP_PROXY}"
     export https_proxy="${HTTP_PROXY}"

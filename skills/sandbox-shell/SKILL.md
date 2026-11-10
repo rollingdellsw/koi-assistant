@@ -1,6 +1,6 @@
 ---
 name: sandbox-shell
-version: 2.5.0
+version: 2.5.1
 description: >-
   A shell on the user's machine inside a safety sandbox — the bridge to the
   local filesystem and toolchain. Load this whenever a task touches the
@@ -17,7 +17,11 @@ description: >-
   liberally. Code navigation is done with the host's own CLIs through the
   shell — a language server front-end (semantic), ast-grep (structural),
   ripgrep (text) — not with dedicated tools. Not needed for purely
-  in-browser/web tasks with no local-file or local-execution component.
+  in-browser/web tasks with no local-file or local-execution component,
+  and not for checking the output of another skill that has its own
+  checks (a spreadsheet's values, a document's or deck's layout): use
+  that skill's tools, and load this only when the task's data or tools
+  are on the user's machine.
 runnable: true
 mcp-servers:
   - name: sandbox
@@ -43,8 +47,10 @@ allowed-tools:
   - sandbox_service_logs
   - sandbox_stop_service
   - sandbox_reset
+  - sandbox_fork_session
   - sandbox_info
   - sandbox_network_policy
+  - view_images
 guardrails: scripts/guardrail.js
 reminders:
   - id: "sandbox:prefer-lsp"
@@ -95,7 +101,24 @@ including code navigation — is a command you run in it.
    delivery there is automatic and cannot fail. See "Shipping changes".
 3. **Edits Are Shell Writes:** All edits are made via `sandbox_exec` (e.g. atomic Python scripts or `cat << 'EOF' > file`). They land in the overlay, and every later command reads through the overlay — so a tool you run in the next turn already sees them. Nothing needs to be re-synced. If the **user** changes files on the host mid-session (e.g. applies your patches), every `sandbox_exec` pulls their versions in automatically before it runs, and reports it in `hostSync` — read that field when it appears (see "When the host changes under you").
 4. **No Guessing:** Never guess the outbox path or context lines for a patch. Always read the file or call `sandbox_info` first.
-5. **Masked Paths:** The host's `/tmp`, `/run`, and credential files (`~/.ssh`, `~/.aws`, etc.) are hidden for security. **Never** tell the user these files "do not exist". Explicitly state: _"This path is masked from the sandbox."_ If you need them for a build, ask the user to restart the MCP server with `--allow-creds`.
+5. **Masked Paths:** Credential files (`~/.ssh`, `~/.aws`, etc. — the exact list is `sandbox_info.maskedCredentials`) are hidden for security. **Never** tell the user these files "do not exist". Explicitly state: _"This path is masked from the sandbox."_ If you need them for a build, ask the user to restart the MCP server with `--allow-creds`. `/tmp` is **not** masked: it is your own scratch directory (see "Where you can write").
+
+## Where you can write
+
+`sandbox_info.paths` returns this table for the live session.
+
+| Path                            | Writable | Survives                                          | Host sees it                                                 |
+| ------------------------------- | -------- | ------------------------------------------------- | ------------------------------------------------------------ |
+| The open project                | yes      | this session's overlay (until reset / eviction)   | no — ship it via the outbox                                  |
+| `/tmp`                          | yes      | across commands, for this session; reset wipes it | no — it is your own scratch dir, not the host's `/tmp`       |
+| `$KOI_OUTBOX`                   | yes      | yes, across sessions                              | **yes** — the only way out. May hold files from earlier runs |
+| `$KOI_PERSIST`                  | yes      | yes, across sessions; never evicted               | **yes** — the user's personal store (`~/.koi/persist/<project>-<id>`) for things a skill keeps for them; not a deliverable, never the project tree |
+| Everything else (incl. `$HOME`) | **no**   | —                                                 | it is the host, read-only: `pip --user`, `mkdir ~/x` → EROFS |
+| Credential paths                | no       | —                                                 | masked                                                       |
+
+Use `/tmp` freely for scratch files, venvs and throwaway installs
+(`python3 -m venv /tmp/venv`, `npm install --prefix /tmp/x ...`). Outside a
+project, it is the only writable place besides the outbox.
 
 ## Quick shell mode (no project needed)
 
@@ -146,6 +169,32 @@ Never report work as lost without checking `priorSessions` first.
 | Outbox       | `$KOI_OUTBOX` in your shell; files written there appear on the host                                             |
 | Overlay path | `sandbox_info.overlayHostPath` — the overlay's host-side location. On greenfield this is the whole project tree |
 | Services     | Long-running processes owned by the server (e.g. dev servers)                                                   |
+
+### Branching a session (`sandbox_fork_session`)
+
+`sandbox_fork_session` mints a second overlay that **starts from this session's
+current state, uncommitted edits included**, and returns its id. It is O(1) —
+the fork stacks this session's layers read-only instead of copying them, so
+forking a session that touched a 2GB tree costs nothing.
+
+From the fork point the two sessions **diverge**: neither sees the other's
+later writes. That is the point — it is what lets two agents attempt the same
+task without colliding.
+
+```
+sandbox_fork_session({ label: "branch-1" })   ->  { session: "<id>", ... }
+# then, in the OTHER process:
+sandbox_open_project({ path: "<same project>", resume: "<id>" })
+```
+
+One server has one live session, so the fork is normally attached by a
+_different_ process (another agent). Two things do **not** fork, and both bite
+in a swarm:
+
+- **The outbox is project-wide.** Concurrent branches exporting patches write
+  to the same directory and will overwrite each other. Have one branch ship.
+- **Services and bound ports** are not forked. Two branches restarting the same
+  dev server fight over the port.
 
 ## Navigating code (all through `sandbox_exec`)
 
@@ -211,6 +260,16 @@ If `ast-grep` is missing, tell the user how to install it
 Same-named symbols in unrelated modules all match, and a re-exported or aliased
 symbol will not. When a rename has to be exhaustive, confirm with the
 compiler after the edit, not with the search before it.
+
+## Looking at images you made (`view_images`)
+
+The shell returns text. To see a picture you produced in the sandbox (a chart or
+diagram from Python, a page rendered to PNG, a screenshot file), call
+`view_images({ paths: ["/tmp/chart.png"], resolution? })`: each file comes back
+as an image. Paths are as the shell sees them (overlay and `/tmp` included), at
+most 6 per call; `resolution` is `low` (480px), `standard` (1080px, default) or
+`high` (1920px). Convert PDFs and other formats to PNG first (`pdftoppm -png`).
+Check a generated figure this way before putting it in a document or deck.
 
 ## Build / test / services
 
