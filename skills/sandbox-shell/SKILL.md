@@ -1,6 +1,6 @@
 ---
 name: sandbox-shell
-version: 2.5.1
+version: 2.7.0
 description: >-
   A shell on the user's machine inside a safety sandbox — the bridge to the
   local filesystem and toolchain. Load this whenever a task touches the
@@ -51,6 +51,7 @@ allowed-tools:
   - sandbox_info
   - sandbox_network_policy
   - view_images
+  - run_host_command
 guardrails: scripts/guardrail.js
 reminders:
   - id: "sandbox:prefer-lsp"
@@ -94,7 +95,7 @@ including code navigation — is a command you run in it.
 
 👑 **The Golden Rules:**
 
-1. **Read-Only Host:** You cannot modify the host directly. All writes go to your local overlay.
+1. **Read-Only Host:** You cannot modify the host directly. All writes go to your local overlay. The one exception is `run_host_command`, which runs only after the person clicks Run (see "Changing the host itself").
 2. **Delivery:** For an EXISTING project, the only way to send files to the user
    is `$KOI_OUTBOX`. For a GREENFIELD project the overlay tree is itself
    host-visible at `sandbox_info.overlayHostPath` and the user copies it out —
@@ -103,18 +104,53 @@ including code navigation — is a command you run in it.
 4. **No Guessing:** Never guess the outbox path or context lines for a patch. Always read the file or call `sandbox_info` first.
 5. **Masked Paths:** Credential files (`~/.ssh`, `~/.aws`, etc. — the exact list is `sandbox_info.maskedCredentials`) are hidden for security. **Never** tell the user these files "do not exist". Explicitly state: _"This path is masked from the sandbox."_ If you need them for a build, ask the user to restart the MCP server with `--allow-creds`. `/tmp` is **not** masked: it is your own scratch directory (see "Where you can write").
 
+## Changing the host itself (`run_host_command`)
+
+Some work cannot happen in the overlay: a missing system package
+(`sudo apt-get install -y ...`), a global tool (`npm -g`, `pipx`, `cargo install`),
+a container image, a host service, a file that must change on the real machine.
+For those call `run_host_command({ why, command, checks? })`. It runs **outside
+the sandbox, as the user**, and only after the person has seen `why` and the
+exact `command` and clicked **Run**. Every call asks, even in full-auto, and
+nothing is remembered.
+
+- **Last resort, not a shortcut.** Reading, building, testing and editing the
+  project stay in `sandbox_exec` + the outbox. Never use it to get around a
+  guardrail block, a masked path or a network denial.
+- **Ask once, for everything.** One `set -e`, non-interactive script, safe to
+  run twice (`apt-get -y`, `mkdir -p`, `npm i -g x@1.2.3`). There is no terminal
+  and no stdin. Runs in the open project's directory, or `$HOME` (`cwd` overrides).
+- **sudo is `sudo -n`.** If it needs a password the command fails, and the result
+  says so. Do not retry. Give the person the command to run themselves (see below).
+- **Session grants.** The dialog lets the person allow the exact command for the
+  rest of the session. If you expect to repeat a command with other arguments, pass
+  `allow_prefix` (e.g. `"sudo apt-get install -y"`) so they can allow
+  `<prefix> <args>` instead. It must be whole leading words of a single simple
+  command (no newline or `; & | < > \` $ ( ) { } \`). It can't be a shell or
+  interpreter, and with sudo it must name the program. Later calls that match
+  run without a prompt, and the result says `approvedBy`. If the server refuses
+  your prefix, the result explains why (`prefixRejected`). Never split a script
+  into simple commands just to fit a grant.
+- **Verify in the sandbox.** Pass the `checks` you will run (e.g.
+  `["soffice --version"]`), then run them with `sandbox_exec`. They decide
+  whether it worked, not the exit code.
+- **Declined, or sudo needs a password → hand it over.** Reply with the exact
+  command in a fenced `bash` block and the directory to run it in, ask the person
+  to tell you when it has finished (or paste the error), then run your checks.
+  Do not call the tool again for the same command unless they ask.
+
 ## Where you can write
 
 `sandbox_info.paths` returns this table for the live session.
 
-| Path                            | Writable | Survives                                          | Host sees it                                                 |
-| ------------------------------- | -------- | ------------------------------------------------- | ------------------------------------------------------------ |
-| The open project                | yes      | this session's overlay (until reset / eviction)   | no — ship it via the outbox                                  |
-| `/tmp`                          | yes      | across commands, for this session; reset wipes it | no — it is your own scratch dir, not the host's `/tmp`       |
-| `$KOI_OUTBOX`                   | yes      | yes, across sessions                              | **yes** — the only way out. May hold files from earlier runs |
+| Path                            | Writable | Survives                                          | Host sees it                                                                                                                                       |
+| ------------------------------- | -------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The open project                | yes      | this session's overlay (until reset / eviction)   | no — ship it via the outbox                                                                                                                        |
+| `/tmp`                          | yes      | across commands, for this session; reset wipes it | no — it is your own scratch dir, not the host's `/tmp`                                                                                             |
+| `$KOI_OUTBOX`                   | yes      | yes, across sessions                              | **yes** — the only way out. May hold files from earlier runs                                                                                       |
 | `$KOI_PERSIST`                  | yes      | yes, across sessions; never evicted               | **yes** — the user's personal store (`~/.koi/persist/<project>-<id>`) for things a skill keeps for them; not a deliverable, never the project tree |
-| Everything else (incl. `$HOME`) | **no**   | —                                                 | it is the host, read-only: `pip --user`, `mkdir ~/x` → EROFS |
-| Credential paths                | no       | —                                                 | masked                                                       |
+| Everything else (incl. `$HOME`) | **no**   | —                                                 | it is the host, read-only: `pip --user`, `mkdir ~/x` → EROFS                                                                                       |
+| Credential paths                | no       | —                                                 | masked                                                                                                                                             |
 
 Use `/tmp` freely for scratch files, venvs and throwaway installs
 (`python3 -m venv /tmp/venv`, `npm install --prefix /tmp/x ...`). Outside a

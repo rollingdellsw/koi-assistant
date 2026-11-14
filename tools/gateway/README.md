@@ -400,6 +400,20 @@ If you are running genuinely untrusted work, prefer Linux (or WSL2).
   production credentials.
 - **Exported patches are untrusted input.** They are inert until you apply them. Review
   them before `git am`, exactly like a pull request.
+- **`run_host_command` leaves the sandbox.** It is the one tool that executes on the
+  host. The gate is in this server, not in the client's tool tier: each call sends an
+  MCP `elicitation/create` carrying `koi/host-command` (why, command, cwd, checks,
+  sha256), and the command runs only on an answer of `decision: "run"` whose `sha256`
+  matches the bytes asked about. A client without the elicitation capability, a decline,
+  a cancel or no answer within 330s means nothing runs. The run is `bash -c` in its own
+  process group, stdin `/dev/null`, a minimal environment, one at a time, killed at its
+  time limit (default 10 min, max 30) or when the server exits; `sudo` resolves to a
+  shim that execs the real sudo with `-n`. The person may also allow, for the rest of
+  the conversation, the exact command (by sha256) or a model-proposed `allow_prefix`
+  that this server validated before offering it. A prefix match requires plain
+  arguments only (no shell syntax), and shells, interpreters and bare `sudo` can never
+  be prefixes. Grants live in memory, are cleared when a new conversation connects
+  and are listed in `sandbox_info.hostCommandGrants`. Test: `node test-host-command.mjs`.
 
 ---
 

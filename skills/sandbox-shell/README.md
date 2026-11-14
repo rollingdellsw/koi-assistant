@@ -130,6 +130,15 @@ touched.
 _Provided by:_ `bubblewrap` + OverlayFS on Linux; APFS copy-on-write clones and
 `sandbox-exec` on macOS.
 
+**One exception, always asked:** `run_host_command` runs a command on your machine,
+outside the sandbox, as you — for things the overlay cannot do (installing a system
+package, a global tool, starting a host service). Every call shows you why and the exact
+command and waits for **Run once**, **Always allow (session)** — the exact command, or
+a prefix the agent proposed and the server checked — or **Decline**; it is asked even in
+full-auto, and declined if the panel is closed or nobody answers. `sudo` runs as
+`sudo -n`, so anything needing your password fails instead of prompting; run those
+yourself in a terminal.
+
 The two are not equivalent past "your files are safe": on Linux a masked credential is
 absent from the filesystem, on macOS it is present but unreadable, and the macOS egress
 path has no automated enforcement test. Details in the

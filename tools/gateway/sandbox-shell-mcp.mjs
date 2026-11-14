@@ -560,6 +560,13 @@ const OUTPUT_CAP = 200 * 1024;      // per-stream cap for exec output
 const LOG_CAP = 500 * 1024;         // per-service ring buffer
 const DEFAULT_TIMEOUT_MS = 120_000;
 
+// run_host_command (outside the sandbox, after an explicit Run click).
+const HOST_RUN_DEFAULT_MS = 10 * 60_000;
+const HOST_RUN_MAX_MS = 30 * 60_000;
+const HOST_CMD_MAX_BYTES = 16_000;
+const HOST_OUTPUT_TAIL = 32 * 1024;     // per stream, the END of the output
+const HOST_APPROVAL_TIMEOUT_MS = 330_000; // matches the network approval wait
+
 function log(msg) {
   process.stderr.write(`[sandbox-shell] ${msg}\n`);
 }
@@ -3111,6 +3118,7 @@ function stopAllServices() {
 
 function shutdownChildren() {
   stopAllServices();
+  if (HOST_RUN.child) { try { process.kill(-HOST_RUN.child.pid, 'SIGKILL'); } catch { /* gone */ } }
   try { NET_BROKER?.stop(); } catch { /* ignore */ }
 }
 process.on('exit', shutdownChildren);
@@ -3285,6 +3293,43 @@ const TOOLS = [
     },
   },
   {
+    name: 'run_host_command',
+    // 'safe' at the CLIENT tier only because this server owns the gate: every
+    // call raises its own approval prompt (MCP elicitation, `koi/host-command`)
+    // that the model cannot answer and that is shown even in full-auto and
+    // inside topic workers. The only thing remembered is what the PERSON chose
+    // in that prompt: a session grant for the exact command, or for a prefix
+    // the server validated. A client-tier prompt on top would ask twice.
+    tier: 'safe',
+    description:
+      'Run a bash command on the user\'s machine, OUTSIDE the sandbox, as the user: install system packages ' +
+      '(sudo apt-get), install tools globally (npm -g, pipx, cargo install), pull a container image, start/enable a ' +
+      'host service, write or delete a file on the real host. EVERY call shows the person `why` and the exact `command` ' +
+      'and waits for them to click Run or Decline; nothing runs without that. The person may instead allow it for the ' +
+      'rest of the session: the exact command, or — when you pass `allow_prefix` — every command that is that prefix ' +
+      'plus plain arguments (e.g. allow_prefix "sudo apt-get install -y" covers "sudo apt-get install -y jq"). Granted ' +
+      'commands run without asking. Propose a prefix only when you expect to repeat the command with other arguments; ' +
+      'it must be a single simple command, not a shell or interpreter. No terminal and no input: write a ' +
+      'non-interactive script (`set -e`, `apt-get -y`), safe to run twice. sudo runs non-interactively (sudo -n): if it ' +
+      'needs a password the command fails, and you should hand the person the command to run in their own terminal. ' +
+      'Ask once, for everything you need. Do not use it for what sandbox_exec can do (reading, building, testing, ' +
+      'editing project files: those go through the overlay and the outbox). Returns the exit code and the output\'s ' +
+      'tail; afterwards run your checks with sandbox_exec — they decide, not the exit code.',
+    displayMessage: '⚠️ host $ {{command}}',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        why: { type: 'string', description: 'For the person: what is missing and what running this unblocks, in two or three sentences.' },
+        command: { type: 'string', description: 'The exact bash script to run on the host: `set -e`, non-interactive, safe to run twice. Use sudo where root is needed.' },
+        checks: { type: 'array', items: { type: 'string' }, description: 'Optional: commands you will run with sandbox_exec afterwards to prove the change, shown to the person, e.g. ["soffice --version"].' },
+        cwd: { type: 'string', description: 'Host working directory: absolute, or relative to the open project. Default: the project dir, or $HOME when none is open.' },
+        timeout_ms: { type: 'number', description: `Run time limit in ms after the person clicks Run (default ${HOST_RUN_DEFAULT_MS}, max ${HOST_RUN_MAX_MS}).` },
+        allow_prefix: { type: 'string', description: 'Optional: a leading part of `command` (whole words) the person may allow for the rest of the session, so later commands that are this prefix plus different arguments run without asking. Only for a single-line command with no ; & | < > ` $ ( ) { } \\. Not a shell/interpreter (bash, sh, python, node, env, xargs, ...), and with sudo it must name the program ("sudo apt-get install -y", not "sudo").' },
+      },
+      required: ['why', 'command'],
+    },
+  },
+  {
     name: 'sandbox_info',
     tier: 'safe',
     description: 'Show sandbox configuration: backend, project root, network mode, state dirs, running services.',
@@ -3356,7 +3401,301 @@ async function viewImages({ paths, resolution }) {
   return { parts };
 }
 
+// =============================================================================
+// run_host_command — the one tool that leaves the sandbox
+// -----------------------------------------------------------------------------
+// Port of headless-agent's run_host_command (society approval.rs). The gate is
+// HERE, not in the client's tool tier: every call asks the side panel through
+// MCP elicitation (`koi/host-command`), and anything but an explicit Run —
+// decline, timeout, closed panel, a client that cannot prompt — means nothing
+// runs. The person approves the exact bytes: the dialog echoes the sha256 it
+// displayed and a mismatch refuses.
+//
+// The run itself: bash in its own process group, stdin /dev/null, a minimal
+// environment, one at a time, killed at the time limit or when this server
+// exits. sudo is non-interactive: a `sudo` wrapper first on PATH execs the real
+// one with -n, so a password prompt fails fast instead of hanging. There is no
+// password field (yet); when sudo needs one, the agent hands the command to
+// the person to run in their own terminal.
+// =============================================================================
+
+const HOST_RUN = { child: null, busy: false };
+
+// -----------------------------------------------------------------------------
+// Session grants: "always allow for this session", chosen by the person in the
+// prompt. Exact = this command's sha256. Prefix = a model-proposed prefix the
+// server validated BEFORE offering it; a command matches only when it is that
+// prefix plus plain arguments (no shell syntax that could chain or substitute
+// another command). Cleared when a new conversation connects; kept across a
+// reconnect of the same one, like network session grants.
+// -----------------------------------------------------------------------------
+const HOST_GRANTS = { exact: new Map(), prefixes: new Map() };
+
+// Shell syntax that could run something other than the granted program.
+const HOST_SHELL_SYNTAX = /[;&|<>`$(){}\\\n\r]/;
+// A prefix starting with one of these grants arbitrary code.
+const HOST_PREFIX_DENY = new Set([
+  'bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'env', 'eval', 'exec', 'command', 'builtin',
+  'source', '.', 'xargs', 'nohup', 'time', 'timeout', 'nice', 'ionice', 'stdbuf', 'setsid', 'watch', 'su',
+  'doas', 'sudo', 'pkexec', 'runuser', 'chroot', 'unshare', 'nsenter', 'ssh', 'script', 'expect',
+  'python', 'python2', 'python3', 'node', 'nodejs', 'deno', 'bun', 'perl', 'ruby', 'php', 'lua', 'tclsh',
+  'awk', 'gawk', 'mawk', 'busybox', 'npx', 'pnpx', 'bunx',
+]);
+
+function normPrefix(p) { return String(p ?? '').trim().replace(/\s+/g, ' '); }
+
+/** Why `prefix` cannot be offered for `command`, or null when it can. */
+function prefixGrantProblem(prefix, command) {
+  const pre = normPrefix(prefix);
+  const cmd = command.trim();
+  if (!pre) return 'empty prefix';
+  if (HOST_SHELL_SYNTAX.test(cmd)) return 'the command is not a single simple command (it has a newline or ; & | < > ` $ ( ) { } \\), so only the exact command can be allowed';
+  if (HOST_SHELL_SYNTAX.test(pre)) return 'the prefix contains shell syntax';
+  if (!(cmd.replace(/\s+/g, ' ') === pre || cmd.replace(/\s+/g, ' ').startsWith(pre + ' '))) return 'the command does not start with this prefix (whole words)';
+  const words = pre.split(' ');
+  let i = 0;
+  if (words[0] === 'sudo') {
+    i = 1;
+    while (i < words.length && words[i].startsWith('-')) i++;
+    if (i >= words.length) return 'with sudo the prefix must name the program, e.g. "sudo apt-get install -y"';
+  }
+  const prog = path.basename(words[i].replace(/^['"]|['"]$/g, ''));
+  if (HOST_PREFIX_DENY.has(prog)) return `"${prog}" runs arbitrary code, so it cannot be allowed by prefix`;
+  return null;
+}
+
+function matchHostGrant(command, sha256) {
+  if (HOST_GRANTS.exact.has(sha256)) return { kind: 'exact' };
+  const cmd = command.trim().replace(/\s+/g, ' ');
+  if (HOST_SHELL_SYNTAX.test(command.trim())) return null;
+  for (const pre of HOST_GRANTS.prefixes.keys()) {
+    if ((cmd === pre || cmd.startsWith(pre + ' ')) && prefixGrantProblem(pre, command) === null) return { kind: 'prefix', prefix: pre };
+  }
+  return null;
+}
+
+function hostGrantsSummary() {
+  return {
+    exact: [...HOST_GRANTS.exact.values()].map((g) => g.command.length > 200 ? g.command.slice(0, 200) + '…' : g.command),
+    prefixes: [...HOST_GRANTS.prefixes.keys()],
+  };
+}
+
+function resetHostGrants() { HOST_GRANTS.exact.clear(); HOST_GRANTS.prefixes.clear(); }
+
+function tailOf(s, cap) {
+  return s.length > cap ? `…[${s.length - cap} earlier bytes dropped]\n` + s.slice(-cap) : s;
+}
+
+function usesSudo(cmd) {
+  return /(?:^|[\s;&|(`$])sudo\b/.test(cmd);
+}
+
+/** A dir holding `sudo` -> `<real sudo> -n "$@"`, or null when sudo is absent. */
+function sudoShimDir() {
+  const real = spawnSync('bash', ['-lc', 'command -v sudo'], { encoding: 'utf8' }).stdout?.trim();
+  if (!real || !real.startsWith('/')) return null;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'koi-hostcmd-'));
+  const shim = path.join(dir, 'sudo');
+  fs.writeFileSync(shim, `#!/bin/sh\nexec ${shQuote(real)} -n "$@"\n`, { mode: 0o700 });
+  return dir;
+}
+
+function hostCwd(cwd) {
+  const base = PROJ.path && !PROJ.hostAbsent ? PROJ.path : os.homedir();
+  if (!cwd) return base;
+  const abs = path.isAbsolute(cwd) ? cwd : path.resolve(base, cwd);
+  return abs;
+}
+
+function runOnHost(command, { cwd, timeoutMs }) {
+  return new Promise((resolve) => {
+    const shim = sudoShimDir();
+    const hostPath = process.env.PATH || '/usr/local/bin:/usr/bin:/bin';
+    const env = {
+      PATH: shim ? `${shim}:${hostPath}` : hostPath,
+      HOME: os.homedir(),
+      USER: process.env.USER || os.userInfo().username,
+      LOGNAME: process.env.LOGNAME || os.userInfo().username,
+      LANG: process.env.LANG || 'C.UTF-8',
+      SHELL: '/bin/bash',
+      TERM: 'dumb',
+      CI: '1',
+      DEBIAN_FRONTEND: 'noninteractive',
+      ...(process.env.XDG_RUNTIME_DIR ? { XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR } : {}),
+      ...(process.env.DBUS_SESSION_BUS_ADDRESS ? { DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS } : {}),
+    };
+    const started = Date.now();
+    const child = spawn('/bin/bash', ['-c', command], {
+      cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true,
+    });
+    HOST_RUN.child = child;
+    let stdout = '', stderr = '', timedOut = false, done = false;
+    // Keep the TAIL: the end of an install log is where the failure is.
+    const keep = (buf, d) => { const s = buf + d.toString(); return s.length > HOST_OUTPUT_TAIL * 4 ? s.slice(-HOST_OUTPUT_TAIL * 2) : s; };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout = keep(stdout, d); });
+    child.stderr.on('data', (d) => { stderr = keep(stderr, d); });
+    const settle = (code, signal, error) => {
+      if (done) return; done = true; clearTimeout(timer);
+      HOST_RUN.child = null;
+      if (shim) { try { fs.rmSync(shim, { recursive: true, force: true }); } catch { /* best effort */ } }
+      resolve({
+        exitCode: code ?? null, signal: signal ?? null, timedOut,
+        durationMs: Date.now() - started,
+        stdout: tailOf(stdout, HOST_OUTPUT_TAIL),
+        stderr: tailOf(stderr + (error ? `\n[koi] could not start bash: ${error.message}` : ''), HOST_OUTPUT_TAIL),
+      });
+    };
+    child.on('error', (e) => settle(127, null, e));
+    child.on('close', (code, signal) => settle(code, signal));
+  });
+}
+
+const RUN_YOURSELF =
+  'If the person would rather run it themselves, give them the exact command (a fenced bash block) and the ' +
+  'directory to run it in, ask them to reply when it has finished (or with the error), and then run your checks ' +
+  'with sandbox_exec. Do not call run_host_command again for the same command unless they ask you to.';
+
+async function runHostCommand({ why, command, checks, cwd, timeout_ms, allow_prefix }) {
+  why = String(why ?? '').trim();
+  command = String(command ?? '');
+  const checkList = Array.isArray(checks) ? checks.map(String).filter((c) => c.trim()) : [];
+  if (!why) return { success: false, error: 'why: tell the person what is missing and what running this unblocks' };
+  if (!command.trim() || Buffer.byteLength(command) > HOST_CMD_MAX_BYTES) {
+    return { success: false, error: `command: the exact bash script to run (1 to ${HOST_CMD_MAX_BYTES} bytes)` };
+  }
+  if (!CLIENT_CAN_PROMPT) {
+    return {
+      success: false, ran: false,
+      error: 'No one can approve this: the connected client cannot show an approval prompt (unattended run, or a client without the MCP elicitation capability). Nothing was run.',
+      hint: RUN_YOURSELF,
+    };
+  }
+  if (HOST_RUN.busy) return { success: false, ran: false, error: 'Another host command is still waiting for approval or running; one at a time.' };
+  const dir = hostCwd(cwd);
+  try {
+    if (!fs.statSync(dir).isDirectory()) throw new Error('not a directory');
+  } catch (e) {
+    return { success: false, ran: false, error: `cwd ${dir}: ${e.code || e.message} on the host` };
+  }
+  const timeoutMs = Math.min(Math.max(Number(timeout_ms) || HOST_RUN_DEFAULT_MS, 1000), HOST_RUN_MAX_MS);
+  const sha256 = crypto.createHash('sha256').update(command).digest('hex');
+  const needsSudo = usesSudo(command);
+  const proposed = allow_prefix != null && String(allow_prefix).trim() ? normPrefix(allow_prefix) : null;
+  const prefixRejected = proposed ? prefixGrantProblem(proposed, command) : null;
+  const grantPrefix = proposed && !prefixRejected ? proposed : null;
+
+  HOST_RUN.busy = true;
+  try {
+    const granted = matchHostGrant(command, sha256);
+    if (granted) {
+      const by = granted.kind === 'exact' ? 'session grant: this exact command' : `session grant: prefix "${granted.prefix}"`;
+      log(`run_host_command: ${by}, running in ${dir} sha256=${sha256.slice(0, 12)} limit=${timeoutMs}ms`);
+      return await finishHostRun({ command, dir, timeoutMs, checkList, needsSudo, extra: { approvedBy: by } });
+    }
+    let answer;
+    try {
+      answer = await sendServerRequest('elicitation/create', {
+        message: `The agent wants to run a command on your machine, outside the sandbox.\n\nWhy: ${why}\n\nIn ${dir}:\n${command}`,
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            decision: { type: 'string', enum: ['run', 'decline'] },
+            reason: { type: 'string' },
+            sha256: { type: 'string' },
+            grant: { type: 'string', enum: ['once', 'exact', 'prefix'] },
+            prefix: { type: 'string' },
+          },
+          required: ['decision'],
+        },
+        'koi/host-command': {
+          why, command, cwd: dir, checks: checkList, sha256, needsSudo,
+          timeoutMs, project: PROJ.path, session: PROJ.sessionId,
+          // null when the model proposed none or it failed validation: then
+          // the dialog offers only Run once / exact / Decline.
+          grantPrefix,
+        },
+      }, HOST_APPROVAL_TIMEOUT_MS);
+    } catch (e) {
+      log(`run_host_command: approval failed (${e.message}) — not run, sha256=${sha256.slice(0, 12)}`);
+      return { success: false, ran: false, declined: true, reason: `no answer: ${e.message}`, hint: RUN_YOURSELF };
+    }
+    const content = answer?.content ?? {};
+    if (answer?.action !== 'accept' || content.decision !== 'run') {
+      const reason = typeof content.reason === 'string' && content.reason.trim() ? content.reason.trim() : 'declined';
+      log(`run_host_command: declined (${reason}) sha256=${sha256.slice(0, 12)}`);
+      return {
+        success: false, ran: false, declined: true, reason,
+        note: 'The person did not approve this command. Nothing ran on the host.',
+        hint: RUN_YOURSELF,
+        ...(prefixRejected ? { prefixRejected: `allow_prefix "${proposed}" was not offered: ${prefixRejected}` } : {}),
+      };
+    }
+    if (content.sha256 !== sha256) {
+      log(`run_host_command: approval was for different bytes (got ${String(content.sha256).slice(0, 12)}, want ${sha256.slice(0, 12)}) — not run`);
+      return { success: false, ran: false, error: 'The approval did not match this exact command (sha256 mismatch). Nothing ran.' };
+    }
+
+    // Remember only what the person picked, and a prefix only if it is the
+    // one this server validated and offered.
+    let sessionGrant = null;
+    if (content.grant === 'exact') {
+      HOST_GRANTS.exact.set(sha256, { command, at: Date.now() });
+      sessionGrant = 'This exact command is now allowed for the rest of this session (no prompt next time).';
+    } else if (content.grant === 'prefix' && grantPrefix && normPrefix(content.prefix) === grantPrefix) {
+      HOST_GRANTS.prefixes.set(grantPrefix, { at: Date.now() });
+      sessionGrant = `Commands "${grantPrefix} <arguments>" are now allowed for the rest of this session (no prompt next time, as long as they contain no shell syntax).`;
+    }
+    log(`run_host_command: approved${sessionGrant ? ` (+${content.grant} grant)` : ''}, running in ${dir} sha256=${sha256.slice(0, 12)} limit=${timeoutMs}ms`);
+    return await finishHostRun({
+      command, dir, timeoutMs, checkList, needsSudo,
+      extra: {
+        approvedBy: 'the person (Run)',
+        ...(sessionGrant ? { sessionGrant } : {}),
+        ...(prefixRejected ? { prefixRejected: `allow_prefix "${proposed}" was not offered: ${prefixRejected}` } : {}),
+      },
+    });
+  } finally {
+    HOST_RUN.busy = false;
+  }
+}
+
+async function finishHostRun({ command, dir, timeoutMs, checkList, needsSudo, extra }) {
+  {
+    const r = await runOnHost(command, { cwd: dir, timeoutMs });
+    log(`run_host_command: exit=${r.exitCode} signal=${r.signal} timedOut=${r.timedOut} ${r.durationMs}ms`);
+    const sudoRefused = needsSudo && /sudo: (?:a (?:terminal|password) is required|a password is required)/.test(r.stderr);
+    const next = checkList.length
+      ? `Next: run your checks with sandbox_exec; they decide, not this exit code:\n  ${checkList.join('\n  ')}`
+      : 'Next: check the result with sandbox_exec; that decides, not this exit code.';
+    return {
+      success: r.exitCode === 0 && !r.timedOut,
+      ran: true,
+      ranOn: 'host (outside the sandbox)',
+      cwd: dir,
+      exitCode: r.exitCode,
+      ...(r.signal ? { signal: r.signal } : {}),
+      timedOut: r.timedOut,
+      durationMs: r.durationMs,
+      stdout: r.stdout,
+      stderr: r.stderr,
+      ...(sudoRefused ? {
+        sudo: 'sudo needs a password, and this tool runs sudo non-interactively (sudo -n), so it was refused.',
+        hint: RUN_YOURSELF,
+      } : {}),
+      ...extra,
+      next,
+    };
+  }
+}
+
 const handlers = {
+  run_host_command: runHostCommand,
+
   async sandbox_exec({ command, cwd, timeout_ms, max_output }) {
     // Keep this overlay's `inuse` marker fresh for the whole session, not just
     // the 30 minutes after sandbox_open_project.
@@ -3649,6 +3988,7 @@ const handlers = {
   async sandbox_info() {
     return {
       backend: BACKEND.name,
+      hostCommandGrants: hostGrantsSummary(),
       platform: process.platform,
       project: PROJ.path,
       sandboxRoot: BACKEND.root,
@@ -3893,6 +4233,8 @@ async function handleMessage(msg) {
         // Session-scoped network grants belong to the conversation that made
         // them; a new client must not inherit "allow evil.example.com".
         if (!reconnect) NET_BROKER?.resetSession(SESSION_ID);
+        // Same rule for "always allow this host command for this session".
+        if (!reconnect) resetHostGrants();
         // The previous connection's overlay just became garbage — good moment
         // to check the cache budget.
         scheduleOverlayGc('initialize');
